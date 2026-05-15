@@ -104,10 +104,12 @@ Main tables:
 ## Login Page
 
 
-## Dashboard
+## UI design
+<img width="1919" height="929" alt="image" src="https://github.com/user-attachments/assets/7e39bd41-e37f-43ca-af07-b3a6b73c80df" />
 
 
 ## Parking Slot Monitor
+<img width="1919" height="928" alt="image" src="https://github.com/user-attachments/assets/ce2ce9e2-8ba8-4fd5-8a5d-8051da45b68d" />
 
 
 ---
