@@ -7,11 +7,12 @@ Smart parking management system for managing vehicle entry, exit, parking slots,
 # Team Members
 
 | Name | Role |
-| Trần Thành Duy    | Frontend Developer |
-| Tạ Thế Ngữ        | Frontend Developer |
-| Phạm Văn	Hùng    | Frontend Developer |
-| Nguyễn Thế	Phong | Backend Developer |
-| Nguyen Gia Huan   | Database Designer |
+|------|------|
+| Trần Thành Duy | Frontend Developer |
+| Tạ Thế Ngữ | Frontend Developer |
+| Phạm Văn Hùng | Frontend Developer |
+| Nguyễn Thế Phong | Backend Developer |
+| Nguyen Gia Huan | Database Designer |
 
 ---
 
