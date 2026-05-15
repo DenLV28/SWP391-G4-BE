@@ -94,7 +94,7 @@ Main tables:
 ## Run project
 
 ```bash
-npm start
+
 ```
 
 ---
