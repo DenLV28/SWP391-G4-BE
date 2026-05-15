@@ -44,9 +44,8 @@ The system helps manage parking buildings efficiently by:
 - Monthly subscription
 
 ## Security System
-- Camera integration
-- License plate recognition
-- Vehicle history tracking
+- Protect data user
+- Protect payment method
 
 ---
 
