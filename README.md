@@ -102,13 +102,13 @@ npm start
 # Screenshots
 
 ## Login Page
-(Add screenshot here)
+
 
 ## Dashboard
-(Add screenshot here)
+
 
 ## Parking Slot Monitor
-(Add screenshot here)
+
 
 ---
 
