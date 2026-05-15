@@ -91,18 +91,6 @@ Main tables:
 
 # Installation
 
-## Clone repository
-
-```bash
-git clone https://github.com/your-repo-link.git
-```
-
-## Install dependencies
-
-```bash
-npm install
-```
-
 ## Run project
 
 ```bash
