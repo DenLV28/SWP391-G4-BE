@@ -101,6 +101,7 @@ Main tables:
 # Screenshots
 
 ## Login Page
+<img width="888" height="753" alt="image" src="https://github.com/user-attachments/assets/e4343693-7c20-4c0f-9280-aeb608ff47ac" />
 
 
 ## UI design
