@@ -1,6 +1,7 @@
 import { useState, useMemo, type ReactNode } from 'react';
-import { Calendar, Download, FileText, ChevronLeft, ChevronRight, TrendingUp, TrendingDown, Minus, ChevronDown } from 'lucide-react';
-import type { Payment } from '../../data/mockData';
+import { Calendar, Download, FileText, ChevronLeft, ChevronRight, TrendingUp, TrendingDown, Minus, ChevronDown, Building2, PieChart } from 'lucide-react';
+import type { Payment, Reservation } from '../../data/mockData';
+import { PARKING_LOTS, lotKeyOrDefault, type LotKey } from '../../utils/parkingLots';
 
 type TimeTab = '7days' | 'month' | 'custom';
 
@@ -64,42 +65,148 @@ const TIME_TABS: { key: TimeTab; label: string }[] = [
   { key: 'custom', label: 'Tùy chỉnh'  },
 ];
 
-export default function ManagerReports({ payments = [] }: { payments?: Payment[] }) {
+// Không dùng d.toISOString() — quy về UTC nên từ 00:00 đến trước 07:00 giờ VN
+// (UTC+7) sẽ trả về ngày hôm qua. Lấy theo ngày/tháng/năm địa phương của d.
+const isoDay = (d: Date) => {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+/** Nhãn nguồn doanh thu — tiền đến từ giao dịch loại nào. */
+const SOURCE_META: Record<string, { label: string; cls: string }> = {
+  booking: { label: 'Đặt chỗ trước (reservation)', cls: 'bg-blue-500' },
+  session: { label: 'Phí gửi xe tại bãi (checkout)', cls: 'bg-emerald-500' },
+  other:   { label: 'Khác', cls: 'bg-slate-400' },
+};
+
+export default function ManagerReports({
+  payments = [],
+  reservations = [],
+}: {
+  payments?: Payment[];
+  reservations?: Reservation[];
+}) {
   const [activeTab, setActiveTab]         = useState<TimeTab>('7days');
   const [page, setPage]                   = useState(1);
   const [filterLot, setFilterLot]         = useState('');
   const [filterVehicle, setFilterVehicle] = useState('');
   const [filterPayment, setFilterPayment] = useState('');
+  // Khoảng tùy chỉnh — mặc định 7 ngày gần nhất
+  const [customFrom, setCustomFrom] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 6); return isoDay(d); });
+  const [customTo, setCustomTo]     = useState(() => isoDay(new Date()));
 
-  // Compute real rows from actual paid payments
-  const realRows = useMemo((): DailyRow[] => {
-    const paidPayments = payments.filter((p) => p.status === 'Paid');
-    if (paidPayments.length === 0) return [];
-
-    const byDate = new Map<string, { revenue: number; count: number }>();
-    for (const p of paidPayments) {
-      const raw = (p.paidAt || p.createdAt || '').slice(0, 10);
-      if (!raw) continue;
-      const d = new Date(raw);
-      if (isNaN(d.getTime())) continue;
-      const key = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
-      const cur = byDate.get(key) ?? { revenue: 0, count: 0 };
-      byDate.set(key, { revenue: cur.revenue + (p.totalAmount || 0), count: cur.count + 1 });
+  // ── Khoảng thời gian đang thống kê (chính xác theo ngày) ────────────────────
+  const range = useMemo(() => {
+    const now = new Date();
+    if (activeTab === '7days') {
+      const s = new Date(now); s.setDate(s.getDate() - 6); s.setHours(0, 0, 0, 0);
+      return { start: s.getTime(), end: now.getTime() };
     }
+    if (activeTab === 'month') {
+      return { start: new Date(now.getFullYear(), now.getMonth(), 1).getTime(), end: now.getTime() };
+    }
+    const s = new Date(`${customFrom}T00:00:00`);
+    const e = new Date(`${customTo}T23:59:59`);
+    return {
+      start: Number.isNaN(s.getTime()) ? 0 : s.getTime(),
+      end: Number.isNaN(e.getTime()) ? now.getTime() : e.getTime(),
+    };
+  }, [activeTab, customFrom, customTo]);
 
+  // ── Gắn mỗi giao dịch Paid với bãi đỗ + nguồn thu ───────────────────────────
+  // payments không mang cột bãi — tra ngược qua reservation (reservationCode
+  // giữ nguyên qua check-in; ticketCode phủ các bản ghi cũ).
+  const resByCode = useMemo(() => {
+    const m = new Map<string, Reservation>();
+    for (const r of reservations) if (r.reservationCode) m.set(r.reservationCode, r);
+    return m;
+  }, [reservations]);
+
+  const enriched = useMemo(() => {
+    return payments
+      .filter((p) => p.status === 'Paid')
+      .map((p) => {
+        const res = resByCode.get(p.reservationCode || '') ?? resByCode.get(p.ticketCode || '');
+        const raw = (p.paidAt || p.createdAt || '').replace(' ', 'T');
+        const ts = new Date(raw).getTime();
+        return {
+          amount: p.totalAmount || 0,
+          ts: Number.isNaN(ts) ? null : ts,
+          // Không tra được đặt chỗ gốc → quy về bãi mặc định (Quận 9), cùng
+          // quy ước fallback với phần còn lại của hệ thống.
+          lotKey: lotKeyOrDefault(res?.parkingLot),
+          source: res ? 'booking' : (p.ticketCode || '').startsWith('TCK') ? 'session' : 'other',
+          vehicle: res?.vehicleType ?? '',
+          method: p.method || 'Khác',
+        };
+      })
+      .filter((e) => e.ts != null);
+  }, [payments, resByCode]);
+
+  // Áp khoảng thời gian + 3 bộ lọc
+  const inRange = useMemo(
+    () =>
+      enriched.filter(
+        (e) =>
+          (e.ts as number) >= range.start &&
+          (e.ts as number) <= range.end &&
+          (!filterLot || e.lotKey === filterLot) &&
+          (!filterVehicle || e.vehicle === filterVehicle) &&
+          (!filterPayment || e.method === filterPayment),
+      ),
+    [enriched, range, filterLot, filterVehicle, filterPayment],
+  );
+
+  // ── Doanh thu theo bãi (trong khoảng thời gian, trước bộ lọc bãi) ───────────
+  const byLot = useMemo(() => {
+    const scoped = enriched.filter(
+      (e) =>
+        (e.ts as number) >= range.start &&
+        (e.ts as number) <= range.end &&
+        (!filterVehicle || e.vehicle === filterVehicle) &&
+        (!filterPayment || e.method === filterPayment),
+    );
+    const rows = PARKING_LOTS.map((lot) => {
+      const items = scoped.filter((e) => e.lotKey === lot.key);
+      return { key: lot.key as LotKey, name: lot.name, revenue: items.reduce((s, e) => s + e.amount, 0), count: items.length };
+    });
+    return { rows, total: scoped.reduce((s, e) => s + e.amount, 0), count: scoped.length };
+  }, [enriched, range, filterVehicle, filterPayment]);
+
+  // ── Nguồn doanh thu (theo loại giao dịch & phương thức thanh toán) ──────────
+  const bySource = useMemo(() => {
+    const g = new Map<string, number>();
+    for (const e of inRange) g.set(e.source, (g.get(e.source) ?? 0) + e.amount);
+    return Array.from(g.entries()).sort((a, b) => b[1] - a[1]);
+  }, [inRange]);
+  const byMethod = useMemo(() => {
+    const g = new Map<string, number>();
+    for (const e of inRange) g.set(e.method, (g.get(e.method) ?? 0) + e.amount);
+    return Array.from(g.entries()).sort((a, b) => b[1] - a[1]);
+  }, [inRange]);
+
+  // Bảng vận hành hàng ngày — gộp inRange theo ngày
+  const realRows = useMemo((): DailyRow[] => {
+    if (enriched.length === 0) return [];
+    const byDate = new Map<string, { revenue: number; count: number }>();
+    for (const e of inRange) {
+      const d = new Date(e.ts as number);
+      const key = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+      const cur = byDate.get(key) ?? { revenue: 0, count: 0 };
+      byDate.set(key, { revenue: cur.revenue + e.amount, count: cur.count + 1 });
+    }
     const entries = Array.from(byDate.entries()).sort((a, b) => {
-      const parse = (s: string) => { const [dd, mm, yyyy] = s.split('/').map(Number); return new Date(yyyy, mm-1, dd).getTime(); };
+      const parse = (s: string) => { const [dd, mm, yyyy] = s.split('/').map(Number); return new Date(yyyy, mm - 1, dd).getTime(); };
       return parse(b[0]) - parse(a[0]);
     });
-
     return entries.map(([date, { revenue, count }], i) => {
       const prevRevenue = entries[i + 1]?.[1].revenue ?? revenue;
       const trend: DailyRow['trend'] = revenue > prevRevenue * 1.05 ? 'up' : revenue < prevRevenue * 0.95 ? 'down' : 'stable';
       return { date, vehicleType: 'Tất cả', enter: count, exit: count, revenue, trend };
     });
-  }, [payments]);
+  }, [enriched.length, inRange]);
 
-  const useRealData = realRows.length > 0;
+  const useRealData = enriched.length > 0;
 
   const filtered = (useRealData ? realRows : ALL_ROWS).filter((r) => {
     if (!useRealData && filterVehicle && r.vehicleType !== filterVehicle) return false;
@@ -124,21 +231,42 @@ export default function ManagerReports({ payments = [] }: { payments?: Payment[]
           <h1 className="text-2xl font-bold text-slate-900">Báo cáo Vận hành &amp; Doanh thu</h1>
           <p className="mt-1 text-sm text-slate-500">Theo dõi hiệu suất và doanh thu toàn hệ thống bãi đỗ xe</p>
         </div>
-        <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
-          {TIME_TABS.map((t) => (
-            <button
-              key={t.key}
-              onClick={() => { setActiveTab(t.key); setPage(1); }}
-              className={`flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition ${
-                activeTab === t.key
-                  ? 'bg-blue-600 text-white shadow-sm'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              {t.key === 'custom' && <Calendar className="h-3.5 w-3.5" />}
-              {t.label}
-            </button>
-          ))}
+        <div className="flex flex-col items-end gap-2">
+          <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+            {TIME_TABS.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => { setActiveTab(t.key); setPage(1); }}
+                className={`flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition ${
+                  activeTab === t.key
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                {t.key === 'custom' && <Calendar className="h-3.5 w-3.5" />}
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {activeTab === 'custom' && (
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+              <input
+                type="date"
+                value={customFrom}
+                max={customTo}
+                onChange={(e) => { setCustomFrom(e.target.value); setPage(1); }}
+                className="rounded-lg border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-blue-400 focus:outline-none"
+              />
+              <span className="text-xs text-slate-400">đến</span>
+              <input
+                type="date"
+                value={customTo}
+                min={customFrom}
+                onChange={(e) => { setCustomTo(e.target.value); setPage(1); }}
+                className="rounded-lg border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-blue-400 focus:outline-none"
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -184,12 +312,92 @@ export default function ManagerReports({ payments = [] }: { payments?: Payment[]
         </div>
       </div>
 
+      {/* Doanh thu theo bãi + Nguồn doanh thu */}
+      {useRealData && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+          {/* Per-lot revenue */}
+          <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
+            <div className="mb-4 flex items-center gap-2">
+              <Building2 className="h-4 w-4 text-blue-600" />
+              <h2 className="font-semibold text-slate-900">Doanh thu theo bãi đỗ</h2>
+              <span className="ml-auto rounded-full bg-blue-50 px-2.5 py-0.5 text-[11px] font-bold text-blue-600">
+                {byLot.count} giao dịch
+              </span>
+            </div>
+            <div className="space-y-3">
+              {byLot.rows.map((lot) => {
+                const pct = byLot.total > 0 ? Math.round((lot.revenue / byLot.total) * 100) : 0;
+                return (
+                  <div key={lot.key}>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="font-semibold text-slate-700">{lot.name}</span>
+                      <span className="font-bold text-slate-900">
+                        {fmtVND(lot.revenue)}
+                        <span className="ml-2 text-[11px] font-semibold text-slate-400">{pct}% · {lot.count} GD</span>
+                      </span>
+                    </div>
+                    <div className="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                      <div className="h-full rounded-full bg-blue-500 transition-all" style={{ width: `${pct}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="flex items-center justify-between border-t border-slate-100 pt-3 text-sm">
+                <span className="font-bold text-slate-900">TỔNG CỘNG (cả 3 bãi)</span>
+                <span className="text-lg font-black text-blue-700">{fmtVND(byLot.total)}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Revenue sources */}
+          <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
+            <div className="mb-4 flex items-center gap-2">
+              <PieChart className="h-4 w-4 text-emerald-600" />
+              <h2 className="font-semibold text-slate-900">Nguồn doanh thu</h2>
+            </div>
+            <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-slate-400">Theo loại giao dịch</p>
+            <div className="space-y-2.5">
+              {bySource.length === 0 && <p className="text-sm text-slate-400">Chưa có giao dịch trong khoảng này.</p>}
+              {bySource.map(([source, amount]) => {
+                const meta = SOURCE_META[source] ?? SOURCE_META.other;
+                const total = bySource.reduce((s, [, a]) => s + a, 0);
+                const pct = total > 0 ? Math.round((amount / total) * 100) : 0;
+                return (
+                  <div key={source}>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-600">{meta.label}</span>
+                      <span className="font-bold text-slate-900">{fmtVND(amount)} <span className="text-[11px] font-semibold text-slate-400">{pct}%</span></span>
+                    </div>
+                    <div className="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                      <div className={`h-full rounded-full ${meta.cls} transition-all`} style={{ width: `${pct}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="mb-2 mt-5 text-[11px] font-bold uppercase tracking-wider text-slate-400">Theo phương thức thanh toán</p>
+            <div className="flex flex-wrap gap-2">
+              {byMethod.map(([method, amount]) => (
+                <span key={method} className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs">
+                  <span className="font-bold text-slate-700">{method}</span>
+                  <span className="ml-1.5 font-semibold text-blue-700">{fmtVND(amount)}</span>
+                </span>
+              ))}
+              {byMethod.length === 0 && <span className="text-sm text-slate-400">—</span>}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
         {[
-          { value: filterLot,     setter: setFilterLot,     label: 'Tất cả bãi đỗ', opts: [['central','ParkFlow Long Phước'],['thuduc','ParkFlow Thủ Đức'],['quan9','ParkFlow Quận 9']] },
-          { value: filterVehicle, setter: setFilterVehicle, label: 'Tất cả loại xe', opts: [['Xe đạp','Xe đạp'],['Xe máy','Xe máy'],['Ô tô 4-7 chỗ','Ô tô 4-7 chỗ'],['Xe tải','Xe tải']] },
-          { value: filterPayment, setter: setFilterPayment, label: 'Tất cả thanh toán', opts: [['cash','Tiền mặt'],['card','Thẻ ngân hàng'],['wallet','Ví điện tử']] },
+          { value: filterLot,     setter: setFilterLot,     label: 'Tất cả bãi đỗ',
+            opts: PARKING_LOTS.map((l) => [l.key, l.name] as [string, string]) },
+          { value: filterVehicle, setter: setFilterVehicle, label: 'Tất cả loại xe',
+            opts: [['motorbike', 'Xe máy / Xe máy điện'], ['car', 'Ô tô 4-7 chỗ (Xăng)'], ['electric vehicle', 'Ô tô Điện / EV']] as [string, string][] },
+          { value: filterPayment, setter: setFilterPayment, label: 'Tất cả thanh toán',
+            opts: [['VNPay', 'VNPay'], ['Cash', 'Tiền mặt'], ['Card', 'Thẻ ngân hàng'], ['E-Wallet', 'Ví điện tử'], ['QR Banking', 'QR Banking']] as [string, string][] },
         ].map((f, i) => (
           <div key={i} className="relative">
             <select

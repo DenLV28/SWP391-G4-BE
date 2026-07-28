@@ -10,22 +10,28 @@ import {
   ParkingCircle,
   UserCircle2,
 } from 'lucide-react';
-import type { User, Slot, Reservation, Payment, PricingRule, VehicleKey, Feedback, SlotIssue } from '../../data/mockData';
+import type { User, Slot, Reservation, Payment, PricingRule, VehicleKey, SlotIssue, ParkingSession } from '../../data/mockData';
 import type { Gate, ScanEvent, AccessLog, EmergencyLog, IncidentType } from '../../types/staff';
 import {
   initialGates,
   initialAccessLogs,
   initialEmergencyLogs,
+  manualVehicleOptions,
 } from '../../types/staff';
 import { connectIot, iotTransport, type GateCommand } from '../../services/iotService';
+import { deleteRfidScan } from '../../services/rfidScanService';
+import { fetchActiveSessions } from '../../services/sessionService';
+import { loadAccessLogs, saveAccessLogs } from '../../services/accessLogStore';
 import StaffOverview from './StaffOverview';
 import GateControl from './GateControl';
 import ActivityLog from './ActivityLog';
 import EmergencyReport from './EmergencyReport';
 import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
+import CurrentSessionPage from '../driver/CurrentSession';
 import { perVisitOverstay, overstayDue, isReservationPaid } from '../../utils/reservationPricing';
 import { formatCurrency } from '../../utils/helpers';
+import { lotKeyOf, lotKeyOrDefault } from '../../utils/parkingLots';
 
 interface StaffDashboardProps {
   currentUser: User;
@@ -35,10 +41,9 @@ interface StaffDashboardProps {
   reservations: Reservation[];
   payments: Payment[];
   pricingRules: PricingRule[];
-  feedbacks: Feedback[];
   users?: User[];
   onConfirmReservation?: (id: string) => void;
-  onRespondFeedback?: (id: string, response: string, status?: Feedback['status']) => void;
+  onCancelReservation?: (id: string) => void;
   onLogout: () => void;
   addToast: (message: string, type?: 'success' | 'info' | 'error') => void;
   onAddEmergency?: (log: EmergencyLog) => void;
@@ -46,19 +51,49 @@ interface StaffDashboardProps {
   onForceClearSlot?: (slotCode: string, reason: string) => Promise<boolean>;
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
+  /** Trả xe/thu phí một lượt gửi — dùng cho trang "Theo dõi bãi xe". */
+  onCheckOutSession?: (
+    ticketCode: string,
+    paymentMethod: 'Cash' | 'Card' | 'E-Wallet' | 'QR Banking' | 'Crypto' | 'VNPay',
+    finalAmount: number,
+    showAlert?: boolean,
+  ) => boolean;
 }
 
-const STAFF_ROUTES = ['staffdashboard', 'gatecontrol', 'activitylog', 'emergency', 'profile'];
+const STAFF_ROUTES = ['staffdashboard', 'gatecontrol', 'parkingmonitor', 'activitylog', 'emergency', 'profile'];
+
+/** Nhãn loại xe thật cho nhật ký — không để UI tự đoán từ loại khách. */
+const vehicleLabelOf = (key?: VehicleKey) => manualVehicleOptions.find((o) => o.key === key)?.label;
 
 const menuItems = [
   { key: 'staffdashboard', label: 'Bảng điều khiển',   icon: LayoutDashboard              },
   { key: 'gatecontrol',    label: 'Điều khiển cổng',   icon: DoorClosed                   },
+  { key: 'parkingmonitor', label: 'Theo dõi bãi xe',   icon: ParkingCircle                },
   { key: 'activitylog',    label: 'Nhật ký hoạt động', icon: ScrollText                   },
-  { key: 'emergency',      label: 'Quản lý Sự cố',      icon: AlertTriangle, danger: true  },
+  { key: 'emergency',      label: 'Sự cố Ô đỗ',         icon: AlertTriangle, danger: true  },
 ];
 
 const nowLabel = () =>
   new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+// Staff không có lượt gửi cá nhân — "Theo dõi bãi xe" chạy CurrentSession ở
+// chế độ toàn-khách: mọi xe Checked-in trong bãi hiện thành phiên ảo chọn được.
+const EMPTY_SESSION: ParkingSession = {
+  id: '',
+  userId: '',
+  ticketCode: '',
+  licensePlate: '',
+  vehicleType: 'car',
+  checkInTime: '',
+  entryGate: '',
+  floor: '',
+  area: '',
+  slotCode: '',
+  estimatedFee: 0,
+  paymentStatus: 'Unpaid',
+  sessionStatus: 'Cancelled',
+  barrierStatus: 'Closed',
+};
 
 let logSeq = 0;
 const newLogId = () => `AL-live-${Date.now()}-${logSeq++}`;
@@ -67,14 +102,13 @@ export default function StaffDashboard({
   currentUser,
   setView,
   currentView,
-  slots,
-  reservations,
+  slots: allSlots,
+  reservations: allReservations,
   payments,
   pricingRules,
-  feedbacks,
   users = [],
   onConfirmReservation,
-  onRespondFeedback,
+  onCancelReservation,
   onLogout,
   addToast,
   onAddEmergency,
@@ -82,17 +116,34 @@ export default function StaffDashboard({
   onForceClearSlot,
   onSetSlotStatus,
   onUpdateUser,
+  onCheckOutSession,
 }: StaffDashboardProps) {
+  // ── Phân quyền theo bãi ─────────────────────────────────────────────────────
+  // Staff chỉ thấy và xử lý dữ liệu (ô đỗ, đặt chỗ, thông báo...) của bãi mình
+  // được gán (users.assigned_parking_lot). Cô lập tuyệt đối: chưa được gán bãi
+  // → KHÔNG thấy dữ liệu bãi nào (banner bên dưới hướng dẫn liên hệ quản lý),
+  // tuyệt đối không fallback về "thấy tất cả" để tránh lọt thông báo chéo bãi.
+  const staffLotKey = lotKeyOf(currentUser.assignedParkingLot);
+  const slots = React.useMemo(
+    () => (staffLotKey ? allSlots.filter((s) => lotKeyOrDefault(s.parkingLot) === staffLotKey) : []),
+    [allSlots, staffLotKey],
+  );
+  const reservations = React.useMemo(
+    () => (staffLotKey ? allReservations.filter((r) => lotKeyOrDefault(r.parkingLot) === staffLotKey) : []),
+    [allReservations, staffLotKey],
+  );
+
   const [gates] = useState<Gate[]>(initialGates);
-  const [accessLogs, setAccessLogs] = useState<AccessLog[]>(initialAccessLogs);
+  // Khôi phục nhật ký từ localStorage khi mở lại trang — trước đây accessLogs
+  // chỉ tồn tại trong bộ nhớ React nên F5 là mất sạch, chỉ còn lại 1-2 dòng
+  // do effect diff reservations dựng tạm lại bên dưới.
+  const [accessLogs, setAccessLogs] = useState<AccessLog[]>(() => loadAccessLogs() ?? initialAccessLogs);
+  useEffect(() => { saveAccessLogs(accessLogs); }, [accessLogs]);
   const [liveScans, setLiveScans] = useState<ScanEvent[]>([]);
   const [emergencyLogs, setEmergencyLogs] = useState<EmergencyLog[]>(initialEmergencyLogs);
   const [confirmedReservations, setConfirmedReservations] = useState<Set<string>>(new Set());
   const [iotStatus, setIotStatus] = useState<'connecting' | 'online' | 'offline' | 'simulated'>('connecting');
   const [bellOpen, setBellOpen] = useState(false);
-  // Which tab EmergencyReport should open on — bell feedback alerts jump
-  // straight to the "Phản hồi Người dùng" tab instead of the default one.
-  const [emergencyTab, setEmergencyTab] = useState<'slot-issue' | 'user-feedback' | undefined>(undefined);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const bellRef = useRef<HTMLDivElement>(null);
@@ -101,6 +152,31 @@ export default function StaffDashboard({
 
   const connRef = useRef<ReturnType<typeof connectIot> | null>(null);
   const prevReservationsRef = useRef(reservations);
+
+  // Vé cổng (khách lượt) đang hoạt động — poll mỗi 5s để trang "Theo dõi bãi xe"
+  // thấy xe vào/ra gần như thời gian thực.
+  const [liveSessions, setLiveSessions] = useState<ParkingSession[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      fetchActiveSessions()
+        .then((list) => { if (!cancelled) setLiveSessions(list); })
+        .catch(() => {});
+    load();
+    const t = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  // liveSessions is bãi-agnostic (GET /api/sessions?active=true) — scope it to
+  // this staff's lot the same way slots/reservations are scoped, by matching
+  // each session's slot_code against a slot that belongs to this lot. This is
+  // what lets "Xe đang đỗ trong bãi" also show walk-ins (no reservation), not
+  // just reservation-based check-ins.
+  const lotSlotCodes = React.useMemo(() => new Set(slots.map((s) => s.slotCode)), [slots]);
+  const sessions = React.useMemo(
+    () => liveSessions.filter((s) => s.sessionStatus === 'Active' && s.slotCode && lotSlotCodes.has(s.slotCode)),
+    [liveSessions, lotSlotCodes],
+  );
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -130,22 +206,33 @@ export default function StaffDashboard({
         !prev.find((p) => p.id === r.id && p.status === 'Checked-in'),
     );
     if (newCheckedIn.length > 0) {
-      setAccessLogs((prevLogs) => [
-        ...newCheckedIn.map((r) => ({
-          id: newLogId(),
-          gateId: 'A',
-          vehicleId: r.licensePlate,
-          action: `Check-in đặt chỗ (${r.reservationCode})`,
-          direction: 'entry' as const,
-          status: 'GRANTED' as const,
-          time: nowLabel(),
-          recognition: 'casual' as const,
-        })),
-        ...prevLogs,
-      ]);
+      // Nhật ký giờ được khôi phục từ localStorage sau reload, nên cache
+      // reservations cũ (cũng từ localStorage) có thể lệch trạng thái so với
+      // backend và khiến hiệu ứng này tưởng nhầm là "vừa check-in" — chặn
+      // trùng bằng cách bỏ qua nếu dòng log tương ứng đã tồn tại.
+      setAccessLogs((prevLogs) => {
+        const already = new Set(prevLogs.map((l) => l.action));
+        const toAdd = newCheckedIn.filter((r) => !already.has(`Check-in đặt chỗ (${r.reservationCode})`));
+        if (toAdd.length === 0) return prevLogs;
+        return [
+          ...toAdd.map((r) => ({
+            id: newLogId(),
+            gateId: 'A',
+            vehicleId: r.licensePlate,
+            action: `Check-in đặt chỗ (${r.reservationCode})`,
+            direction: 'entry' as const,
+            status: 'GRANTED' as const,
+            time: nowLabel(),
+            recognition: 'casual' as const,
+            vehicleType: vehicleLabelOf(r.vehicleType),
+          })),
+          ...prevLogs,
+        ];
+      });
     }
 
-    // Detect new Pending bookings → show popup + toast
+    // Detect new Pending bookings → show popup + toast + ghi nhận "CHƯA VÀO"
+    // vào nhật ký (xe đã đặt chỗ nhưng chưa tới bãi, staff chưa check-in).
     const newPending = reservations.filter(
       (r) =>
         r.status === 'Pending' &&
@@ -154,6 +241,26 @@ export default function StaffDashboard({
     if (newPending.length > 0) {
       setBookingAlert(newPending[0]);
       addToast(`Yêu cầu đặt chỗ mới: ${newPending[0].slotCode ?? ''} — ${newPending[0].licensePlate}`, 'info');
+      setAccessLogs((prevLogs) => {
+        const already = new Set(prevLogs.map((l) => l.action));
+        const toAdd = newPending.filter((r) => !already.has(`Đặt chỗ mới (${r.reservationCode}) — xe chưa tới bãi`));
+        if (toAdd.length === 0) return prevLogs;
+        return [
+          ...toAdd.map((r) => ({
+            id: newLogId(),
+            gateId: 'A',
+            vehicleId: r.licensePlate,
+            action: `Đặt chỗ mới (${r.reservationCode}) — xe chưa tới bãi`,
+            direction: 'entry' as const,
+            status: 'PENDING' as const,
+            time: nowLabel(),
+            recognition: 'casual' as const,
+            vehicleType: vehicleLabelOf(r.vehicleType),
+            notArrivedYet: true,
+          })),
+          ...prevLogs,
+        ];
+      });
     }
 
     prevReservationsRef.current = reservations;
@@ -177,6 +284,7 @@ export default function StaffDashboard({
               status: 'GRANTED',
               time: nowLabel(),
               recognition: 'subscriber',
+              vehicleType: vehicleLabelOf(scan.vehicleType),
               fee: 0,
             },
             ...prev,
@@ -185,21 +293,10 @@ export default function StaffDashboard({
           setTimeout(() => {
             setLiveScans((prev) => prev.filter((s) => s.id !== scan.id));
           }, 4000);
-        } else if (scan.recognition === 'unknown') {
-          setAccessLogs((prev) => [
-            {
-              id: newLogId(),
-              gateId: scan.gateId,
-              vehicleId: 'KHÔNG XÁC ĐỊNH',
-              action: 'Nhận diện biển số thất bại',
-              direction: scan.direction,
-              status: 'DENIED',
-              time: nowLabel(),
-              recognition: 'unknown',
-            },
-            ...prev,
-          ]);
         }
+        // Lượt quét không đọc được biển số CHỈ nằm ở hàng đợi chờ xử lý —
+        // không tự đổ dòng "KHÔNG XÁC ĐỊNH" vào nhật ký. Nhật ký chỉ ghi khi
+        // staff thao tác thật (cho qua / từ chối) qua handleConfirmScan/handleDenyScan.
       },
     });
     connRef.current = conn;
@@ -232,6 +329,7 @@ export default function StaffDashboard({
         status,
         time: nowLabel(),
         recognition: scan.recognition,
+        vehicleType: vehicleLabelOf(vehicleType),
         fee,
         handledBy: currentUser.fullName,
       },
@@ -258,7 +356,11 @@ export default function StaffDashboard({
       ...prev,
     ]);
     setLiveScans((prev) => prev.filter((s) => s.id !== scan.id));
-    addToast('Đã từ chối lượt quét.', 'info');
+    // Lượt quét đến từ DB (id dạng "RFID-<scan_id>") → xóa hẳn bản ghi + ảnh
+    // để nó không quay lại hàng đợi hay lịch sử lượt quét.
+    const dbId = /^RFID-(\d+)$/.exec(scan.id)?.[1];
+    if (dbId) deleteRfidScan(dbId);
+    addToast('Đã từ chối & xóa lượt quét.', 'info');
   };
 
   const handleManualEntry = (
@@ -278,6 +380,7 @@ export default function StaffDashboard({
         status: 'OVERRIDE',
         time: nowLabel(),
         recognition: 'casual',
+        vehicleType: vehicleLabelOf(vehicleType),
         fee: direction === 'exit' ? pricing?.firstHourPrice ?? 0 : 0,
         handledBy: currentUser.fullName,
       },
@@ -294,6 +397,7 @@ export default function StaffDashboard({
     vehicleType: VehicleKey,
     ownerName: string,
     rfidUid: string,
+    collectedFee?: number,
   ) => {
     const pricing = pricingRules.find((p) => p.vehicleType === vehicleType);
     setAccessLogs((prev) => [
@@ -301,12 +405,14 @@ export default function StaffDashboard({
         id: newLogId(),
         gateId,
         vehicleId: plate || rfidUid,
-        action: 'Quẹt thẻ RFID',
+        action: direction === 'exit' ? 'Quẹt thẻ RFID — xe ra, đã thu phí' : 'Quẹt thẻ RFID — xe vào',
         direction,
         status: 'GRANTED',
         time: nowLabel(),
         recognition: 'subscriber',
-        fee: direction === 'exit' ? pricing?.firstHourPrice ?? 0 : 0,
+        vehicleType: vehicleLabelOf(vehicleType),
+        // Xe ra: ghi đúng số tiền thực thu từ vé (trạm OCR truyền sang)
+        fee: direction === 'exit' ? (collectedFee ?? pricing?.firstHourPrice ?? 0) : 0,
         handledBy: currentUser.fullName,
       },
       ...prev,
@@ -331,6 +437,7 @@ export default function StaffDashboard({
           status: 'GRANTED' as const,
           time: nowLabel(),
           recognition: 'casual' as const,
+          vehicleType: vehicleLabelOf(res.vehicleType),
         },
         ...prev,
       ]);
@@ -338,7 +445,30 @@ export default function StaffDashboard({
     addToast('Đã xác nhận yêu cầu đặt chỗ.', 'success');
   };
 
-  const handleSubmitEmergency = (type: IncidentType, description: string, slotCode?: string, floor?: string) => {
+  const handleCancelReservation = (id: string) => {
+    const res = reservations.find((r) => r.id === id);
+    onCancelReservation?.(id);
+    // Ghi nhận hành động hủy đặt chỗ vào nhật ký hoạt động
+    if (res) {
+      setAccessLogs((prev) => [
+        {
+          id: newLogId(),
+          gateId: 'A',
+          vehicleId: res.licensePlate || res.reservationCode,
+          action: `Hủy đặt chỗ (${res.reservationCode})`,
+          direction: 'entry' as const,
+          status: 'DENIED' as const,
+          time: nowLabel(),
+          recognition: 'casual' as const,
+          vehicleType: vehicleLabelOf(res.vehicleType),
+        },
+        ...prev,
+      ]);
+    }
+    addToast('Đã hủy đặt chỗ theo yêu cầu.', 'success');
+  };
+
+  const handleSubmitEmergency =(type: IncidentType, description: string, slotCode?: string, floor?: string) => {
     const newLog: EmergencyLog = {
       id: `EM-${Date.now()}`,
       type,
@@ -356,12 +486,11 @@ export default function StaffDashboard({
   };
 
   const alertsCount = accessLogs.filter((l) => l.status === 'DENIED').length;
-  const newFeedbacksCount = feedbacks.filter((f) => f.status === 'New').length;
   const pendingReservationsCount = reservations.filter((r) => r.status === 'Pending').length;
 
-  // Xe gửi theo lượt còn trong bãi quá 24 giờ — chuông báo kèm chủ xe và mức
-  // phí mới (giá qua đêm + 40% giá lượt). Ticker mỗi phút để mốc 24h được
-  // phát hiện cả khi dữ liệu không đổi.
+  // Xe còn trong bãi đã qua 00:00 (phát sinh phí qua đêm) — chuông báo kèm
+  // chủ xe và mức phí mới. Ticker mỗi phút để mốc 00:00 được phát hiện cả khi
+  // dữ liệu không đổi.
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 60_000);
@@ -373,12 +502,16 @@ export default function StaffDashboard({
       const paid = isReservationPaid(r, payments);
       return { r, fee, paid, due: overstayDue(fee, paid) };
     })
-    .filter((x) => x.fee.overstayed);
+    // Lọc theo surcharge > 0 (thật sự phát sinh thêm tiền), không phải
+    // fee.overstayed — "overstayed" giờ chỉ có nghĩa "đã qua ít nhất 1 đêm",
+    // và xe đặt gói "Qua đêm" luôn qua đêm ngay từ đêm đầu (đã trả trước,
+    // surcharge = 0) nên không nên bị coi là "quá giờ".
+    .filter((x) => x.fee.surcharge > 0);
 
-  const bellCount = newFeedbacksCount + pendingReservationsCount + overstayedVehicles.length;
+  const bellCount = pendingReservationsCount + overstayedVehicles.length;
 
-  // Mỗi xe vừa vượt mốc 24 giờ được ghi một dòng cảnh báo vào Nhật ký hoạt
-  // động (một lần cho mỗi vé trong phiên làm việc).
+  // Mỗi xe vừa phát sinh thêm phí qua đêm được ghi một dòng cảnh báo vào Nhật
+  // ký hoạt động (một lần cho mỗi vé trong phiên làm việc).
   const loggedOverstayIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     const fresh = overstayedVehicles.filter(({ r }) => !loggedOverstayIds.current.has(r.id));
@@ -393,6 +526,7 @@ export default function StaffDashboard({
         status: 'PENDING' as const,
         time: nowLabel(),
         recognition: 'casual' as const,
+        vehicleType: vehicleLabelOf(r.vehicleType),
       })),
       ...prev,
     ]);
@@ -406,16 +540,38 @@ export default function StaffDashboard({
           <GateControl
             gates={gates}
             liveScans={liveScans}
-            accessLogs={accessLogs}
             iotStatus={iotStatus}
             iotTransport={iotTransport}
             pricingRules={pricingRules}
             currentUser={currentUser}
+            reservations={reservations}
+            payments={payments}
             onConfirmScan={handleConfirmScan}
             onDenyScan={handleDenyScan}
             onManualEntry={handleManualEntry}
             onRfidVerified={handleRfidVerified}
-            onNavigate={setView}
+            onGateCommand={(gateId, command) => Boolean(sendCommand(gateId, command))}
+            onAlarm={(description) => handleSubmitEmergency('Other', description)}
+            addToast={addToast}
+          />
+        );
+      case 'parkingmonitor':
+        // Toàn bộ chức năng "Lượt gửi hiện tại" của user, chạy trong cổng staff:
+        // reservations là của MỌI khách trong bãi phụ trách (đã lọc theo bãi).
+        return (
+          <CurrentSessionPage
+            title="Theo dõi bãi xe"
+            subtitle="Theo dõi & quản lý toàn bộ lượt gửi hiện tại của khách — giờ vào, ô đỗ, phí tạm tính và trả xe"
+            currentSession={EMPTY_SESSION}
+            setView={setView}
+            onCheckOutSession={onCheckOutSession ?? (() => false)}
+            pricingRules={pricingRules}
+            currentUser={currentUser}
+            slots={slots}
+            payments={payments}
+            reservations={reservations}
+            activeSessions={liveSessions}
+            onCancelReservation={handleCancelReservation}
           />
         );
       case 'activitylog':
@@ -432,16 +588,10 @@ export default function StaffDashboard({
       case 'emergency':
         return (
           <EmergencyReport
-            initialTab={emergencyTab}
             slots={slots}
             currentUser={currentUser}
             addToast={addToast}
             onCreateIssue={onCreateIssue}
-            feedbacks={feedbacks}
-            onRespondFeedback={(id, response, status) => {
-              onRespondFeedback?.(id, response, status);
-              addToast('Đã lưu phản hồi cho người dùng.', 'success');
-            }}
             onForceClearSlot={onForceClearSlot}
             onSetSlotStatus={onSetSlotStatus}
           />
@@ -451,21 +601,20 @@ export default function StaffDashboard({
           <StaffOverview
             accessLogs={accessLogs}
             reservations={reservations}
+            sessions={sessions}
             slots={slots}
-            feedbacks={feedbacks}
             payments={payments}
             alertsCount={alertsCount}
             confirmedReservations={confirmedReservations}
             onConfirmReservation={handleConfirmReservation}
-            onRespondFeedback={(id, response, status) => {
-              onRespondFeedback?.(id, response, status);
-              addToast('Đã gửi phản hồi tới người dùng.', 'success');
-            }}
+            onCancelReservation={handleCancelReservation}
             onNavigate={setView}
             emergencyLogs={emergencyLogs}
             onSubmitEmergency={handleSubmitEmergency}
             addToast={addToast}
             onSetSlotStatus={onSetSlotStatus}
+            assignedLot={currentUser.assignedParkingLot}
+            actorId={currentUser.id}
           />
         );
     }
@@ -497,7 +646,11 @@ export default function StaffDashboard({
           </div>
           <div className="min-w-0">
             <p className="truncate text-xs font-bold text-slate-800">{menuItems.find(m => m.key === currentView)?.label ?? 'Bảng điều khiển'}</p>
-            <p className="truncate text-[10px] text-slate-400">Nhà ga A · Cổng 2</p>
+            <p className="truncate text-[10px] text-slate-400">
+              {currentUser.assignedParkingLot
+                ? `Bãi phụ trách: ${currentUser.assignedParkingLot}`
+                : 'Chưa gán bãi phụ trách'}
+            </p>
           </div>
         </div>
 
@@ -557,7 +710,7 @@ export default function StaffDashboard({
             <div className="relative" ref={bellRef}>
               <button
                 className="relative text-slate-500 hover:text-slate-700"
-                title={`${newFeedbacksCount} phản hồi mới, ${pendingReservationsCount} đặt chỗ chờ xác nhận, ${overstayedVehicles.length} xe quá giờ`}
+                title={`${pendingReservationsCount} đặt chỗ chờ xác nhận, ${overstayedVehicles.length} xe quá giờ`}
                 onClick={() => setBellOpen(o => !o)}
               >
                 <Bell className="h-5 w-5" />
@@ -583,7 +736,7 @@ export default function StaffDashboard({
                         onClick={() => { setBellOpen(false); setView('staffdashboard'); }}
                       >
                         <p className="text-[10px] font-bold text-amber-600 uppercase">
-                          Xe gửi quá giờ
+                          Xe đã qua đêm
                         </p>
                         <p className="text-xs font-semibold text-slate-800">
                           {r.licensePlate} · {users.find((u) => u.id === r.userId)?.fullName ?? 'Khách vãng lai'}
@@ -591,33 +744,12 @@ export default function StaffDashboard({
                         <p className="text-[10px] text-slate-500 mt-0.5">
                           Còn thu: <span className="font-bold text-amber-700">{formatCurrency(due)}</span>
                           {paid
-                            ? ` (phụ phí 40% — giá vé ${formatCurrency(fee.base)} đã thanh toán)`
-                            : ` (giá vé ${formatCurrency(fee.base)} + phụ phí 40% ${formatCurrency(fee.surcharge)})`}
+                            ? ` (phí qua đêm — giá vé ${formatCurrency(fee.base)} đã thanh toán)`
+                            : ` (giá vé ${formatCurrency(fee.base)} + phí qua đêm ${formatCurrency(fee.surcharge)})`}
                         </p>
                         <p className="text-[9px] text-slate-400 mt-0.5">
                           {r.reservationCode} · đến dự kiến {r.date} {r.startTime}
                         </p>
-                      </div>
-                    ))}
-                    {feedbacks.filter(f => f.status === 'New').map(fb => (
-                      <div
-                        key={fb.id}
-                        className="px-4 py-3 hover:bg-slate-50 cursor-pointer"
-                        // Feedback alerts land staff on Quản lý Sự cố, opened
-                        // straight on the "Phản hồi Người dùng" tab.
-                        onClick={() => { setBellOpen(false); setEmergencyTab('user-feedback'); setView('emergency'); }}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="flex-1 min-w-0">
-                            <p className="text-[10px] font-bold text-rose-600 uppercase">Yêu cầu hỗ trợ mới</p>
-                            <p className="text-xs font-semibold text-slate-800 truncate">{fb.type}</p>
-                            <p className="text-[10px] text-slate-400 italic line-clamp-1">"{fb.description}"</p>
-                          </div>
-                          <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-bold ${fb.priority === 'High' ? 'bg-rose-100 text-rose-600' : fb.priority === 'Medium' ? 'bg-amber-100 text-amber-600' : 'bg-slate-100 text-slate-500'}`}>
-                            {fb.priority}
-                          </span>
-                        </div>
-                        <p className="text-[9px] text-slate-400 mt-1">{fb.createdAt}</p>
                       </div>
                     ))}
                     {reservations.filter(r => r.status === 'Pending').map(res => (
@@ -676,7 +808,22 @@ export default function StaffDashboard({
           </div>
         </header>
 
-        <main className="p-6">{renderContent()}</main>
+        <main className="p-6">
+          {/* Staff chưa được phân công bãi → toàn bộ dữ liệu rỗng, báo rõ lý do */}
+          {!staffLotKey && (
+            <div className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
+              <Bell className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+              <div>
+                <p className="text-sm font-bold text-amber-800">Bạn chưa được phân công bãi xe</p>
+                <p className="mt-0.5 text-xs text-amber-700">
+                  Dữ liệu ô đỗ, đặt chỗ và thông báo chỉ hiển thị sau khi Quản lý gán bạn phụ trách
+                  một bãi (Quản lý Bãi xe → Nhân viên phụ trách). Vui lòng liên hệ Quản lý.
+                </p>
+              </div>
+            </div>
+          )}
+          {renderContent()}
+        </main>
       </div>
 
       {/* New booking alert popup */}

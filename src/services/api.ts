@@ -1,4 +1,4 @@
-import type { Payment, ParkingSession, Reservation, User, Vehicle } from '../types';
+import type { Payment, ParkingSession, Reservation, User, SavedVehicle as Vehicle } from '../data/mockData';
 
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 

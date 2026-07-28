@@ -286,6 +286,10 @@ export default function ParkingFloorMap({
       {/* ── Parking spaces ── */}
       {enriched.map((sp) => {
         if (sp.hiddenByArea) return null;
+        // Có kho ô đỗ thật (mỗi bãi sức chứa khác nhau) → vị trí không tồn tại
+        // trong bãi thì không vẽ. Không truyền slots (trang demo công khai) →
+        // vẫn vẽ đủ mặt bằng như cũ.
+        if ((slots?.length ?? 0) > 0 && !sp.isReal) return null;
         const isSelected = selectedId === sp.id;
         const isAvail = sp.status === 'Available';
         const clickable = interactive && !sp.dimmedByFilter && (issueMode || isAvail);

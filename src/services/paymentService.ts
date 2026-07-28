@@ -68,6 +68,7 @@ export async function updatePayment(id: string, patch: {
   totalAmount?: number;
   parkingFee?: number;
   extraServiceFee?: number;
+  overtimeFee?: number;
   lostTicketFee?: number;
   discount?: number;
   ticketCode?: string;

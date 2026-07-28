@@ -31,6 +31,8 @@ class UserService {
     status: string;
     password?: string;
     assignedParkingLot?: string;
+    /** id of the logged-in user performing this action — backend verifies their real role against it. */
+    actorId?: string;
   }): Promise<UserRecord> {
     const response = await fetch(buildUrl('/api/users'), {
       method: 'POST',
@@ -52,6 +54,8 @@ class UserService {
     role?: string;
     status?: string;
     assignedParkingLot?: string;
+    /** id of the logged-in user performing this action — backend verifies their real role against it. */
+    actorId?: string;
   }): Promise<UserRecord> {
     const response = await fetch(buildUrl(`/api/users/${id}`), {
       method: 'PUT',
@@ -66,8 +70,9 @@ class UserService {
     return data.user;
   }
 
-  async deleteUser(id: string): Promise<void> {
-    const response = await fetch(buildUrl(`/api/users/${id}`), {
+  async deleteUser(id: string, actorId?: string): Promise<void> {
+    const qs = actorId ? `?actorId=${encodeURIComponent(actorId)}` : '';
+    const response = await fetch(buildUrl(`/api/users/${id}${qs}`), {
       method: 'DELETE',
     });
 

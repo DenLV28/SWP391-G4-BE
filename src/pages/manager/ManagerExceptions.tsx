@@ -1,101 +1,29 @@
-import React, { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
-  ShieldAlert, RefreshCw, Clock3, Timer,
-  ChevronDown, Search,
-  Car, Bike, Truck, Zap, Flame, AlertTriangle, MapPin,
-  ChevronLeft, ChevronRight, MoreHorizontal,
+  Wrench, Clock3, CheckCircle2,
+  ChevronDown, Search, Info, X, Image as ImageIcon,
+  Flame, AlertTriangle, MapPin,
+  ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import type { EmergencyLog } from '../../types/staff';
+import type { SlotIssue } from '../../data/mockData';
+import { ISSUE_TYPE_LABELS, STATUS_CONFIG } from './ManagerIssues';
 
 interface ManagerExceptionsProps {
   setView: (view: string) => void;
   emergencyLogs?: EmergencyLog[];
+  /** Sự cố ô đỗ thật do nhân viên báo cáo — nguồn dữ liệu chính của trang này. */
+  issues?: SlotIssue[];
+  // 3 hành động này dùng LẠI ĐÚNG luồng nghiệp vụ đã có ở trang Sự cố Ô đỗ
+  // (ManagerIssues) — không nhân bản logic, chỉ hiện lại ở đây cho tiện thao
+  // tác ngay trong modal Chi tiết của Xử lý Ngoại lệ.
+  /** Chờ duyệt → Approved ("Đang bảo trì"), đặt ô đỗ vào trạng thái Bảo trì. */
+  onApproveIssue?: (id: string) => void;
+  /** Chờ duyệt → Rejected (từ chối báo cáo, ô đỗ giữ nguyên). */
+  onRejectIssue?: (id: string) => void;
+  /** Approved → Resolved, trả ô đỗ về Available (hoàn thành bảo trì). */
+  onRestoreIssue?: (id: string) => void;
 }
-
-type ExStatus = 'pending' | 'processing' | 'resolved';
-
-interface ExceptionRow {
-  id: string;
-  date: string;
-  time: string;
-  plate: string;
-  vehicleDesc: string;
-  vehicleType: 'car' | 'motorbike' | 'truck' | 'ev';
-  lot: string;
-  title: string;
-  description: string;
-  status: ExStatus;
-}
-
-const ROWS: ExceptionRow[] = [
-  {
-    id: 'EX-001',
-    date: '24/10/2023', time: '14:32:05',
-    plate: '30F-123.45', vehicleDesc: 'Sedan - Toyota Camry', vehicleType: 'car',
-    lot: 'ParkFlow Long Phước',
-    title: 'Quá giờ đỗ xe (>48h)',
-    description: 'Xe chưa rời bãi sau 2 ngày, không thể liên lạc chủ xe qua SDT đã đăng ký.',
-    status: 'pending',
-  },
-  {
-    id: 'EX-002',
-    date: '24/10/2023', time: '13:15:20',
-    plate: '29K1-888.88', vehicleDesc: 'Xe máy - Honda SH', vehicleType: 'motorbike',
-    lot: 'ParkFlow Thủ Đức',
-    title: 'Lỗi đọc thẻ tại lối ra',
-    description: 'Mã thẻ ID: #PF-00921 không khớp với lịch sử vào. Nghi vấn nhầm thẻ.',
-    status: 'processing',
-  },
-  {
-    id: 'EX-003',
-    date: '24/10/2023', time: '10:05:00',
-    plate: '15C-555.55', vehicleDesc: 'Xe tải - Isuzu', vehicleType: 'truck',
-    lot: 'ParkFlow Quận 9',
-    title: 'Cảnh báo Đen (Blacklist)',
-    description: 'Biển số nằm trong danh sách hạn chế của ban quản lý. Hệ thống tự động khóa cổng.',
-    status: 'resolved',
-  },
-  {
-    id: 'EX-004',
-    date: '23/10/2023', time: '22:45:12',
-    plate: '51H-999.01', vehicleDesc: 'Xe điện - Tesla Model 3', vehicleType: 'ev',
-    lot: 'ParkFlow Long Phước',
-    title: 'Lỗi Thanh toán MoMo',
-    description: 'Giao dịch đã trừ tiền trên app nhưng hệ thống chưa ghi nhận trạng thái thành công.',
-    status: 'pending',
-  },
-];
-
-const BAR_DATA = [
-  { day: 'Thứ 2', h: 38 },
-  { day: 'Thứ 3', h: 52 },
-  { day: 'Hôm nay', h: 84, today: true },
-  { day: 'Thứ 5', h: 0 },
-  { day: 'Thứ 6', h: 0 },
-  { day: 'Thứ 7', h: 0 },
-  { day: 'CN',    h: 0 },
-];
-
-const STATUS_STYLE: Record<ExStatus, { badge: string; label: string }> = {
-  pending:    { badge: 'bg-pink-100 text-pink-700 border border-pink-200',   label: 'Đang chờ'     },
-  processing: { badge: 'bg-slate-100 text-slate-600 border border-slate-200',label: 'Đang xử lý'   },
-  resolved:   { badge: 'bg-green-100 text-green-700 border border-green-200',label: 'Đã giải quyết'},
-};
-
-const VehicleIcon = ({ type }: { type: ExceptionRow['vehicleType'] }) => {
-  const cls = 'h-5 w-5';
-  if (type === 'motorbike') return <Bike className={cls} />;
-  if (type === 'truck')     return <Truck className={cls} />;
-  if (type === 'ev')        return <Zap className={cls} />;
-  return <Car className={cls} />;
-};
-
-const ICON_BG: Record<ExceptionRow['vehicleType'], string> = {
-  car:       'bg-blue-50 text-blue-600',
-  motorbike: 'bg-orange-50 text-orange-600',
-  truck:     'bg-slate-100 text-slate-600',
-  ev:        'bg-emerald-50 text-emerald-600',
-};
 
 const EMERGENCY_STATUS_STYLE: Record<string, { badge: string; label: string }> = {
   NEW:      { badge: 'bg-rose-100 text-rose-700 border border-rose-200',       label: 'MỚI'       },
@@ -104,25 +32,67 @@ const EMERGENCY_STATUS_STYLE: Record<string, { badge: string; label: string }> =
   FIXED:    { badge: 'bg-green-100 text-green-700 border border-green-200',    label: 'ĐÃ SỬA'    },
 };
 
-export default function ManagerExceptions({ setView: _setView, emergencyLogs = [] }: ManagerExceptionsProps) {
-  const [searchLot,    setSearchLot]    = useState('Bãi đỗ xe');
-  const [searchPlate,  setSearchPlate]  = useState('');
-  const [filterType,   setFilterType]   = useState('Loại Ngoại lệ');
-  const [filterStatus, setFilterStatus] = useState('Trạng thái');
+const PAGE_SIZE = 8;
+
+type StatusFilter = 'all' | keyof typeof STATUS_CONFIG;
+
+export default function ManagerExceptions({
+  setView: _setView,
+  emergencyLogs = [],
+  issues = [],
+  onApproveIssue,
+  onRejectIssue,
+  onRestoreIssue,
+}: ManagerExceptionsProps) {
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [page, setPage] = useState(1);
+  const [detailIssue, setDetailIssue] = useState<SlotIssue | null>(null);
+
+  const openDetail = (issue: SlotIssue) => setDetailIssue(issue);
+  const closeDetail = () => setDetailIssue(null);
+
+  const typeOptions = useMemo(
+    () => Array.from(new Set(issues.map((i) => i.issueType))),
+    [issues],
+  );
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return issues
+      .filter((i) => statusFilter === 'all' || i.status === statusFilter)
+      .filter((i) => typeFilter === 'all' || i.issueType === typeFilter)
+      .filter((i) => {
+        if (!q) return true;
+        return (
+          i.slotCode.toLowerCase().includes(q) ||
+          i.description.toLowerCase().includes(q) ||
+          i.reportedBy.toLowerCase().includes(q) ||
+          (ISSUE_TYPE_LABELS[i.issueType] ?? i.issueType).toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => new Date(b.reportedAt).getTime() - new Date(a.reportedAt).getTime());
+  }, [issues, search, typeFilter, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  const counts = useMemo(() => {
+    const c: Record<keyof typeof STATUS_CONFIG, number> = { Pending: 0, Approved: 0, Rejected: 0, Resolved: 0 };
+    issues.forEach((i) => { c[i.status] += 1; });
+    return c;
+  }, [issues]);
+
+  const changeFilter = (fn: () => void) => { fn(); setPage(1); };
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 space-y-6">
 
       {/* ── Header ── */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900">Quản lý Ngoại lệ</h1>
-          <p className="mt-1 text-sm text-slate-500">Giám sát và giải quyết các sự cố bất thường trong hệ thống.</p>
-        </div>
-        <button className="flex shrink-0 items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700">
-          <ShieldAlert className="h-4 w-4" />
-          Giải quyết Ngoại lệ
-        </button>
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900">Quản lý Ngoại lệ</h1>
+        <p className="mt-1 text-sm text-slate-500">Giám sát và giải quyết các sự cố ô đỗ bất thường trong hệ thống.</p>
       </div>
 
       {/* ── Staff Emergency Alerts ── */}
@@ -165,48 +135,22 @@ export default function ManagerExceptions({ setView: _setView, emergencyLogs = [
         </div>
       )}
 
-      {/* ── Stat cards ── */}
+      {/* ── Stat cards (số thật từ Sự cố Ô đỗ) ── */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {([
-          {
-            icon: Timer,      iconBg: 'bg-blue-50   text-blue-500',
-            tag: 'Tháng này', tagColor: 'text-slate-400',
-            label: 'Tổng Ngoại lệ', value: '1,284',
-            sub: '+12%↑', subColor: 'text-blue-500',
-          },
-          {
-            icon: RefreshCw,  iconBg: 'bg-orange-50 text-orange-500',
-            tag: 'Cần xử lý', tagColor: 'text-slate-400',
-            label: 'Chờ Giải quyết', value: '42',
-            sub: '-5%↓', subColor: 'text-green-500',
-          },
-          {
-            icon: ShieldAlert, iconBg: 'bg-red-50    text-red-500',
-            tag: 'Khẩn cấp',  tagColor: 'text-red-500',
-            label: 'Sự cố Bảo mật', value: '08',
-            sub: 'Nghiêm trọng', subColor: 'text-red-500',
-          },
-          {
-            icon: Clock3,     iconBg: 'bg-green-50  text-green-500',
-            tag: 'Trung bình', tagColor: 'text-slate-400',
-            label: 'TG Phản hồi TB', value: '14.5',
-            sub: 'phút', subColor: 'text-slate-400',
-          },
+          { icon: Wrench,      iconBg: 'bg-blue-50   text-blue-500',   label: 'Tổng sự cố',    value: issues.length },
+          { icon: Clock3,      iconBg: 'bg-amber-50  text-amber-500',  label: 'Chờ duyệt',      value: counts.Pending },
+          { icon: AlertTriangle, iconBg: 'bg-red-50  text-red-500',    label: 'Đang bảo trì',   value: counts.Approved },
+          { icon: CheckCircle2, iconBg: 'bg-emerald-50 text-emerald-500', label: 'Đã hoàn thành', value: counts.Resolved },
         ] as const).map((s) => {
           const Icon = s.icon;
           return (
             <div key={s.label} className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
-              <div className="flex items-start justify-between">
-                <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${s.iconBg}`}>
-                  <Icon className="h-5 w-5" />
-                </div>
-                <span className={`text-[11px] font-semibold ${s.tagColor}`}>{s.tag}</span>
+              <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${s.iconBg}`}>
+                <Icon className="h-5 w-5" />
               </div>
               <p className="mt-3 text-xs text-slate-500">{s.label}</p>
-              <div className="mt-1 flex items-end gap-2">
-                <span className="text-3xl font-bold text-slate-800">{s.value}</span>
-                <span className={`mb-0.5 text-xs font-semibold ${s.subColor}`}>{s.sub}</span>
-              </div>
+              <p className="mt-1 text-3xl font-bold text-slate-800">{s.value}</p>
             </div>
           );
         })}
@@ -214,166 +158,251 @@ export default function ManagerExceptions({ setView: _setView, emergencyLogs = [
 
       {/* ── Filter bar ── */}
       <div className="flex flex-wrap items-center gap-3">
-        {/* Lot dropdown */}
-        <button className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
-          {searchLot}
-          <ChevronDown className="h-4 w-4 text-slate-400" />
-        </button>
-
-        {/* Plate search */}
+        {/* Plate/slot search */}
         <div className="relative">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <input
-            value={searchPlate}
-            onChange={(e) => setSearchPlate(e.target.value)}
-            placeholder="Tìm biển số/ID..."
-            className="w-52 rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-4 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
+            value={search}
+            onChange={(e) => changeFilter(() => setSearch(e.target.value))}
+            placeholder="Tìm ô đỗ, người báo cáo, mô tả..."
+            className="w-64 rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-4 text-sm text-slate-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
           />
         </div>
 
         {/* Type dropdown */}
-        <button className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
-          {filterType}
-          <ChevronDown className="h-4 w-4 text-slate-400" />
-        </button>
+        <div className="relative">
+          <select
+            value={typeFilter}
+            onChange={(e) => changeFilter(() => setTypeFilter(e.target.value))}
+            className="appearance-none rounded-xl border border-slate-200 bg-white py-2.5 pl-4 pr-9 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 focus:outline-none"
+          >
+            <option value="all">Tất cả loại sự cố</option>
+            {typeOptions.map((t) => (
+              <option key={t} value={t}>{ISSUE_TYPE_LABELS[t] ?? t}</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        </div>
 
         {/* Status dropdown */}
-        <button className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
-          {filterStatus}
-          <ChevronDown className="h-4 w-4 text-slate-400" />
-        </button>
-
+        <div className="relative">
+          <select
+            value={statusFilter}
+            onChange={(e) => changeFilter(() => setStatusFilter(e.target.value as StatusFilter))}
+            className="appearance-none rounded-xl border border-slate-200 bg-white py-2.5 pl-4 pr-9 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 focus:outline-none"
+          >
+            <option value="all">Tất cả trạng thái</option>
+            {(Object.keys(STATUS_CONFIG) as (keyof typeof STATUS_CONFIG)[]).map((s) => (
+              <option key={s} value={s}>{STATUS_CONFIG[s].label}</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        </div>
       </div>
 
       {/* ── Table ── */}
       <div className="overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-sm">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-slate-100">
-              {['Ngày & Giờ','Thông tin Xe','Bãi đỗ','Mô tả Ngoại lệ','Trạng thái','Thao tác'].map((h) => (
-                <th key={h} className="px-5 py-3.5 text-left text-xs font-semibold text-slate-500">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-50">
-            {ROWS.map((row) => {
-              const st = STATUS_STYLE[row.status];
-              return (
-                <tr key={row.id} className="hover:bg-slate-50/60">
-                  {/* Date & Time */}
-                  <td className="px-5 py-4">
-                    <p className="font-medium text-slate-800">{row.date}</p>
-                    <p className="text-xs text-slate-400">{row.time}</p>
-                  </td>
-
-                  {/* Vehicle */}
-                  <td className="px-5 py-4">
-                    <div className="flex items-center gap-3">
-                      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${ICON_BG[row.vehicleType]}`}>
-                        <VehicleIcon type={row.vehicleType} />
-                      </div>
-                      <div>
-                        <p className="font-semibold text-slate-800">{row.plate}</p>
-                        <p className="text-xs text-slate-400">{row.vehicleDesc}</p>
-                      </div>
-                    </div>
-                  </td>
-
-                  {/* Lot */}
-                  <td className="px-5 py-4 text-slate-700">{row.lot}</td>
-
-                  {/* Description */}
-                  <td className="max-w-xs px-5 py-4">
-                    <p className="font-semibold text-slate-800">{row.title}</p>
-                    <p className="mt-0.5 line-clamp-2 text-xs text-slate-500">{row.description}</p>
-                  </td>
-
-                  {/* Status */}
-                  <td className="px-5 py-4">
-                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${st.badge}`}>
-                      {st.label}
-                    </span>
-                  </td>
-
-                  {/* Actions */}
-                  <td className="px-5 py-4">
-                    {row.status === 'resolved' ? (
-                      <div className="flex items-center gap-2">
-                        <button className="text-sm font-medium text-blue-600 hover:underline">Xem lại</button>
-                        <button className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-100">
-                          <MoreHorizontal className="h-4 w-4" />
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="flex items-center gap-2">
-                        <button className={`rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 ${row.status === 'processing' ? 'opacity-50 cursor-not-allowed' : ''}`}>
-                          Chi tiết
-                        </button>
-                        <button className={`rounded-lg px-3 py-1.5 text-xs font-semibold text-white transition ${row.status === 'processing' ? 'bg-slate-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}>
-                          Giải quyết
-                        </button>
-                      </div>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        {paged.length === 0 ? (
+          <div className="flex flex-col items-center gap-3 p-12 text-center text-slate-400">
+            <Wrench className="h-10 w-10 text-slate-200" />
+            <p className="text-sm font-semibold">Không có sự cố nào khớp bộ lọc</p>
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-slate-100">
+                {['Ngày & Giờ', 'Ô đỗ', 'Loại sự cố', 'Người báo cáo', 'Trạng thái', 'Thao tác'].map((h) => (
+                  <th key={h} className="px-5 py-3.5 text-left text-xs font-semibold text-slate-500">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-50">
+              {paged.map((issue) => {
+                const st = STATUS_CONFIG[issue.status];
+                const StatusIcon = st.icon;
+                const [datePart, timePart] = issue.reportedAt.split(' ');
+                return (
+                  <tr key={issue.id} className="hover:bg-slate-50/60">
+                    <td className="px-5 py-4">
+                      <p className="font-medium text-slate-800">{datePart}</p>
+                      <p className="text-xs text-slate-400">{timePart ?? ''}</p>
+                    </td>
+                    <td className="px-5 py-4 font-semibold text-slate-800">{issue.slotCode}</td>
+                    <td className="px-5 py-4 text-slate-700">{ISSUE_TYPE_LABELS[issue.issueType] ?? issue.issueType}</td>
+                    <td className="px-5 py-4 text-slate-700">{issue.reportedBy}</td>
+                    <td className="px-5 py-4">
+                      <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${st.bg} ${st.text}`}>
+                        <StatusIcon className="h-3 w-3" />
+                        {st.label}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4">
+                      <button
+                        onClick={() => openDetail(issue)}
+                        className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition"
+                      >
+                        <Info className="h-3.5 w-3.5" />
+                        Chi tiết
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
 
         {/* Pagination */}
-        <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3">
-          <p className="text-xs text-slate-500">Hiển thị 1 - 10 trong 42 ngoại lệ đang chờ</p>
-          <div className="flex items-center gap-1">
-            <button className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50">
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            {[1,2,3].map((n) => (
-              <button key={n} className={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-medium transition ${n === 1 ? 'bg-blue-600 text-white' : 'border border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-                {n}
+        {filtered.length > 0 && (
+          <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3">
+            <p className="text-xs text-slate-500">
+              Hiển thị {(page - 1) * PAGE_SIZE + 1} - {Math.min(page * PAGE_SIZE, filtered.length)} trong {filtered.length} ngoại lệ
+            </p>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page === 1}
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" />
               </button>
-            ))}
-            <span className="px-1 text-slate-400">...</span>
-            <button className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-sm font-medium text-slate-600 hover:bg-slate-50">5</button>
-            <button className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50">
-              <ChevronRight className="h-4 w-4" />
-            </button>
+              <span className="px-3 text-sm font-medium text-slate-600">{page} / {totalPages}</span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page === totalPages}
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
-      {/* ── Bottom row: trend chart + AI insight ── */}
-      <div className="grid gap-4 lg:grid-cols-3">
-        {/* Bar chart */}
-        <div className="col-span-2 rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-          <h3 className="mb-4 text-sm font-bold text-slate-800">Xu hướng Ngoại lệ</h3>
-          <div className="flex items-end gap-3" style={{ height: 100 }}>
-            {BAR_DATA.map((d) => (
-              <div key={d.day} className="flex flex-1 flex-col items-center gap-1">
-                <div
-                  className={`w-full rounded-t-md ${d.today ? 'bg-slate-800' : 'bg-blue-200'}`}
-                  style={{ height: d.h > 0 ? `${d.h}px` : '4px', opacity: d.h === 0 ? 0.2 : 1 }}
-                />
-                <span className={`text-[10px] ${d.today ? 'font-bold text-slate-700' : 'text-slate-400'}`}>{d.day}</span>
+      {/* ── Detail modal ── */}
+      {detailIssue && (() => {
+        const cfg = STATUS_CONFIG[detailIssue.status];
+        const StatusIcon = cfg.icon;
+        const locked = detailIssue.status === 'Resolved' || detailIssue.status === 'Rejected';
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm" onClick={closeDetail}>
+            <div
+              className="w-full max-w-lg rounded-2xl bg-white shadow-2xl overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-blue-600">Chi tiết ngoại lệ</p>
+                  <p className="mt-0.5 font-mono font-bold text-slate-900">{detailIssue.slotCode}</p>
+                </div>
+                <button onClick={closeDetail} className="rounded-full p-1 text-slate-400 hover:bg-slate-100">
+                  <X className="h-4 w-4" />
+                </button>
               </div>
-            ))}
-          </div>
-        </div>
 
-        {/* AI Insight */}
-        <div className="rounded-2xl bg-blue-600 p-6 text-white shadow-sm">
-          <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-blue-500/50">
-            <ShieldAlert className="h-6 w-6" />
+              <div className="space-y-4 p-6">
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Loại sự cố</p>
+                    <p className="mt-1 font-semibold text-slate-800">{ISSUE_TYPE_LABELS[detailIssue.issueType] ?? detailIssue.issueType}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Trạng thái hiện tại</p>
+                    <p className={`mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-bold ${cfg.bg} ${cfg.text}`}>
+                      <StatusIcon className="h-3 w-3" />
+                      {cfg.label}
+                    </p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Người báo cáo</p>
+                    <p className="mt-1 font-semibold text-slate-800">{detailIssue.reportedBy || '—'}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Thời gian báo cáo</p>
+                    <p className="mt-1 font-semibold text-slate-800">{detailIssue.reportedAt}</p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
+                  <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Mô tả</p>
+                  <p className="text-sm leading-relaxed text-slate-700">{detailIssue.description || 'Không có mô tả.'}</p>
+                </div>
+
+                {detailIssue.imageUrl ? (
+                  <div>
+                    <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">Ảnh đính kèm</p>
+                    <img
+                      src={detailIssue.imageUrl}
+                      alt="Ảnh sự cố"
+                      className="max-h-48 rounded-xl border border-slate-200 bg-white object-contain"
+                    />
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <ImageIcon className="h-4 w-4" />
+                    Không có ảnh đính kèm
+                  </div>
+                )}
+
+                {/* Trạng thái xử lý — Duyệt/Từ chối (Pending) hoặc Khôi phục (Approved),
+                    dùng đúng 3 hành động đã có ở trang Sự cố Ô đỗ. */}
+                <div>
+                  <label className="mb-2 block text-xs font-bold text-slate-700">Trạng thái xử lý</label>
+                  {locked ? (
+                    <div className="flex items-center gap-2 rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2.5 text-xs font-semibold text-emerald-700">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      Sự cố này đã ở trạng thái cuối ({cfg.label}) — không thể chỉnh sửa thêm.
+                    </div>
+                  ) : detailIssue.status === 'Approved' ? (
+                    <div className="space-y-2">
+                      <button
+                        type="button"
+                        onClick={() => { onRestoreIssue?.(detailIssue.id); closeDetail(); }}
+                        className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 py-2.5 text-xs font-bold text-white transition hover:bg-emerald-700"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        Hoàn thành bảo trì — Khôi phục ô đỗ
+                      </button>
+                      <p className="text-[11px] text-slate-500">
+                        Ô đỗ <strong>{detailIssue.slotCode}</strong> đang ở trạng thái Bảo trì — bấm để trả về Trống.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => { onRejectIssue?.(detailIssue.id); closeDetail(); }}
+                        className="rounded-xl border border-slate-200 px-3 py-2.5 text-xs font-bold text-slate-600 transition hover:bg-slate-50"
+                      >
+                        Từ chối
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { onApproveIssue?.(detailIssue.id); closeDetail(); }}
+                        className="rounded-xl bg-red-600 px-3 py-2.5 text-xs font-bold text-white transition hover:bg-red-700"
+                      >
+                        Duyệt — Bảo trì
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex gap-2 border-t border-slate-100 p-4">
+                <button
+                  type="button"
+                  onClick={closeDetail}
+                  className="flex-1 rounded-xl border border-slate-200 px-4 py-3 text-xs font-bold text-slate-600 transition hover:bg-slate-50"
+                >
+                  Đóng
+                </button>
+              </div>
+            </div>
           </div>
-          <h3 className="text-lg font-bold">ParkFlow AI Insight</h3>
-          <p className="mt-2 text-sm text-blue-100">
-            Hôm nay số lượng ngoại lệ "Lỗi thẻ" tăng 15% so với trung bình. Chúng tôi đề xuất kiểm tra đầu đọc thẻ tại Lối ra số 03.
-          </p>
-          <button className="mt-4 w-full rounded-xl bg-white py-2.5 text-sm font-bold text-blue-600 transition hover:bg-blue-50">
-            Chạy Chẩn đoán
-          </button>
-        </div>
-      </div>
+        );
+      })()}
     </div>
   );
 }

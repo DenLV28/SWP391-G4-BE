@@ -55,8 +55,14 @@ export type AccessLog = {
   status: AccessStatus;
   time: string; // display time, e.g. "10:42 AM"
   recognition: RecognitionResult;
+  /** Nhãn loại xe thật tại thời điểm quét (vd "Xe máy / Xe máy điện") — không đoán lại ở UI. */
+  vehicleType?: string;
   fee?: number;
   handledBy?: string;
+  /** Đơn đặt chỗ mới tạo — xe CHƯA vào bãi, staff chưa check-in. Không phải
+   *  sự kiện qua cổng thật nên UI hiển thị hành động "CHƯA VÀO" thay vì
+   *  đọc theo `direction`. */
+  notArrivedYet?: boolean;
 };
 
 export type GateState = 'open' | 'closed';

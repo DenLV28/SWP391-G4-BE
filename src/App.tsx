@@ -22,7 +22,6 @@ import ParkingLotsList from "./pages/public/ParkingLotsList";
 
 // Driver pages
 import MyParking from "./pages/driver/MyParking";
-import CurrentSessionPage from "./pages/driver/CurrentSession";
 import MyReservations from "./pages/driver/MyReservations";
 import PaymentsPage from "./pages/driver/Payments";
 import VNPayReturn from "./pages/driver/VNPayReturn";
@@ -71,12 +70,15 @@ import {
   fetchAllReservations,
   createReservation as apiCreateReservation,
   updateReservation as apiUpdateReservation,
+  deleteReservation as apiDeleteReservation,
+  subscribeToReservationEvents,
 } from "./services/reservationService";
 import {
   fetchPaymentsByUser,
   fetchAllPayments,
   createPayment as apiCreatePayment,
   updatePayment as apiUpdatePayment,
+  deletePayment as apiDeletePayment,
   subscribeToPaymentEvents,
 } from "./services/paymentService";
 import {
@@ -88,6 +90,7 @@ import {
 } from "./services/notificationService";
 import {
   fetchActiveSession,
+  fetchActiveSessionsByUser,
   createSession as apiCreateSession,
   updateSession as apiUpdateSession,
 } from "./services/sessionService";
@@ -108,7 +111,8 @@ import {
   subscribeSessions,
 } from "./services/sessionStore";
 import userService, { UserRecord } from "./services/userService";
-import { fixMojibake } from "./utils/helpers";
+import { fixMojibake, nowLocalStr, localDateISO } from "./utils/helpers";
+import { minutesSinceCreated, SELF_CANCEL_WINDOW_MINUTES, perVisitOverstay, buildCheckedInVehicles, isPaymentVoided, addOneMonth, findActiveMonthlyReservation } from "./utils/reservationPricing";
 import { fetchSlotStatuses, updateSlotStatus, subscribeToSlotEvents, forceClearSlot } from "./services/slotService";
 import { fetchPricingRules } from "./services/pricingService";
 import { fetchIssues, apiCreateIssue, apiUpdateIssue, subscribeToIssueEvents } from "./services/issueService";
@@ -200,7 +204,7 @@ const toAppUser = (record: UserRecord): User => ({
         ? "Active"
         : "Locked",
   assignedParkingLot: record.assignedParkingLot || '',
-  createdAt: record.createdAt ? String(record.createdAt) : new Date().toISOString().split("T")[0],
+  createdAt: record.createdAt ? String(record.createdAt) : localDateISO(),
   passwordUpdatedAt: record.passwordUpdatedAt ?? null,
 });
 
@@ -290,10 +294,10 @@ export default function App() {
       const validViews = [
         "home", "baixe", "info", "slots", "pricing", "pricing-detail", "contact", "login", "register",
         "terms", "privacy", "help",
-        "myparking", "session", "reservations", "payments", "feedback", "profile", "vnpay-return",
+        "myparking", "reservations", "payments", "feedback", "profile", "vnpay-return",
         "admindashboard", "usermanagement", "rolemanagement", "systemconfig",
-        "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "exceptions", "issues",
-        "staffdashboard", "gatecontrol", "activitylog", "emergency",
+        "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "monthlycards", "exceptions",
+        "staffdashboard", "gatecontrol", "parkingmonitor", "activitylog", "emergency",
       ];
 
       const targetView = (hash || "home").split("?")[0];
@@ -306,10 +310,10 @@ export default function App() {
 
       if (!currentUser) {
         const isProtectedRoute = [
-          "myparking", "session", "reservations", "payments", "feedback", "profile",
+          "myparking", "reservations", "payments", "feedback", "profile",
           "admindashboard", "usermanagement", "rolemanagement", "systemconfig",
-          "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "exceptions", "issues",
-          "staffdashboard", "gatecontrol", "activitylog", "emergency",
+          "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "monthlycards", "exceptions",
+          "staffdashboard", "gatecontrol", "parkingmonitor", "activitylog", "emergency",
         ].includes(targetView);
 
         if (isProtectedRoute) {
@@ -395,12 +399,26 @@ export default function App() {
     const sync = async () => {
       const dbSlots = await fetchSlotStatuses();
       if (!dbSlots.length) return;
-      setSlots((prev) =>
-        prev.map((s) => {
-          const db = dbSlots.find((d) => d.slotCode === s.slotCode);
-          return db && db.status !== s.status ? { ...s, status: db.status } : s;
-        }),
-      );
+      // DB là nguồn chân lý cho kho ô đỗ: cập nhật status + parkingLot cho ô đã
+      // có, BỔ SUNG ô chỉ tồn tại trong DB (TD-*/LP-* của Thủ Đức & Long Phước)
+      // và LOẠI ô đã bị xóa khỏi DB (mỗi bãi sức chứa khác nhau, localStorage
+      // cũ có thể còn ô ma) — nhờ vậy sơ đồ 3 bãi đồng bộ cho User/Staff/Manager.
+      setSlots((prev) => {
+        const known = new Set(prev.map((s) => s.slotCode));
+        const dbCodes = new Set(dbSlots.map((d) => d.slotCode));
+        const merged = prev
+          .filter((s) => dbCodes.has(s.slotCode))
+          .map((s) => {
+            const db = dbSlots.find((d) => d.slotCode === s.slotCode);
+            if (!db) return s;
+            const statusChanged = db.status !== s.status;
+            const lotChanged = !!db.parkingLot && db.parkingLot !== s.parkingLot;
+            if (!statusChanged && !lotChanged) return s;
+            return { ...s, status: db.status, parkingLot: db.parkingLot ?? s.parkingLot };
+          });
+        const additions = dbSlots.filter((d) => !known.has(d.slotCode));
+        return additions.length ? [...merged, ...additions] : merged;
+      });
     };
     // Pricing rides the same interval — Manager's edits show up for Staff/User
     // without a full reload, no need for a separate timer.
@@ -540,6 +558,13 @@ export default function App() {
   // so two tabs don't ping-pong saves back and forth.
   const skipNextReservationSave = useRef(false);
 
+  // In-flight "create" POSTs, keyed by local reservation id. A discard fired
+  // right after booking (Hủy đặt chỗ / X on the success modal) must wait for
+  // its matching create to land before deleting — otherwise the DELETE can
+  // reach the server before the POST commits, becomes a no-op, and the
+  // reservation survives as an orphaned Pending row that staff still sees.
+  const pendingReservationCreates = useRef<Map<string, Promise<void>>>(new Map());
+
   // IDs of reservations the user explicitly cleared — persisted in localStorage so
   // polling cannot bring them back, even if the DB update is delayed or fails.
   const hiddenResIds = useRef<Set<string>>(
@@ -588,6 +613,11 @@ export default function App() {
     const sessions = loadSessions();
     return sessions?.[0] ?? initialParkingSession;
   });
+  // currentSession chỉ theo dõi MỘT vé (thiết kế ban đầu: mỗi tài khoản một
+  // xe) — một tài khoản có thể có nhiều xe cùng đỗ (vd. xe đăng ký hộ người
+  // khác), nên "Xe đang đỗ tại bãi" của driver cần TOÀN BỘ danh sách này,
+  // không chỉ currentSession.
+  const [driverActiveSessions, setDriverActiveSessions] = useState<ParkingSession[]>([]);
   const skipNextSessionSave = useRef(false);
 
   useEffect(() => {
@@ -613,6 +643,28 @@ export default function App() {
     const unsubscribe = subscribeReservations((next) => {
       skipNextReservationSave.current = true;
       setReservations(next);
+    });
+    return unsubscribe;
+  }, []);
+
+  // Đồng bộ thời gian thực giữa driver ↔ staff/manager qua server push (SSE):
+  // user đặt chỗ → staff thấy yêu cầu ngay; staff xác nhận/hủy → driver thấy
+  // ngay — không phải chờ chu kỳ poll 10 giây. Poll vẫn giữ nguyên làm lưới an
+  // toàn khi mất kết nối SSE tạm thời.
+  useEffect(() => {
+    const unsubscribe = subscribeToReservationEvents((e) => {
+      skipNextReservationSave.current = true;
+      if (e.type === 'deleted') {
+        setReservations((prev) => prev.filter((r) => r.id !== e.id));
+      } else {
+        setReservations((prev) => {
+          const idx = prev.findIndex((r) => r.id === e.reservation.id);
+          if (idx === -1) return [e.reservation, ...prev];
+          const next = [...prev];
+          next[idx] = e.reservation;
+          return next;
+        });
+      }
     });
     return unsubscribe;
   }, []);
@@ -731,6 +783,10 @@ export default function App() {
         })
         .catch(() => {});
 
+      fetchActiveSessionsByUser(uid)
+        .then((apiSessions) => setDriverActiveSessions(apiSessions as any))
+        .catch(() => {});
+
       fetchFeedbacksByUser(uid)
         .then((apiFb) => {
           if (apiFb.length === 0) return;
@@ -811,6 +867,9 @@ export default function App() {
               return apiSession as any;
             });
           }
+          fetchActiveSessionsByUser(uid)
+            .then((apiSessions) => setDriverActiveSessions(apiSessions as any))
+            .catch(() => {});
         }
         if (isStaffOrManager) {
           const [apiRes, apiFb, apiPay] = await Promise.all([
@@ -913,6 +972,7 @@ export default function App() {
                 phone: apiUser.phone,
                 role: apiUser.role,
                 status: apiUser.status,
+                assignedParkingLot: apiUser.assignedParkingLot,
               };
             } else {
               merged.push(apiUser);
@@ -939,11 +999,14 @@ export default function App() {
           }
 
           // Refresh display fields while preserving the local ID.
+          // assignedParkingLot: staff đang đăng nhập nhận phân công bãi mới của
+          // manager trong vòng 5s, không cần đăng nhập lại.
           if (
             latestUser.fullName !== currentUser.fullName ||
             latestUser.role !== currentUser.role ||
             latestUser.phone !== currentUser.phone ||
-            latestUser.status !== currentUser.status
+            latestUser.status !== currentUser.status ||
+            (latestUser.assignedParkingLot || '') !== (currentUser.assignedParkingLot || '')
           ) {
             const refreshedUser: User = {
               ...currentUser,
@@ -951,6 +1014,7 @@ export default function App() {
               phone: latestUser.phone,
               role: latestUser.role,
               status: latestUser.status,
+              assignedParkingLot: latestUser.assignedParkingLot,
             };
             setCurrentUser(refreshedUser);
             window.localStorage.setItem(SESSION_KEY, JSON.stringify(refreshedUser));
@@ -1011,7 +1075,13 @@ export default function App() {
   };
 
   // Driver actions
-  const handleAddReservation = (newRes: any): Reservation | null => {
+  // slotsOverride: dùng khi caller vừa fetch riêng một bản ô đỗ MỚI NHẤT từ
+  // backend (vd. handleMonthlyBookingPaid, chạy sau khi quay lại từ VNPay —
+  // tại thời điểm đó `slots` trong closure có thể vẫn là bản cache cũ từ
+  // localStorage vì App vừa mount lại, effect fetch tươi chưa kịp chạy xong).
+  // Không có override thì dùng state hiện tại như trước giờ.
+  const handleAddReservation = (newRes: any, slotsOverride?: Slot[]): Reservation | null => {
+    const slotPool = slotsOverride ?? slots;
     // A physical vehicle can't be booked/parked in two places at once — block a
     // second reservation for the same plate while one is still pending or the
     // car is already checked in, otherwise check-in later produces two live
@@ -1032,12 +1102,40 @@ export default function App() {
       );
       return null;
     }
+    // Xe vào bãi không qua đặt chỗ (khách vãng lai) chỉ có bản ghi trong
+    // parking_sessions, không nằm trong reservations — vẫn phải chặn đặt chỗ
+    // mới cho những xe này, nếu không "conflicting" ở trên bỏ sót và xe đang
+    // thực sự nằm trong bãi vẫn đặt tiếp được như trong ảnh chụp báo lỗi.
+    const conflictingSession = normalizedPlate
+      ? driverActiveSessions.find(
+          (s) =>
+            s.sessionStatus === 'Active' &&
+            String(s.licensePlate || '').trim().toUpperCase().replace(/\s+/g, '') === normalizedPlate,
+        )
+      : undefined;
+    if (conflictingSession) {
+      alert(`Xe ${newRes.licensePlate} hiện đang đỗ trong bãi (vé ${conflictingSession.ticketCode}). Vui lòng cho xe ra trước khi đặt chỗ mới.`);
+      return null;
+    }
+    // Thẻ tháng: mỗi xe chỉ 1 thẻ còn hiệu lực tại một thời điểm. Không dựa
+    // vào check "Pending/Confirmed/Checked-in" ở trên vì thẻ tháng dao động
+    // qua lại Checked-in/Completed mỗi lần xe ra/vào trong tháng — "Completed"
+    // không có nghĩa thẻ đã hết hạn, nên cần check riêng theo ngày hết hạn.
+    if (newRes.note === 'Theo tháng') {
+      const existingMonthly = findActiveMonthlyReservation(newRes.licensePlate, reservations);
+      if (existingMonthly) {
+        alert(
+          `Xe ${newRes.licensePlate} đang có một thẻ tháng còn hiệu lực (${existingMonthly.reservationCode}, hết hạn ${addOneMonth(existingMonthly.date.split('T')[0])}). Vui lòng đợi thẻ hết hạn rồi mới đặt lại.`,
+        );
+        return null;
+      }
+    }
 
     const code = `RSV-${Math.floor(1000 + Math.random() * 9000)}`;
     let assignedSlotCode = newRes.slotCode;
 
     if (!assignedSlotCode && newRes.slotAssignmentMode === "Auto") {
-      const availableSlot = slots.find(
+      const availableSlot = slotPool.find(
         (s) =>
           s.floorName === newRes.floor &&
           s.areaName === newRes.area &&
@@ -1046,6 +1144,14 @@ export default function App() {
       );
       if (availableSlot) {
         assignedSlotCode = availableSlot.slotCode;
+      } else {
+        // Không khớp đúng khu/tầng đã chọn lúc đặt (vd. dữ liệu ô đỗ đổi khác
+        // trong lúc khách thao tác trên VNPay) — vẫn cố xếp một ô Trống bất kỳ
+        // cùng loại xe, còn hơn để đặt chỗ không có ô nào (bãi không cập nhật).
+        const fallbackSlot = slotPool.find(
+          (s) => s.vehicleType === newRes.vehicleType && s.status === "Available",
+        );
+        if (fallbackSlot) assignedSlotCode = fallbackSlot.slotCode;
       }
     }
 
@@ -1066,8 +1172,19 @@ export default function App() {
 
     setReservations((prev) => [r, ...prev]);
 
-    // Persist to DB (fire-and-forget; local state is already updated).
-    apiCreateReservation(r).catch(() => {});
+    // Persist to DB (local state is already updated). The promise is tracked
+    // so a discard fired right after this (see handleDiscardReservation) can
+    // wait for it instead of racing it.
+    const createPromise = apiCreateReservation(r).then(
+      () => {},
+      () => {},
+    );
+    pendingReservationCreates.current.set(r.id, createPromise);
+    createPromise.finally(() => {
+      if (pendingReservationCreates.current.get(r.id) === createPromise) {
+        pendingReservationCreates.current.delete(r.id);
+      }
+    });
 
     // Update areas slots stats
     setAreas((prev) =>
@@ -1097,33 +1214,129 @@ export default function App() {
       }),
     );
 
-    // Slot becomes Pending until staff confirms
+    // Thẻ tháng đã thanh toán xong (không phải "chờ duyệt" như đặt chỗ
+    // thường) → đánh dấu ô đỗ "Locked" (sơ đồ hiển thị "Xe tháng", xem legend
+    // ParkingFloorMap) để giữ riêng cho khách suốt tháng, không lẫn với ô
+    // đang thật sự chờ staff duyệt. Ô chỉ về lại "Available" khi thẻ bị hủy
+    // hoặc hết hạn — xe ra/vào trong tháng không được trả ô về trống.
+    const slotStatusForNewRes = newRes.note === 'Theo tháng' ? 'Locked' : 'Pending';
     setSlots((prev) =>
       prev.map((s) => {
         if (s.slotCode === assignedSlotCode) {
-          return { ...s, status: "Pending" };
+          return { ...s, status: slotStatusForNewRes };
         }
         return s;
       }),
     );
-    if (assignedSlotCode) updateSlotStatus(assignedSlotCode, 'Pending').catch(() => {});
+    if (assignedSlotCode) updateSlotStatus(assignedSlotCode, slotStatusForNewRes).catch(() => {});
 
     return r;
+  };
+
+  // Gói tháng: VNPay báo thanh toán thành công cho một đặt chỗ tháng CHƯA
+  // từng tồn tại (AvailableSlots chỉ lưu tạm thông tin, không gọi
+  // handleAddReservation trước khi thanh toán) — tạo đặt chỗ thật ngay bây
+  // giờ rồi mới đánh dấu hóa đơn (đã tạo Unpaid từ trước) là Paid. Nhờ vậy,
+  // nếu khách không thanh toán/hủy giữa chừng thì không có đặt chỗ nào được
+  // tạo — đúng yêu cầu "bắt buộc thanh toán trước mới được đặt".
+  const handleMonthlyBookingPaid = async (
+    paymentId: string,
+    booking: import('./pages/driver/VNPayReturn').PendingMonthlyBooking,
+  ) => {
+    // Trang này vừa mount lại sau khi quay về từ VNPay (điều hướng ra ngoài
+    // domain rồi quay lại) — `slots` trong state lúc này có thể vẫn là bản
+    // cache cũ từ localStorage, effect fetch tươi của App chưa chắc đã chạy
+    // xong. Tự fetch một bản MỚI NHẤT ở đây để việc xếp ô cho đặt chỗ tháng
+    // luôn dựa trên tình trạng bãi thật, không bị "bỏ trống ô" do dữ liệu cũ.
+    let freshSlots: Slot[] | undefined;
+    try {
+      freshSlots = await fetchSlotStatuses();
+      setSlots(freshSlots);
+    } catch { /* fetch lỗi — vẫn thử tạo đặt chỗ với slots hiện có trong state */ }
+
+    const created = handleAddReservation(booking, freshSlots);
+    if (!created) {
+      alert(
+        'Thanh toán đã thành công nhưng không thể tạo đặt chỗ tháng (biển số này đang có một đặt chỗ khác chưa hoàn tất). Vui lòng liên hệ quản lý bãi để được hỗ trợ hoàn tiền.',
+      );
+      return;
+    }
+    handleConfirmPayment(paymentId, 'VNPay', null);
+  };
+
+  // Hủy NGAY sau khi vừa đặt (nút Hủy / dấu X trên modal thành công): đặt chỗ
+  // chưa được xác nhận/thanh toán → XÓA HẲN khỏi DB và danh sách, không để lại
+  // bản ghi Cancelled (tránh poll 10s kéo trạng thái Pending từ DB sống lại).
+  const handleDiscardReservation = (id: string) => {
+    const targetRes = reservations.find((r) => r.id === id);
+    if (!targetRes) return;
+    setReservations((prev) => prev.filter((r) => r.id !== id));
+    // Xóa theo reservationCode: id cục bộ (RSV-<timestamp>) khác reservation_id
+    // trong DB ngay sau khi đặt — code là khóa ổn định ở cả hai phía.
+    // Chờ POST tạo đơn (nếu còn đang chạy) hoàn tất trước khi gọi DELETE —
+    // nếu không, DELETE có thể tới server trước khi POST commit, coi như xóa
+    // hụt (no-op), và đơn Pending vẫn sống sót trong DB rồi bị đẩy tới staff
+    // qua SSE dù phía user đã "hủy".
+    const pendingCreate = pendingReservationCreates.current.get(id) ?? Promise.resolve();
+    pendingReservationCreates.current.delete(id);
+    pendingCreate.finally(() => {
+      apiDeleteReservation(targetRes.reservationCode).catch(() => {});
+    });
+    // Trả ô đỗ về Trống như luồng hủy thường
+    if (targetRes.slotCode) {
+      setSlots((prev) => prev.map((s) => (s.slotCode === targetRes.slotCode ? { ...s, status: 'Available' } : s)));
+      updateSlotStatus(targetRes.slotCode, 'Available').catch(() => {});
+    }
+    // Nếu đã lỡ tạo hóa đơn Unpaid (vd bấm "Thanh toán VNPay" rồi lỗi giữa
+    // chừng) trước khi hủy ngay đơn này — dọn luôn, không để sót trên trang
+    // Thanh toán (mirror handleCancelReservation).
+    const staleUnpaid = payments.filter(
+      (p) => p.status !== 'Paid' && (p.reservationCode === targetRes.reservationCode || p.ticketCode === targetRes.reservationCode),
+    );
+    if (staleUnpaid.length > 0) {
+      const staleIds = new Set(staleUnpaid.map((p) => p.id));
+      setPayments((prev) => prev.filter((p) => !staleIds.has(p.id)));
+      staleUnpaid.forEach((p) => apiDeletePayment(p.id).catch(() => {}));
+    }
+    // Hoàn thống kê areas/floors đã trừ lúc tạo (mirror handleCancelReservation)
+    // — nếu không, dashboard sẽ bị lệch reservedSlots/availableSlots vĩnh viễn
+    // mỗi lần user hủy ngay một đơn vừa đặt.
+    setAreas((prev) =>
+      prev.map((a) => {
+        if (a.areaName === targetRes.area) {
+          return {
+            ...a,
+            availableSlots: a.availableSlots + 1,
+            reservedSlots: Math.max(0, a.reservedSlots - 1),
+          };
+        }
+        return a;
+      }),
+    );
+    setFloors((prev) =>
+      prev.map((f) => {
+        if (f.floorName === targetRes.floor) {
+          return {
+            ...f,
+            availableSlots: f.availableSlots + 1,
+            reservedSlots: Math.max(0, f.reservedSlots - 1),
+          };
+        }
+        return f;
+      }),
+    );
+    addToast(`Đã hủy đặt chỗ ${targetRes.reservationCode}.`, 'info');
   };
 
   const handleCancelReservation = (id: string) => {
     const targetRes = reservations.find((r) => r.id === id);
     if (!targetRes) return;
 
-    // Check cancellation lead time: only block if start time is in the future but < 15 min away
-    const dateOnly = targetRes.date.split('T')[0];
-    const timeOnly = targetRes.startTime.slice(0, 5);
-    const startDateTime = new Date(`${dateOnly}T${timeOnly}:00`);
-    const diffMs = startDateTime.getTime() - Date.now();
-    const diffMins = diffMs / (1000 * 60);
-
-    if (diffMins > 0 && diffMins < 15) {
-      alert('Không thể hủy đặt chỗ. Chỉ được hủy trước ít nhất 15 phút so với giờ bắt đầu.');
+    // Free-cancel window: user can self-cancel only within 5 minutes of
+    // creating the reservation (Pending or Confirmed) — past that, the
+    // booking is left to staff to manage.
+    if (minutesSinceCreated(targetRes) > SELF_CANCEL_WINDOW_MINUTES) {
+      alert(`Không thể hủy đặt chỗ. Chỉ được tự hủy trong vòng ${SELF_CANCEL_WINDOW_MINUTES} phút sau khi đặt chỗ. Vui lòng liên hệ nhân viên bãi đỗ để được hỗ trợ hủy.`);
       return;
     }
 
@@ -1131,6 +1344,20 @@ export default function App() {
       prev.map((r) => (r.id === id ? { ...r, status: "Cancelled" } : r)),
     );
     apiUpdateReservation(id, { status: 'Cancelled', cancelledBy: 'user' }).catch(() => {});
+
+    // Đặt chỗ hủy rồi thì hóa đơn Unpaid gắn với nó (nếu có, vd bấm "Thanh
+    // toán VNPay" nhưng chưa hoàn tất) không còn ý nghĩa gì nữa — chưa hề có
+    // tiền thật nào chuyển, để lại chỉ khiến trang Thanh toán hiện một chiếc
+    // xe đã hủy như đang nợ tiền. Payment Đã thanh toán thì giữ nguyên (là
+    // lịch sử giao dịch thật, không được xóa).
+    const staleUnpaid = payments.filter(
+      (p) => p.status !== 'Paid' && (p.reservationCode === targetRes.reservationCode || p.ticketCode === targetRes.reservationCode),
+    );
+    if (staleUnpaid.length > 0) {
+      const staleIds = new Set(staleUnpaid.map((p) => p.id));
+      setPayments((prev) => prev.filter((p) => !staleIds.has(p.id)));
+      staleUnpaid.forEach((p) => apiDeletePayment(p.id).catch(() => {}));
+    }
 
     // Revert areas slots stats
     setAreas((prev) =>
@@ -1222,7 +1449,7 @@ export default function App() {
       return s;
     }));
 
-    alert("Reservation expired. The reserved slot has been released.");
+    alert("Đặt chỗ đã hết hạn. Chỗ đỗ đã được giải phóng.");
   };
 
   // Auto-expire reservations background job
@@ -1257,248 +1484,6 @@ export default function App() {
 
     return () => clearInterval(interval);
   }, [reservations, currentUser]);
-
-  const handleCheckInReservation = (
-    reservationId: string,
-  ): {
-    success: boolean;
-    ticketCode?: string;
-    slotCode?: string;
-    error?: string;
-  } => {
-    const res = reservations.find((r) => r.id === reservationId);
-    if (!res) return { success: false, error: "Reservation does not exist." };
-    if (res.status !== "Confirmed")
-      return {
-        success: false,
-        error: `Reservation status is ${res.status}, not Confirmed.`,
-      };
-    if (currentUser?.status !== "Active")
-      return { success: false, error: "Account is not active." };
-
-    // Business rule: a Fixed-time booking's window is a hard cutoff — if the
-    // vehicle checks in after the booked end time has already passed, staff
-    // cancel the booking instead of letting it in late (Flexible/monthly
-    // reservations have no endTime, so they're exempt from this check).
-    if (res.endTime) {
-      const endDateTime = new Date(`${res.date.split("T")[0]}T${res.endTime.slice(0, 5)}:00`);
-      if (!isNaN(endDateTime.getTime()) && Date.now() > endDateTime.getTime()) {
-        setReservations((prev) =>
-          prev.map((r) => (r.id === reservationId ? { ...r, status: "Cancelled" } : r)),
-        );
-        apiUpdateReservation(reservationId, { status: "Cancelled", cancelledBy: "staff", cancelReason: "overdue" }).catch(() => {});
-
-        setAreas((prev) =>
-          prev.map((a) =>
-            a.areaName === res.area
-              ? { ...a, availableSlots: a.availableSlots + 1, reservedSlots: Math.max(0, a.reservedSlots - 1) }
-              : a,
-          ),
-        );
-        setFloors((prev) =>
-          prev.map((f) =>
-            f.floorName === res.floor
-              ? { ...f, availableSlots: f.availableSlots + 1, reservedSlots: Math.max(0, f.reservedSlots - 1) }
-              : f,
-          ),
-        );
-        setSlots((prev) =>
-          prev.map((s) => {
-            if (res.slotCode && s.slotCode === res.slotCode) {
-              updateSlotStatus(res.slotCode, "Available").catch(() => {});
-              return { ...s, status: "Available" };
-            }
-            return s;
-          }),
-        );
-
-        return {
-          success: false,
-          error: "Đã quá giờ đặt chỗ — đặt chỗ này đã bị hủy. Vui lòng đặt chỗ mới.",
-        };
-      }
-    }
-
-    // Find the specific reserved slot by slotCode, then fallback to area search
-    let targetSlot = res.slotCode ? slots.find((s) => s.slotCode === res.slotCode) : undefined;
-    if (!targetSlot) {
-      targetSlot = slots.find(
-        (s) =>
-          s.floorName === res.floor &&
-          s.areaName === res.area &&
-          s.vehicleType === res.vehicleType &&
-          (s.status === "Reserved" || s.status === "Available"),
-      );
-    }
-
-    if (!targetSlot) {
-      return {
-        success: false,
-        error: "No vacant slot available in the selected zone.",
-      };
-    }
-
-    const ticketCode = `TCK-${new Date().toISOString().split("T")[0].replace(/-/g, "")}-${Math.floor(1000 + Math.random() * 9000)}`;
-
-    // Update reservation status to Checked-in
-    setReservations((prev) =>
-      prev.map((r) =>
-        r.id === reservationId ? { ...r, status: "Checked-in" } : r,
-      ),
-    );
-    apiUpdateReservation(reservationId, { status: 'Checked-in' }).catch(() => {});
-
-    // Update slot status to Occupied
-    setSlots((prev) =>
-      prev.map((s) =>
-        s.id === targetSlot.id ? { ...s, status: "Occupied" } : s,
-      ),
-    );
-    updateSlotStatus(targetSlot.slotCode, 'Occupied').catch(() => {});
-
-    // Fallback estimate for reservations that predate the estimatedCost field
-    // (or somehow have none) — mirrors the flat vehicle/duration table.
-    const calcEstimatedFee = (vehicleType: string, startTime: string, endTime: string): number => {
-      const isMoto = vehicleType === 'motorbike';
-      const isEV = vehicleType === 'electric vehicle';
-      if (!endTime) {
-        return isMoto ? 200000 : isEV ? 1200000 : 700000;
-      }
-      const parseMin = (t: string) => { const [h, m] = t.split(':').map(Number); return h * 60 + (m || 0); };
-      const diffMin = parseMin(endTime) - parseMin(startTime);
-      if (isMoto) return diffMin > 180 ? 30000 : 10000;
-      if (diffMin > 180) return isEV ? 100000 : 80000;
-      const hours = Math.max(1, Math.ceil(diffMin / 60));
-      return hours * (isEV ? 30000 : 25000);
-    };
-
-    // Create a new current session
-    const newSession: ParkingSession = {
-      id: `SES-${Date.now()}`,
-      userId: currentUser.id,
-      ticketCode: ticketCode,
-      licensePlate: res.licensePlate,
-      vehicleType: res.vehicleType,
-      checkInTime: new Date().toISOString().replace("T", " ").slice(0, 16),
-      expectedEndTime: res.endTime ? `${res.date} ${res.endTime}` : undefined,
-      entryGate: "Gate A - Entrance Kiosk",
-      floor: res.floor,
-      area: res.area,
-      slotCode: targetSlot.slotCode,
-      // Reuse the exact price already quoted (and shown) at booking time so the
-      // amount due never changes between "Đặt chỗ" → "Lượt gửi" → "Thanh toán".
-      estimatedFee: res.estimatedCost && res.estimatedCost > 0
-        ? res.estimatedCost
-        : calcEstimatedFee(res.vehicleType, res.startTime, res.endTime ?? ''),
-      paymentStatus: "Unpaid",
-      sessionStatus: "Active",
-      barrierStatus: "Closed",
-    };
-
-    // Update floor/area stats: decrement reserved, increment occupied
-    setAreas((prev) =>
-      prev.map((a) => {
-        if (a.areaName === res.area) {
-          return {
-            ...a,
-            reservedSlots: Math.max(0, a.reservedSlots - 1),
-            occupiedSlots: a.occupiedSlots + 1,
-          };
-        }
-        return a;
-      }),
-    );
-
-    setFloors((prev) =>
-      prev.map((f) => {
-        if (f.floorName === res.floor) {
-          return {
-            ...f,
-            reservedSlots: Math.max(0, f.reservedSlots - 1),
-            occupiedSlots: f.occupiedSlots + 1,
-          };
-        }
-        return f;
-      }),
-    );
-
-    // Already paid in full at booking time (VNPay "pay now") — just re-point that
-    // settled payment's ticketCode to this new session so checkout/history keep
-    // tracking it, instead of also creating a fresh Unpaid invoice below and
-    // billing the same car twice for one trip.
-    const existingPaidPayment = payments.find(
-      (p) =>
-        p.status === "Paid" &&
-        (p.reservationCode === res.reservationCode || p.ticketCode === res.reservationCode),
-    );
-
-    // Reuse an existing pre-payment placeholder from booking time (keyed by
-    // the reservation code, e.g. an abandoned "pay now" VNPay attempt) instead
-    // of creating a second invoice for the same debt — otherwise that old
-    // Unpaid row and this check-in invoice both sit outstanding forever,
-    // showing as two separate charges for one physical car.
-    const existingPrePayment = payments.find(
-      (p) => p.ticketCode === res.reservationCode && p.status !== "Paid",
-    );
-
-    if (existingPaidPayment) {
-      if (existingPaidPayment.ticketCode !== ticketCode) {
-        setPayments((prev) =>
-          prev.map((p) => (p.id === existingPaidPayment.id ? { ...p, ticketCode } : p)),
-        );
-        apiUpdatePayment(existingPaidPayment.id, { ticketCode }).catch(() => {});
-      }
-    } else if (existingPrePayment) {
-      setPayments((prev) =>
-        prev.map((p) =>
-          p.id === existingPrePayment.id
-            ? { ...p, ticketCode, parkingFee: newSession.estimatedFee, totalAmount: newSession.estimatedFee }
-            : p,
-        ),
-      );
-      apiUpdatePayment(existingPrePayment.id, {
-        ticketCode,
-        parkingFee: newSession.estimatedFee,
-        totalAmount: newSession.estimatedFee,
-      }).catch(() => {});
-    } else {
-      // Auto create a matching unpaid invoice, pre-filled with the exact price
-      // already quoted at booking time so it doesn't show 0đ before checkout.
-      const newInvoice: Payment = {
-        id: `PAY-${Date.now()}`,
-        userId: currentUser.id,
-        ticketCode: ticketCode,
-        reservationCode: res.reservationCode,
-        licensePlate: res.licensePlate,
-        parkingFee: newSession.estimatedFee,
-        extraServiceFee: 0,
-        lostTicketFee: 0,
-        discount: 0,
-        totalAmount: newSession.estimatedFee,
-        method: "",
-        status: "Unpaid",
-        createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
-      };
-      setPayments((prev) => [newInvoice, ...prev]);
-      apiCreatePayment(newInvoice).catch(() => {});
-    }
-
-    setCurrentSession(newSession);
-    // Adopt the DB-assigned numeric id once the row lands — the local "SES-..."
-    // id doesn't exist server-side, so anything that later addresses the session
-    // by id (rather than ticketCode) would silently miss the DB row.
-    apiCreateSession(newSession as any)
-      .then((created: any) => {
-        const dbId = created?.session?.id ?? created?.id;
-        if (!dbId) return;
-        setCurrentSession((prev) =>
-          prev.ticketCode === ticketCode ? { ...prev, id: String(dbId) } : prev,
-        );
-      })
-      .catch(() => {});
-
-    return { success: true, ticketCode, slotCode: targetSlot.slotCode };
-  };
 
   // Checkout for a car shown via a *virtual* session (ticket "TMP-<resCode>"):
   // CurrentSession fabricates these when the selected checked-in reservation
@@ -1541,7 +1526,7 @@ export default function App() {
     );
     apiUpdateReservation(res.id, { status: "Completed" }).catch(() => {});
 
-    const paidAt = new Date().toISOString().replace("T", " ").slice(0, 16);
+    const paidAt = nowLocalStr();
     const payRecord = payments.find(
       (p) => p.reservationCode === resCode || p.ticketCode === resCode,
     );
@@ -1617,7 +1602,7 @@ export default function App() {
       updateSlotStatus(targetSlot.slotCode, 'Available').catch(() => {});
     }
 
-    const checkOutTime = new Date().toISOString().replace("T", " ").slice(0, 16);
+    const checkOutTime = nowLocalStr();
     setCurrentSession((prev) => ({
       ...prev,
       sessionStatus: "Completed",
@@ -1638,7 +1623,7 @@ export default function App() {
       barrierStatus: 'Opened',
     }).catch(() => {});
 
-    const paidAt = new Date().toISOString().replace("T", " ").slice(0, 16);
+    const paidAt = nowLocalStr();
     const payRecord = payments.find((p) => p.ticketCode === ticketCode);
     // Chỉ cập nhật payment nếu chưa Paid (tránh ghi đè xe đã thanh toán trước)
     if (payRecord && payRecord.status !== 'Paid') {
@@ -1724,7 +1709,7 @@ export default function App() {
     method: "Cash" | "Card" | "E-Wallet" | "QR Banking" | "Crypto" | "VNPay",
     vnpayCtx?: import('./pages/driver/VNPayReturn').VNPayCheckoutContext | null,
   ) => {
-    const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const now = nowLocalStr(true);
     const payment = payments.find((p) => p.id === id);
     const finalAmount = payment?.totalAmount ?? vnpayCtx?.amount ?? 0;
 
@@ -1837,7 +1822,7 @@ export default function App() {
       userId: currentUser?.id || "GUEST",
       feedbackCode: fbCode,
       status: "New",
-      createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+      createdAt: nowLocalStr(),
       ...newFb,
     };
     setFeedbacks((prev) => [f, ...prev]);
@@ -1845,7 +1830,7 @@ export default function App() {
   };
 
   const handleRespondFeedback = (id: string, response: string, newStatus?: Feedback['status']) => {
-    const respondedAt = new Date().toISOString().replace("T", " ").slice(0, 16);
+    const respondedAt = nowLocalStr();
     const resolvedStatus = newStatus ?? 'In Progress';
     setFeedbacks((prev) =>
       prev.map((f) =>
@@ -1876,6 +1861,7 @@ export default function App() {
           fullName: up.fullName ?? currentUser.fullName,
           email: up.email ?? currentUser.email,
           phone: up.phone ?? currentUser.phone,
+          actorId: currentUser.id,
         });
         const nextUser: User = {
           ...currentUser,
@@ -1913,6 +1899,7 @@ export default function App() {
         status: u.status,
         password: u.password,
         assignedParkingLot: u.assignedParkingLot || '',
+        actorId: currentUser?.id,
       });
       setUsers((prev) => [toAppUser(created), ...prev]);
 
@@ -1921,10 +1908,10 @@ export default function App() {
         action: "Create User Profile",
         actor: currentUser?.fullName || "System Admin",
         target: `${u.fullName} (${u.email})`,
-        createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+        createdAt: nowLocalStr(),
       };
       setAdminActivities((prev) => [log, ...prev]);
-      alert("New account created successfully.");
+      alert("Tạo tài khoản mới thành công.");
       return true;
     } catch (error) {
       alert(error instanceof Error ? error.message : "Không thể tạo tài khoản.");
@@ -1932,18 +1919,40 @@ export default function App() {
     }
   };
 
+  // Seeded/demo users keep a local id (e.g. 'DEMO-ADM') after merging with the
+  // API by email — see the syncUsers effect above — so other mock-data filters
+  // (vehicles/reservations/payments keyed by that local id) keep matching. But
+  // PUT/DELETE /api/users/:id need the real numeric DB id, or they 404. Resolve
+  // it by email right before any mutating call; fall back to the given id if
+  // the backend is unreachable or no match is found (updateUser/deleteUser
+  // will then report their own error).
+  const resolveApiUserId = async (userId: string): Promise<string> => {
+    const target = users.find((u) => u.id === userId);
+    if (!target) return userId;
+    try {
+      const remote = await userService.fetchUsers();
+      const match = remote.find((r) => r.email.toLowerCase() === target.email.toLowerCase());
+      return match ? String(match.id) : userId;
+    } catch {
+      return userId;
+    }
+  };
+
   const handleEditUser = async (id: string, u: any): Promise<boolean> => {
     try {
-      const updated = await userService.updateUser(id, {
+      const apiId = await resolveApiUserId(id);
+      const updated = await userService.updateUser(apiId, {
         fullName: u.fullName,
         email: u.email,
         phone: u.phone,
         role: u.role,
         status: u.status,
         assignedParkingLot: u.assignedParkingLot || '',
+        actorId: currentUser?.id,
       });
+      // Giữ id local để các filter theo userId (đặt chỗ, xe...) không gãy
       setUsers((prev) =>
-        prev.map((usr) => (usr.id === id ? toAppUser(updated) : usr)),
+        prev.map((usr) => (usr.id === id ? { ...toAppUser(updated), id: usr.id } : usr)),
       );
 
       const log: AdminActivity = {
@@ -1951,10 +1960,10 @@ export default function App() {
         action: "Update User Profile",
         actor: currentUser?.fullName || "System Admin",
         target: `${u.fullName} (${u.email})`,
-        createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+        createdAt: nowLocalStr(),
       };
       setAdminActivities((prev) => [log, ...prev]);
-      alert("User account details stored successfully.");
+      alert("Cập nhật thông tin tài khoản thành công.");
       return true;
     } catch (error) {
       alert(error instanceof Error ? error.message : "Không thể cập nhật tài khoản.");
@@ -1964,8 +1973,10 @@ export default function App() {
 
   const handleAssignStaffToLot = async (userId: string, lotName: string): Promise<boolean> => {
     try {
-      const updated = await userService.updateUser(userId, { assignedParkingLot: lotName });
-      setUsers((prev) => prev.map((u) => (u.id === userId ? toAppUser(updated) : u)));
+      const apiId = await resolveApiUserId(userId);
+      const updated = await userService.updateUser(apiId, { assignedParkingLot: lotName, actorId: currentUser?.id });
+      // Giữ id local để các filter theo userId (đặt chỗ, xe...) không gãy
+      setUsers((prev) => prev.map((u) => (u.id === userId ? { ...toAppUser(updated), id: u.id } : u)));
       return true;
     } catch (error) {
       alert(error instanceof Error ? error.message : "Không thể phân công nhân viên.");
@@ -1978,7 +1989,8 @@ export default function App() {
     if (!targetUser) return;
 
     try {
-      await userService.deleteUser(id);
+      const apiId = await resolveApiUserId(id);
+      await userService.deleteUser(apiId, currentUser?.id);
       setUsers((prev) => prev.filter((usr) => usr.id !== id));
 
       const log: AdminActivity = {
@@ -1986,10 +1998,10 @@ export default function App() {
         action: "Delete User Account",
         actor: currentUser?.fullName || "System Admin",
         target: `${targetUser.fullName} (${targetUser.email})`,
-        createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+        createdAt: nowLocalStr(),
       };
       setAdminActivities((prev) => [log, ...prev]);
-      alert("User account deleted.");
+      alert("Đã xóa tài khoản người dùng.");
     } catch (error) {
       alert(error instanceof Error ? error.message : "Không thể xóa tài khoản.");
     }
@@ -2002,9 +2014,10 @@ export default function App() {
     const nextStatus = targetUser.status === "Locked" ? "Active" : "Locked";
 
     try {
-      const updated = await userService.updateUser(id, { status: nextStatus });
+      const apiId = await resolveApiUserId(id);
+      const updated = await userService.updateUser(apiId, { status: nextStatus, actorId: currentUser?.id });
       setUsers((prev) =>
-        prev.map((usr) => (usr.id === id ? toAppUser(updated) : usr)),
+        prev.map((usr) => (usr.id === id ? { ...toAppUser(updated), id: usr.id } : usr)),
       );
 
       const log: AdminActivity = {
@@ -2013,30 +2026,39 @@ export default function App() {
           nextStatus === "Locked" ? "Lock User Account" : "Unlock User Account",
         actor: currentUser?.fullName || "System Admin",
         target: `${targetUser.fullName} (${targetUser.email})`,
-        createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+        createdAt: nowLocalStr(),
       };
       setAdminActivities((prev) => [log, ...prev]);
-      alert(`Account access status updated to: ${nextStatus}`);
+      alert(nextStatus === "Locked" ? "Đã khóa tài khoản." : "Đã mở khóa tài khoản.");
     } catch (error) {
       alert(error instanceof Error ? error.message : "Không thể cập nhật trạng thái tài khoản.");
     }
   };
 
-  const handleAssignRole = (userId: string, newRole: Role) => {
+  const handleAssignRole = async (userId: string, newRole: Role): Promise<boolean> => {
     const targetUser = users.find((u) => u.id === userId);
-    if (!targetUser) return;
-    setUsers((prev) =>
-      prev.map((usr) => (usr.id === userId ? { ...usr, role: newRole } : usr)),
-    );
+    if (!targetUser) return false;
 
-    const log: AdminActivity = {
-      id: `ACT-${Date.now()}`,
-      action: "Assign Role Credentials",
-      actor: currentUser?.fullName || "System Admin",
-      target: `${targetUser.fullName} assigned to ${newRole}`,
-      createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
-    };
-    setAdminActivities((prev) => [log, ...prev]);
+    try {
+      const apiId = await resolveApiUserId(userId);
+      const updated = await userService.updateUser(apiId, { role: newRole, actorId: currentUser?.id });
+      setUsers((prev) =>
+        prev.map((usr) => (usr.id === userId ? { ...toAppUser(updated), id: usr.id } : usr)),
+      );
+
+      const log: AdminActivity = {
+        id: `ACT-${Date.now()}`,
+        action: "Assign Role Credentials",
+        actor: currentUser?.fullName || "System Admin",
+        target: `${targetUser.fullName} assigned to ${newRole}`,
+        createdAt: nowLocalStr(),
+      };
+      setAdminActivities((prev) => [log, ...prev]);
+      return true;
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Không thể cập nhật vai trò.");
+      return false;
+    }
   };
 
   const handleSaveConfig = (updated: Partial<SystemConfig>) => {
@@ -2047,7 +2069,7 @@ export default function App() {
       action: "Configure system settings",
       actor: currentUser?.fullName || "System Admin",
       target: "Stored global configurations",
-      createdAt: new Date().toISOString().replace("T", " ").slice(0, 16),
+      createdAt: nowLocalStr(),
     };
     setAdminActivities((prev) => [log, ...prev]);
   };
@@ -2060,9 +2082,23 @@ export default function App() {
     reserved: slots.filter((s) => s.status === "Reserved").length,
   };
 
+  // "sessionAmount" bên dưới ước tính theo Date.now() ngay lúc tính — nhưng
+  // useMemo chỉ chạy lại khi dependency đổi, nên số này sẽ đứng yên nếu không
+  // có gì khác kích hoạt render. Tick nhẹ mỗi 30s (không cần từng giây — đây
+  // chỉ là số tổng trên thẻ thống kê, không phải đồng hồ đang chạy) để "Số dư
+  // chưa thanh toán" của xe đang đỗ tự lớn dần đúng với phí quá giờ thực tế.
+  const [unpaidTick, setUnpaidTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = setInterval(() => setUnpaidTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
   // Calculate unpaid total — includes:
   // 1. Unpaid payments with known amount ("otherAmount": old/unrelated unpaid items)
-  // 2. Active session fee estimated by current time (payment totalAmount=0) ("sessionAmount")
+  // 2. Every currently-parked vehicle's fee ("sessionAmount") — summed with the exact
+  //    same formula/list (buildCheckedInVehicles + perVisitOverstay) MyParking uses for
+  //    each vehicle's own "Phí tạm tính" card, so the total always matches what's shown
+  //    per vehicle (incl. walk-ins with no reservation, and accounts with >1 car parked).
   // 3. Confirmed/Pending reservations that paid "Thanh toán sau" (no paid payment record) ("reservationAmount")
   // Broken out by category (not just summed) so the UI can show what the total is made of,
   // instead of one lump number that looks inconsistent with the per-vehicle "Phí tạm tính".
@@ -2072,25 +2108,21 @@ export default function App() {
     let otherAmount = 0;
     let hasEstimate = false;
 
-    // Part 1 & 2: Unpaid payment records
+    // Part 1: Unpaid payment records with a known amount (old/unrelated unpaid items)
+    // — bỏ qua hóa đơn đã "hủy thanh toán" (đặt chỗ gắn với nó đã bị hủy/xóa),
+    // không thì Số dư chưa thanh toán vẫn cộng tiền cho xe đã hủy từ lâu.
     for (const p of payments) {
       if (p.status !== 'Unpaid' || p.userId !== currentUser?.id) continue;
-      if (p.totalAmount > 0) {
-        otherAmount += p.totalAmount;
-        continue;
-      }
-      // Payment is 0 — estimate from active session duration
-      if (
-        currentSession.sessionStatus === 'Active' &&
-        currentSession.paymentStatus !== 'Paid' &&
-        p.ticketCode === currentSession.ticketCode
-      ) {
-        const rule = pricingRules.find((r) => r.vehicleType === currentSession.vehicleType) ?? pricingRules[0];
-        const start = new Date(currentSession.checkInTime.replace(' ', 'T'));
-        const totalMins = Math.max(0, Math.floor((Date.now() - start.getTime()) / 60000));
-        const extraHours = totalMins > 60 ? Math.ceil((totalMins - 60) / 60) : 0;
-        const estimated = rule.firstHourPrice + extraHours * rule.nextHourPrice + rule.extraServiceFee;
-        sessionAmount += estimated;
+      if (isPaymentVoided(p, reservations)) continue;
+      if (p.totalAmount > 0) otherAmount += p.totalAmount;
+    }
+
+    // Part 2: Every vehicle currently parked under this account
+    if (currentUser) {
+      const myReservations = reservations.filter((r) => r.userId === currentUser.id);
+      const checkedIn = buildCheckedInVehicles(myReservations, driverActiveSessions);
+      for (const res of checkedIn) {
+        sessionAmount += perVisitOverstay(res, pricingRules, Date.now()).total;
         hasEstimate = true;
       }
     }
@@ -2116,7 +2148,7 @@ export default function App() {
       unpaidReservationAmount: reservationAmount,
       unpaidOtherAmount: otherAmount,
     };
-  }, [payments, currentUser, currentSession, reservations, pricingRules]);
+  }, [payments, currentUser, reservations, driverActiveSessions, pricingRules, unpaidTick]);
   const upcomingRes = reservations.find(
     (r) => r.status === "Confirmed" || r.status === "Pending",
   );
@@ -2201,7 +2233,7 @@ export default function App() {
   const notificationCount = userBellNotifications.length;
 
   // Clicking one bell item marks just that item as read, then routes by type:
-  // 'Parking Reservation' → Đặt chỗ của tôi, 'User Feedback' → Phản hồi / Hỗ trợ.
+  // 'Parking Reservation' → Lịch sử đặt chỗ, 'User Feedback' → Phản hồi / Hỗ trợ.
   const handleNotificationClick = (n: { id: string; type: "reservation" | "feedback"; targetView: string }) => {
     if (n.type === "feedback") {
       setSeenFeedbackIds((prev) => new Set(prev).add(n.id));
@@ -2245,10 +2277,8 @@ export default function App() {
     switch (view) {
       case "myparking":
         return "Trang của tôi";
-      case "session":
-        return "Lượt gửi hiện tại";
       case "reservations":
-        return "Đặt chỗ của tôi";
+        return "Lịch sử đặt chỗ";
       case "payments":
         return "Thanh toán";
       case "feedback":
@@ -2289,7 +2319,7 @@ export default function App() {
                 <Homepage setView={setView} stats={publicStats} pricingRules={pricingRules} />
               )}
               {currentView === "baixe" && (
-                <ParkingLotsList setView={setView} />
+                <ParkingLotsList setView={setView} pricingRules={pricingRules} />
               )}
               {currentView === "info" && (
                 <ParkingInformation setView={setView} />
@@ -2303,6 +2333,7 @@ export default function App() {
                   savedVehicles={savedVehicles}
                   onAddReservation={handleAddReservation}
                   onCancelReservation={handleCancelReservation}
+                  onDiscardReservation={handleDiscardReservation}
                   reservations={reservations}
                   pricingRules={pricingRules}
                 />
@@ -2323,6 +2354,7 @@ export default function App() {
               {currentView === "vnpay-return" && (
                 <VNPayReturn
                   onPaymentSuccess={(id, ctx) => handleConfirmPayment(id, "VNPay", ctx)}
+                  onMonthlyBookingPaid={handleMonthlyBookingPaid}
                   setView={setView}
                 />
               )}
@@ -2382,6 +2414,7 @@ export default function App() {
                   onDeleteUser={handleDeleteUser}
                   onToggleLockUser={handleToggleLockUser}
                   activeAdminEmail={currentUser.email}
+                  viewerRole={currentUser.role}
                 />
               )}
               {currentView === "rolemanagement" && (
@@ -2389,6 +2422,8 @@ export default function App() {
                   users={users}
                   onAssignRole={handleAssignRole}
                   activeAdminEmail={currentUser.email}
+                  viewerRole={currentUser.role}
+                  viewerId={currentUser.id}
                 />
               )}
               {currentView === "systemconfig" && (
@@ -2433,6 +2468,8 @@ export default function App() {
             onRejectIssue={handleRejectIssue}
             onRestoreIssue={handleRestoreIssue}
             onForceClearSlot={handleForceClearSlot}
+            onRespondFeedback={handleRespondFeedback}
+            addToast={addToast}
             onUpdateUser={handleUpdateProfile}
             onAssignStaff={handleAssignStaffToLot}
           />
@@ -2452,9 +2489,9 @@ export default function App() {
             reservations={reservations}
             payments={payments}
             pricingRules={pricingRules}
-            feedbacks={feedbacksWithNames}
             users={users}
             onUpdateUser={handleUpdateProfile}
+            onCheckOutSession={handleCheckOutSession}
             onForceClearSlot={handleForceClearSlot}
             onSetSlotStatus={handleSetSlotStatus}
             onConfirmReservation={(id) => {
@@ -2464,7 +2501,16 @@ export default function App() {
                   r.id === id ? { ...r, status: "Confirmed" } : r,
                 ),
               );
-              apiUpdateReservation(id, { status: 'Confirmed' }).catch(() => {});
+              // staffId để backend TỰ kiểm tra staff có đúng bãi của đặt chỗ
+              // không (không chỉ tin bộ lọc UI) — server chặn (403) nếu lệch bãi.
+              apiUpdateReservation(id, { status: 'Confirmed', staffId: currentUser?.id })
+                .catch(() => {
+                  // Bị chặn hoặc lỗi mạng → hoàn tác trạng thái lạc quan đã set ở trên.
+                  setReservations((prev) =>
+                    prev.map((r) => (r.id === id && res ? { ...r, status: res.status } : r)),
+                  );
+                  addToast('Không thể xác nhận đặt chỗ — bãi đỗ không thuộc phân công của bạn.', 'error');
+                });
               // Slot becomes Reserved (yellow) once staff confirms the booking
               if (res?.slotCode) {
                 setSlots((prev) =>
@@ -2475,7 +2521,46 @@ export default function App() {
                 updateSlotStatus(res.slotCode, 'Reserved').catch(() => {});
               }
             }}
-            onRespondFeedback={handleRespondFeedback}
+            onCancelReservation={(id) => {
+              const res = reservations.find((r) => r.id === id);
+              if (!res) return;
+              setReservations((prev) =>
+                prev.map((r) => (r.id === id ? { ...r, status: "Cancelled" } : r)),
+              );
+              // staffId để backend TỰ kiểm tra staff có đúng bãi của đặt chỗ
+              // không (không chỉ tin bộ lọc UI) — server chặn (403) nếu lệch bãi.
+              apiUpdateReservation(id, { status: 'Cancelled', cancelledBy: 'staff', staffId: currentUser?.id })
+                .catch(() => {
+                  // Bị chặn hoặc lỗi mạng → hoàn tác trạng thái lạc quan đã set ở trên.
+                  setReservations((prev) =>
+                    prev.map((r) => (r.id === id ? { ...r, status: res.status } : r)),
+                  );
+                  addToast('Không thể hủy đặt chỗ — bãi đỗ không thuộc phân công của bạn.', 'error');
+                });
+              // Slot + area/floor stats freed back up once staff cancels the booking
+              if (res.slotCode) {
+                setSlots((prev) =>
+                  prev.map((s) =>
+                    s.slotCode === res.slotCode ? { ...s, status: "Available" } : s,
+                  ),
+                );
+                updateSlotStatus(res.slotCode, 'Available').catch(() => {});
+              }
+              setAreas((prev) =>
+                prev.map((a) =>
+                  a.areaName === res.area
+                    ? { ...a, availableSlots: a.availableSlots + 1, reservedSlots: Math.max(0, a.reservedSlots - 1) }
+                    : a,
+                ),
+              );
+              setFloors((prev) =>
+                prev.map((f) =>
+                  f.floorName === res.floor
+                    ? { ...f, availableSlots: f.availableSlots + 1, reservedSlots: Math.max(0, f.reservedSlots - 1) }
+                    : f,
+                ),
+              );
+            }}
             onLogout={handleLogout}
             addToast={addToast}
             onAddEmergency={(log) => setEmergencyLogs((prev) => [log, ...prev])}
@@ -2517,7 +2602,7 @@ export default function App() {
                 <Homepage setView={setView} stats={publicStats} pricingRules={pricingRules} />
               )}
               {currentView === "baixe" && (
-                <ParkingLotsList setView={setView} />
+                <ParkingLotsList setView={setView} pricingRules={pricingRules} />
               )}
               {currentView === "info" && (
                 <ParkingInformation setView={setView} />
@@ -2531,6 +2616,7 @@ export default function App() {
                   savedVehicles={savedVehicles}
                   onAddReservation={handleAddReservation}
                   onCancelReservation={handleCancelReservation}
+                  onDiscardReservation={handleDiscardReservation}
                   reservations={reservations}
                   pricingRules={pricingRules}
                 />
@@ -2552,6 +2638,7 @@ export default function App() {
               {currentView === "vnpay-return" && (
                 <VNPayReturn
                   onPaymentSuccess={(id, ctx) => handleConfirmPayment(id, "VNPay", ctx)}
+                  onMonthlyBookingPaid={handleMonthlyBookingPaid}
                   setView={setView}
                 />
               )}
@@ -2559,7 +2646,6 @@ export default function App() {
               {/* Driver-Specific Pages with a standard profile layout */}
               {[
                 "myparking",
-                "session",
                 "reservations",
                 "payments",
                 "feedback",
@@ -2590,8 +2676,7 @@ export default function App() {
                       <nav className="space-y-1">
                         {[
                           { key: "myparking", label: "Trang của tôi" },
-                          { key: "session", label: "Lượt gửi hiện tại" },
-                          { key: "reservations", label: "Đặt chỗ của tôi" },
+                          { key: "reservations", label: "Lịch sử đặt chỗ" },
                           { key: "payments", label: "Thanh toán" },
                           { key: "feedback", label: "Phản hồi / Hỗ trợ" },
                           { key: "profile", label: "Hồ sơ" },
@@ -2622,7 +2707,6 @@ export default function App() {
                       <p className="mb-2 px-1 text-[9px] font-bold uppercase tracking-widest text-slate-400">Lối tắt nhanh</p>
                       <div className="space-y-1">
                         {[
-                          { key: "session", label: "Lượt gửi hiện tại" },
                           { key: "slots",   label: "Đặt chỗ gửi xe" },
                         ].map((item) => (
                           <button
@@ -2637,7 +2721,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Personal info — only on the "Đặt chỗ của tôi" page */}
+                    {/* Personal info — only on the "Lịch sử đặt chỗ" page */}
                     {currentView === "reservations" && (
                       <div className="mt-3 overflow-hidden rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
                         <div className="flex items-center gap-2.5">
@@ -2682,6 +2766,7 @@ export default function App() {
                         user={currentUser}
                         setView={setView}
                         currentSession={currentSession}
+                        activeSessions={driverActiveSessions}
                         reservations={reservations.filter((r) => r.userId === currentUser.id)}
                         unpaidTotal={unpaidTotal}
                         unpaidIsEstimate={unpaidIsEstimate}
@@ -2690,6 +2775,8 @@ export default function App() {
                         unpaidOtherAmount={unpaidOtherAmount}
                         feedbacks={feedbacks.filter((f) => f.userId === currentUser?.id)}
                         savedVehicles={savedVehicles}
+                        pricingRules={pricingRules}
+                        slots={slots}
                         onClearCheckedIn={(ids) => {
                           addHiddenResIds(ids);
                           setReservations((prev) => prev.filter((r) => !ids.includes(r.id)));
@@ -2697,31 +2784,10 @@ export default function App() {
                         }}
                       />
                     )}
-                    {currentView === "session" && (
-                      <CurrentSessionPage
-                        currentSession={currentSession}
-                        setView={setView}
-                        onCheckOutSession={handleCheckOutSession}
-                        pricingRules={pricingRules}
-                        currentUser={currentUser}
-                        slots={slots}
-                        payments={payments}
-                        reservations={reservations.filter((r) => r.userId === currentUser.id)}
-                        savedVehicles={savedVehicles}
-                        onDismissSession={() => {
-                          setCurrentSession((prev) => ({
-                            ...prev,
-                            ticketCode: '',
-                            sessionStatus: 'Cancelled',
-                            paymentStatus: 'Unpaid',
-                            barrierStatus: 'Closed',
-                          }));
-                        }}
-                      />
-                    )}
                     {currentView === "reservations" && (
                       <MyReservations
                         reservations={reservations.filter((r) => r.userId === currentUser.id)}
+                        activeSessions={driverActiveSessions}
                         payments={payments}
                         onAddReservation={handleAddReservation}
                         onCancelReservation={handleCancelReservation}
@@ -2731,7 +2797,6 @@ export default function App() {
                         driverStatus={currentUser.status}
                         savedVehicles={savedVehicles}
                         systemConfig={systemConfig}
-                        onCheckInReservation={handleCheckInReservation}
                         onExpireReservation={handleExpireReservation}
                         onClearHistory={(ids) => {
                           addHiddenResIds(ids);
@@ -2758,6 +2823,7 @@ export default function App() {
                             if (matchRes) return { ...p, licensePlate: matchRes.licensePlate };
                             return p;
                           })}
+                        reservations={reservations}
                         onClearPaid={() => {
                           // Hide-only: these rows stay in dbo.payments (and in this app's
                           // shared `payments` state) since Staff/Manager's revenue wallet

@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, BadgeInfo, Car, CheckCircle, Clock, Lock, MapPin, Ticket, Unlock, X } from 'lucide-react';
+import { AlertTriangle, BadgeInfo, Car, CheckCircle, Clock, Lock, MapPin, Search, Ticket, Unlock, X } from 'lucide-react';
 import { ParkingSession, PricingRule, Reservation, SavedVehicle, User, Slot, Payment } from '../../data/mockData';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
 import SectionTitle from '../../components/SectionTitle';
+import ConfirmModal from '../../components/ConfirmModal';
 import { createVNPayPayment } from '../../services/vnpayService';
 import { createPayment, updatePayment } from '../../services/paymentService';
-import { perVisitOverstay, overstayDue } from '../../utils/reservationPricing';
+import { perVisitOverstay, overstayDue, buildCheckedInVehicles, realtimeParkingFee } from '../../utils/reservationPricing';
+import { nowLocalStr } from '../../utils/helpers';
 
 type PaymentMethod = 'Cash' | 'Card' | 'E-Wallet' | 'QR Banking' | 'Crypto' | 'VNPay';
 
@@ -21,6 +23,13 @@ interface CurrentSessionProps {
   reservations?: Reservation[];
   savedVehicles?: SavedVehicle[];
   onDismissSession?: () => void;
+  /** Tiêu đề trang — cổng Staff dùng lại component này dưới tên "Theo dõi bãi xe". */
+  title?: string;
+  subtitle?: string;
+  /** Vé cổng (khách lượt) đang hoạt động — Staff truyền vào để theo dõi xe trong bãi thời gian thực. */
+  activeSessions?: ParkingSession[];
+  /** Staff truyền vào để có thể hủy đặt chỗ trước của khách ngay tại "Theo dõi bãi xe". */
+  onCancelReservation?: (id: string) => void;
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -67,14 +76,17 @@ function calcFee(
   checkInIso: string,
   checkOutIso: string,
   rule: PricingRule,
-): { totalMins: number; extraHours: number; parkingFee: number; serviceFee: number; total: number } {
+): { totalMins: number; parkingFee: number; nights: number; nightsFee: number; serviceFee: number; total: number } {
   const start = new Date(checkInIso.replace(' ', 'T'));
   const end = new Date(checkOutIso.replace(' ', 'T'));
   const totalMins = Math.max(0, Math.floor((end.getTime() - start.getTime()) / 60000));
-  const extraHours = totalMins > 60 ? Math.ceil((totalMins - 60) / 60) : 0;
-  const parkingFee = rule.firstHourPrice + extraHours * rule.nextHourPrice;
+  // "Theo lượt" là MỘT MỨC GIÁ CỐ ĐỊNH (giá giờ đầu), không cộng dồn theo số
+  // giờ đã đỗ. Qua 00:00: cộng thêm giá qua đêm cho mỗi đêm — xem
+  // utils/reservationPricing::realtimeParkingFee.
+  const fee = realtimeParkingFee(checkInIso, end.getTime(), rule);
+  const nights = fee.overstayed ? Math.max(1, Math.round(fee.surcharge / (rule.overnightPrice || 1))) : 0;
   const serviceFee = rule.extraServiceFee;
-  return { totalMins, extraHours, parkingFee, serviceFee, total: parkingFee + serviceFee };
+  return { totalMins, parkingFee: fee.base, nights, nightsFee: fee.surcharge, serviceFee, total: fee.total + serviceFee };
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -90,11 +102,18 @@ export default function CurrentSession({
   reservations = [],
   savedVehicles: _savedVehicles = [],
   onDismissSession,
+  title = 'Lượt gửi hiện tại',
+  subtitle = 'Theo dõi giờ vào, ô đỗ, phí tạm tính và thao tác khi xe ra',
+  activeSessions = [],
+  onCancelReservation,
 }: CurrentSessionProps) {
-  // All currently parked vehicles for this user
+  const [cancelTarget, setCancelTarget] = useState<Reservation | null>(null);
+  // All currently parked vehicles for this user — includes walk-ins (no prior
+  // reservation) synthesized from activeSessions, not just checked-in
+  // reservations, so a car that just drove up without booking still shows here.
   const checkedInVehicles = useMemo(
-    () => reservations.filter((r) => r.status === 'Checked-in'),
-    [reservations],
+    () => buildCheckedInVehicles(reservations, activeSessions),
+    [reservations, activeSessions],
   );
 
   // Index of the vehicle that matches currentSession (by licensePlate)
@@ -105,6 +124,14 @@ export default function CurrentSession({
 
   // Default selection = primary session vehicle (or first)
   const [selectedIdx, setSelectedIdx] = useState<number>(() => Math.max(0, primaryIdx));
+
+  // Tìm biển số — lọc thẻ xe hiển thị (bỏ qua dấu gạch/chấm khi so khớp)
+  const [plateSearch, setPlateSearch] = useState('');
+  const normPlate = (p: string) => p.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const searchHits = useMemo(() => {
+    const q = normPlate(plateSearch);
+    return checkedInVehicles.filter((r) => !q || normPlate(r.licensePlate).includes(q));
+  }, [checkedInVehicles, plateSearch]);
 
   // Keep selection in sync if reservations change (e.g. a vehicle checks out)
   useEffect(() => {
@@ -138,7 +165,7 @@ export default function CurrentSession({
   // Build a virtual session from reservation when it doesn't map to currentSession
   const virtualSession = useMemo<ParkingSession | null>(() => {
     if (!selectedRes || isPrimarySelected) return null;
-    // Quá 24 giờ: đã thanh toán → chỉ còn phụ phí 40%; chưa → giá vé + phụ phí.
+    // Qua 00:00: đã thanh toán → chỉ còn phần qua đêm phát sinh; chưa → giá vé + phần qua đêm.
     const overstay = perVisitOverstay(selectedRes, pricingRules);
     // The fabricated session must still reflect the real paid state — a Paid
     // payment row linked to this reservation (reservationCode survives the
@@ -156,7 +183,9 @@ export default function CurrentSession({
       ticketCode: `TMP-${selectedRes.reservationCode}`,
       licensePlate: selectedRes.licensePlate,
       vehicleType: selectedRes.vehicleType,
-      checkInTime: `${selectedRes.date} ${selectedRes.startTime}`,
+      // Mốc check-in THẬT (staff quẹt thẻ) — không phải khung giờ dự kiến lúc
+      // đặt, vốn có thể lệch xa giờ xe thực sự vào bãi.
+      checkInTime: selectedRes.checkedInAt || `${selectedRes.date} ${selectedRes.startTime}`,
       expectedEndTime: selectedRes.endTime ? `${selectedRes.date} ${selectedRes.endTime}` : undefined,
       entryGate: 'Gate A - Entrance',
       floor: selectedRes.floor,
@@ -206,18 +235,17 @@ export default function CurrentSession({
   const [showQRModal, setShowQRModal] = useState(false);
   const [showCheckoutModal, setShowCheckoutModal] = useState(false);
   const [showBarrierOpenedModal, setShowBarrierOpenedModal] = useState(false);
-  const [checkOutTimeInput, setCheckOutTimeInput] = useState(() =>
-    new Date().toISOString().slice(0, 16).replace('T', ' '),
-  );
+  const [checkOutTimeInput, setCheckOutTimeInput] = useState(() => nowLocalStr());
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('VNPay');
   const [barrierStatus, setBarrierStatus] = useState<'Closed' | 'Opened'>('Closed');
   const [paymentStatus, setPaymentStatus] = useState<'Unpaid' | 'Paid' | 'Failed'>('Unpaid');
   const [loadingVNPay, setLoadingVNPay] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
-  // Refresh current time every 30 seconds to drive overstay detection
+  // Đồng hồ thời gian thực (mỗi giây) — cấp cho bảng "Xe trong bãi" của staff
+  // lẫn phát hiện quá giờ của driver.
   useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
@@ -251,7 +279,7 @@ export default function CurrentSession({
   }, [activeSession, checkOutTimeInput, pricingRule]);
 
   const feeBreakdown = useMemo(() => {
-    if (!activeSession) return { totalMins: 0, extraHours: 0, parkingFee: 0, serviceFee: 0, total: 0 };
+    if (!activeSession) return { totalMins: 0, parkingFee: 0, nights: 0, nightsFee: 0, serviceFee: 0, total: 0 };
     return calcFee(activeSession.checkInTime, checkOutTimeInput, pricingRule);
   }, [activeSession, checkOutTimeInput, pricingRule]);
 
@@ -261,7 +289,7 @@ export default function CurrentSession({
       alert('Lượt gửi đã hoàn tất hoặc đã bị hủy.');
       return;
     }
-    setCheckOutTimeInput(new Date().toISOString().slice(0, 16).replace('T', ' '));
+    setCheckOutTimeInput(nowLocalStr());
     setPaymentMethod('VNPay');
     setBarrierStatus('Closed');
     setPaymentStatus(activeSession.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid');
@@ -289,6 +317,7 @@ export default function CurrentSession({
               totalAmount: checkoutFee,
               parkingFee: feeBreakdown.parkingFee,
               extraServiceFee: feeBreakdown.serviceFee,
+              overtimeFee: feeBreakdown.nightsFee,
             })
           : await createPayment({
               id: `PAY-VNP-${Date.now()}`,
@@ -297,12 +326,13 @@ export default function CurrentSession({
               reservationCode: matchedRes?.reservationCode,
               parkingFee: feeBreakdown.parkingFee,
               extraServiceFee: feeBreakdown.serviceFee,
+              overtimeFee: feeBreakdown.nightsFee,
               lostTicketFee: 0,
               discount: 0,
               totalAmount: checkoutFee,
               method: '',
               status: 'Unpaid',
-              createdAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
+              createdAt: nowLocalStr(),
             });
         localStorage.setItem(
           'pf_vnpay_ctx',
@@ -346,10 +376,68 @@ export default function CurrentSession({
 
   return (
     <div className="space-y-6">
-      <SectionTitle
-        title="Lượt gửi hiện tại"
-        subtitle="Theo dõi giờ vào, ô đỗ, phí tạm tính và thao tác khi xe ra"
-      />
+      <SectionTitle title={title} subtitle={subtitle} />
+
+      {/* ── XE TRONG BÃI (vé cổng, khách lượt) — thời gian thực từ trạm OCR ── */}
+      {activeSessions.length > 0 && (
+        <div className="rounded-2xl border border-slate-100 bg-white shadow-sm">
+          <div className="flex items-center justify-between px-5 py-4">
+            <h4 className="flex items-center gap-2 text-sm font-bold text-slate-800">
+              <Car className="h-4 w-4 text-blue-600" /> Xe đang trong bãi — vé cổng
+            </h4>
+            <span className="flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-600">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
+              {activeSessions.length} xe · thời gian thực
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-y border-slate-100 bg-slate-50/70 text-left text-xs font-bold uppercase tracking-wide text-slate-400">
+                  <th className="px-5 py-3">Vé</th>
+                  <th className="px-5 py-3">Biển số</th>
+                  <th className="px-5 py-3">Loại xe</th>
+                  <th className="px-5 py-3">Cổng vào</th>
+                  <th className="px-5 py-3">Giờ vào</th>
+                  <th className="px-5 py-3">Đã gửi</th>
+                  <th className="px-5 py-3 text-right">Phí tạm tính</th>
+                </tr>
+              </thead>
+              <tbody>
+                {activeSessions.map((s) => {
+                  const entry = new Date(s.checkInTime.replace(' ', 'T'));
+                  const validEntry = !Number.isNaN(entry.getTime());
+                  const elapsedSec = validEntry ? Math.max(0, Math.floor((nowMs - entry.getTime()) / 1000)) : 0;
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  const liveDuration = `${pad(Math.floor(elapsedSec / 3600))}:${pad(Math.floor((elapsedSec % 3600) / 60))}:${pad(elapsedSec % 60)}`;
+                  const rule = pricingRules.find((p) => p.vehicleType === s.vehicleType);
+                  // Xe vào bằng đặt chỗ trước đã có giá chốt (gói "Gửi theo lượt"/"Qua
+                  // đêm") — phải dùng perVisitOverstay trên đúng reservation đó (giống
+                  // hệt bảng "Xe đang đỗ trong bãi" bên dưới) để 2 nơi luôn khớp số,
+                  // thay vì tính lại theo giờ như khách vãng lai thật sự không đặt trước.
+                  const matchedReservationForFee = reservations.find(
+                    (r) => r.status === 'Checked-in' && normPlate(r.licensePlate) === normPlate(s.licensePlate),
+                  );
+                  const estFee = matchedReservationForFee
+                    ? perVisitOverstay(matchedReservationForFee, pricingRules, nowMs).total
+                    : realtimeParkingFee(s.checkInTime, nowMs, rule).total;
+                  return (
+                    <tr key={s.id} className="border-b border-slate-50 last:border-0">
+                      <td className="px-5 py-3 font-mono font-semibold text-blue-700">{s.ticketCode || '—'}</td>
+                      <td className="px-5 py-3 font-bold text-slate-800">{s.licensePlate}</td>
+                      <td className="px-5 py-3 text-slate-600">{vehicleLabel(s.vehicleType)}</td>
+                      <td className="px-5 py-3 text-slate-600">{s.entryGate || '—'}</td>
+                      <td className="px-5 py-3 text-slate-600">{formatDateTime(s.checkInTime)}</td>
+                      <td className="px-5 py-3 font-mono font-semibold text-slate-800">{validEntry ? liveDuration : '—'}</td>
+                      <td className="px-5 py-3 text-right font-bold text-rose-600">{formatMoney(estFee)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* ── VEHICLE PICKER (only shown when ≥ 1 parked vehicle) ── */}
       {checkedInVehicles.length > 0 && (
@@ -368,20 +456,39 @@ export default function CurrentSession({
             </span>
           </div>
 
+          {/* Tìm biển số → xem loại xe & vị trí đỗ */}
+          <div className="relative mb-4">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              value={plateSearch}
+              onChange={(e) => setPlateSearch(e.target.value.toUpperCase())}
+              placeholder="Tìm biển số xe (vd: 29C1-38383)..."
+              className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm uppercase tracking-wider focus:border-blue-400 focus:bg-white focus:outline-none"
+            />
+          </div>
+          {plateSearch && (
+            <p className="mb-3 text-[11px] text-slate-400">
+              {searchHits.length > 0
+                ? `Tìm thấy ${searchHits.length} xe khớp "${plateSearch}"`
+                : `Không có xe nào khớp "${plateSearch}"`}
+            </p>
+          )}
+
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {checkedInVehicles.map((res, idx) => {
+              // Ẩn thẻ không khớp ô tìm kiếm (giữ nguyên idx thật để chọn đúng xe)
+              if (plateSearch && !searchHits.includes(res)) return null;
               const isSelected = idx === selectedIdx;
               const isThisPrimary =
                 hasSession && res.licensePlate === currentSession.licensePlate;
               // Same source everywhere this fee is shown (this picker, the
-              // detail panel below, and "Trang của tôi"): the price actually
-              // quoted/charged at booking time — not a live elapsed-time
-              // recalculation, which used to drift from every other display.
+              // detail panel below, and "Trang của tôi"): perVisitOverstay
+              // falls back to the pricing rule's first-hour price when there's
+              // no quoted estimatedCost (walk-ins with no reservation), so
+              // those still show a real number instead of 0đ.
               const estFee = isThisPrimary
                 ? currentSession.estimatedFee
-                : res.estimatedCost && res.estimatedCost > 0
-                ? res.estimatedCost
-                : 0;
+                : perVisitOverstay(res, pricingRules, nowMs).total;
 
               return (
                 <button
@@ -420,12 +527,14 @@ export default function CurrentSession({
                     </div>
                     <div>
                       <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Giờ vào</span>
-                      <span className="font-semibold text-slate-700">{res.startTime.slice(0, 5)}</span>
+                      <span className="font-semibold text-slate-700">
+                        {res.checkedInAt ? res.checkedInAt.slice(11, 16) : res.startTime.slice(0, 5)}
+                      </span>
                     </div>
                     <div>
                       <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Thời gian</span>
                       <span className="font-semibold text-slate-700">
-                        {formatDuration(`${res.date} ${res.startTime}`)}
+                        {formatDuration(res.checkedInAt || `${res.date} ${res.startTime}`)}
                       </span>
                     </div>
                     <div>
@@ -512,14 +621,25 @@ export default function CurrentSession({
                       </p>
                     </div>
                   </div>
+
+                  {onCancelReservation && (
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setCancelTarget(res)}
+                        className="cursor-pointer rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 transition hover:bg-rose-50"
+                      >
+                        Hủy đặt chỗ
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
 
           <div className="mt-4 rounded-xl border border-amber-100 bg-amber-50 p-3 text-xs text-amber-700">
-            Vui lòng đến bãi xe và bấm <strong>"Check-in"</strong> trong mục{' '}
-            <strong>"Đặt chỗ của tôi"</strong> để kích hoạt lượt gửi.
+            Vui lòng đến bãi xe — nhân viên hoặc hệ thống quét thẻ RFID tại cổng sẽ ghi nhận xe vào và kích hoạt lượt gửi.
           </div>
 
           <button
@@ -527,7 +647,7 @@ export default function CurrentSession({
             onClick={() => setView('reservations')}
             className="mt-3 cursor-pointer rounded-xl bg-blue-600 px-5 py-2.5 text-xs font-bold text-white transition hover:bg-blue-500"
           >
-            Đến trang Đặt chỗ → Check-in
+            Xem chi tiết đặt chỗ
           </button>
         </div>
       )}
@@ -659,7 +779,7 @@ export default function CurrentSession({
                   onClick={openCheckout}
                   className="cursor-pointer rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-indigo-500"
                 >
-                  Mô phỏng quét khi ra
+                  Cho xe ra
                 </button>
               </>
             )}
@@ -882,7 +1002,7 @@ export default function CurrentSession({
                       Date.now() +
                         (label.includes('30') ? 30 : label.includes('2 giờ') ? 120 : 1440) * 60000,
                     );
-                    setCheckOutTimeInput(next.toISOString().slice(0, 16).replace('T', ' '));
+                    setCheckOutTimeInput(nowLocalStr(false, next));
                   }}
                   className="cursor-pointer rounded bg-white px-2 py-1 text-slate-600 transition hover:bg-slate-50"
                 >
@@ -899,11 +1019,11 @@ export default function CurrentSession({
             <Row label="Giờ ra thực tế" value={formatDateTime(checkOutTimeInput)} />
             <Row label="Thời gian gửi xe" value={formatDuration(activeSession.checkInTime, checkOutTimeInput)} />
             <div className="border-t border-slate-200/60 pt-2 mt-1 space-y-1.5">
-              <Row label="Giờ đầu tiên" value={formatMoney(pricingRule.firstHourPrice)} />
-              {feeBreakdown.extraHours > 0 && (
+              <Row label="Phí gửi theo lượt" value={formatMoney(feeBreakdown.parkingFee)} />
+              {feeBreakdown.nights > 0 && (
                 <Row
-                  label={`${feeBreakdown.extraHours} giờ tiếp × ${formatMoney(pricingRule.nextHourPrice)}`}
-                  value={formatMoney(feeBreakdown.extraHours * pricingRule.nextHourPrice)}
+                  label={`Qua đêm — ${feeBreakdown.nights} đêm × ${formatMoney(pricingRule.overnightPrice)}`}
+                  value={formatMoney(feeBreakdown.nightsFee)}
                 />
               )}
               {feeBreakdown.serviceFee > 0 && <Row label="Phí dịch vụ" value={formatMoney(feeBreakdown.serviceFee)} />}
@@ -980,6 +1100,17 @@ export default function CurrentSession({
           </div>
         </Modal>
       )}
+
+      <ConfirmModal
+        isOpen={cancelTarget !== null}
+        title="Hủy đặt chỗ của khách?"
+        message={cancelTarget ? `Đặt chỗ ${cancelTarget.reservationCode} (biển số ${cancelTarget.licensePlate || '—'}) sẽ bị hủy. Khách sẽ nhận được thông báo.` : ''}
+        onConfirm={() => {
+          if (cancelTarget) onCancelReservation?.(cancelTarget.id);
+          setCancelTarget(null);
+        }}
+        onCancel={() => setCancelTarget(null)}
+      />
     </div>
   );
 }

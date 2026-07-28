@@ -4,6 +4,7 @@ import {
   Map, Phone, Car, ArrowRight,
 } from 'lucide-react';
 import parkflowBg from '../../assets/images/parkflow_bg_1779336618673.png';
+import type { PricingRule, VehicleKey } from '../../data/mockData';
 // Real photos of the three lots (see "Bãi xe nổi bật")
 import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
 import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
@@ -19,7 +20,7 @@ interface Lot {
   badgeColor: string;
   features: { icon: React.ReactNode; label: string }[];
   priceFrom: string;
-  floors: { name: string; items: string[] }[];
+  floor: { name: string; items: string[] };
 }
 
 const lots: Lot[] = [
@@ -38,10 +39,7 @@ const lots: Lot[] = [
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
     priceFrom: '700.000đ',
-    floors: [
-      { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Staff Booth', 'Ramp lên'] },
-      { name: 'Tầng 2', items: ['Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Ramp xuống'] },
-    ],
+    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
   {
     id: '2',
@@ -58,10 +56,7 @@ const lots: Lot[] = [
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
     priceFrom: '850.000đ',
-    floors: [
-      { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Staff Booth', 'Ramp lên'] },
-      { name: 'Tầng 2', items: ['Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Ramp xuống'] },
-    ],
+    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
   {
     id: '3',
@@ -80,52 +75,69 @@ const lots: Lot[] = [
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
     priceFrom: '1.100.000đ',
-    floors: [
-      { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Staff Booth', 'Ramp lên'] },
-      { name: 'Tầng 2', items: ['Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Ramp xuống'] },
-    ],
+    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
 ];
 
-const pricingRows = [
+function formatVnd(value: number) {
+  return `${value.toLocaleString('vi-VN')}đ`;
+}
+
+// Metadata cố định (icon, nhãn, mô tả) — số tiền lấy trực tiếp từ pricingRules
+// (bảng giá thật do Manager chỉnh) để không bao giờ lệch với giá đang tính phí.
+const pricingRowsMeta: {
+  vehicleKey: VehicleKey;
+  icon: React.ReactNode;
+  label: string;
+  sub: string;
+  popular?: boolean;
+  perVisitLabel: string;
+}[] = [
   {
+    vehicleKey: 'motorbike',
     icon: <Car className="h-5 w-5 text-blue-600" />,
     label: 'Xe máy / Xe máy điện',
     sub: 'Mô tô, tay ga, xe điện 2 bánh',
-    prices: [
-      { type: 'Theo lượt', price: '10.000đ' },
-      { type: 'Qua đêm', price: '30.000đ' },
-      { type: 'Theo tháng', price: '200.000đ' },
-    ],
+    perVisitLabel: 'Theo lượt',
   },
   {
+    vehicleKey: 'car',
     icon: <Car className="h-5 w-5 text-blue-600" />,
     label: 'Ô tô 4-7 chỗ (Xăng)',
     sub: 'Sedan, SUV, Hatchback',
     popular: true,
-    prices: [
-      { type: 'Theo giờ', price: '25.000đ' },
-      { type: 'Qua đêm', price: '80.000đ' },
-      { type: 'Theo tháng', price: '700.000đ' },
-    ],
+    perVisitLabel: 'Theo giờ',
   },
   {
+    vehicleKey: 'electric vehicle',
     icon: <Zap className="h-5 w-5 text-blue-600" />,
     label: 'Ô tô 4-7 chỗ (Điện / EV)',
     sub: 'Có trạm sạc EV kèm theo',
-    prices: [
-      { type: 'Theo giờ', price: '30.000đ' },
-      { type: 'Qua đêm', price: '100.000đ' },
-      { type: 'Theo tháng', price: '1.200.000đ' },
-    ],
+    perVisitLabel: 'Theo giờ',
   },
 ];
+
+function buildPricingRows(pricingRules: PricingRule[]) {
+  return pricingRowsMeta.map((meta) => {
+    const rule = pricingRules.find((r) => r.vehicleType === meta.vehicleKey);
+    return {
+      icon: meta.icon,
+      label: meta.label,
+      sub: meta.sub,
+      popular: meta.popular,
+      prices: [
+        { type: meta.perVisitLabel, price: formatVnd(rule?.firstHourPrice ?? 0) },
+        { type: 'Qua đêm', price: formatVnd(rule?.overnightPrice ?? 0) },
+        { type: 'Theo tháng', price: formatVnd(rule?.monthlyPrice ?? 0) },
+      ],
+    };
+  });
+}
 
 import ParkingFloorMap from '../../components/ParkingFloorMap';
 
 function LotCard({ lot, onBook }: { lot: Lot; onBook: (lotId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
-  const [activeFloor, setActiveFloor] = useState(0);
 
   return (
     <div className="group bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm hover:shadow-xl transition-all duration-300 flex flex-col md:flex-row w-full">
@@ -174,34 +186,17 @@ function LotCard({ lot, onBook }: { lot: Lot; onBook: (lotId: string) => void })
 
           {expanded && (
             <div className="bg-white">
-              {/* Floor tabs */}
-              <div className="flex border-b border-slate-100">
-                {lot.floors.map((floor, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setActiveFloor(i)}
-                    className={`flex-1 py-2 text-[12px] font-semibold transition ${
-                      activeFloor === i
-                        ? 'border-b-2 border-blue-600 text-blue-700 bg-blue-50/60'
-                        : 'text-slate-500 hover:text-slate-700'
-                    }`}
-                  >
-                    {floor.name}
-                  </button>
-                ))}
-              </div>
-
               {/* Floor plan — same schematic map as the booking page (view-only) */}
               <div className="relative bg-slate-50 p-2">
-                <ParkingFloorMap level={activeFloor === 0 ? 1 : 2} interactive={false} />
+                <ParkingFloorMap level={1} interactive={false} />
                 <div className="absolute top-4 left-4 bg-blue-700/90 text-white text-[11px] font-bold px-3 py-1 rounded-full backdrop-blur-sm border border-blue-400/40">
-                  {lot.floors[activeFloor]?.name}
+                  {lot.floor.name}
                 </div>
               </div>
 
               {/* Floor info pills */}
               <div className="px-4 py-3 flex flex-wrap gap-1.5 bg-slate-50 border-t border-slate-100">
-                {lot.floors[activeFloor]?.items.map((item, j) => (
+                {lot.floor.items.map((item, j) => (
                   <span key={j} className="bg-blue-50 text-blue-700 text-[11px] font-medium px-2.5 py-1 rounded-full border border-blue-100">
                     {item}
                   </span>
@@ -240,9 +235,16 @@ function LotCard({ lot, onBook }: { lot: Lot; onBook: (lotId: string) => void })
   );
 }
 
-export default function ParkingLotsList({ setView }: { setView: (v: string) => void }) {
+export default function ParkingLotsList({
+  setView,
+  pricingRules = [],
+}: {
+  setView: (v: string) => void;
+  pricingRules?: PricingRule[];
+}) {
   const [search, setSearch] = useState('');
   const featuredRef = useRef<HTMLElement>(null);
+  const pricingRows = buildPricingRows(pricingRules);
 
   // "Xem bản đồ" on the homepage hero lands here — jump straight to "Bãi xe nổi bật".
   useEffect(() => {

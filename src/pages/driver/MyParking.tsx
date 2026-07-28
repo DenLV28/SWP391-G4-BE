@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
-import { Ticket, Receipt, Car, Clock, MapPin, CreditCard, Hash, DoorOpen, Trash2 } from 'lucide-react';
-import { User, ParkingSession, Reservation, Feedback, SavedVehicle } from '../../data/mockData';
+import React, { useEffect, useState } from 'react';
+import { Ticket, Receipt, Car, Clock, MapPin, CreditCard, Hash, DoorOpen, Trash2, Building2 } from 'lucide-react';
+import { User, ParkingSession, Reservation, Feedback, SavedVehicle, PricingRule, Slot } from '../../data/mockData';
+import { PARKING_LOTS } from '../../utils/parkingLots';
 import StatCard from '../../components/StatCard';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
+import { perVisitOverstay, buildCheckedInVehicles } from '../../utils/reservationPricing';
 
 const vehicleLabelMap: Record<string, string> = {
   car: 'Ô tô 4-7 chỗ (Xăng)', motorbike: 'Xe máy / Xe máy điện', 'electric vehicle': 'Ô tô 4-7 chỗ (Điện)',
@@ -18,10 +20,30 @@ function formatDateTime(v: string) {
   return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export default function MyParking({ user, setView, currentSession, reservations, unpaidTotal, unpaidIsEstimate, unpaidSessionAmount = 0, unpaidReservationAmount = 0, unpaidOtherAmount = 0, feedbacks, savedVehicles, onClearCheckedIn }: {
+/** Tên bãi đỗ của một xe đang đỗ — ưu tiên `parkingLot` của reservation (luôn có,
+ * kể cả khách vãng lai không có bản ghi này), nếu không thì tra theo slotCode
+ * trong kho ô (`slots[].parkingLot`, đồng bộ trực tiếp từ DB). */
+function lotLabelFor(res: Reservation, slots: Slot[]): string {
+  if (res.parkingLot) return res.parkingLot;
+  const slot = slots.find((s) => s.slotCode === res.slotCode);
+  return slot?.parkingLot || PARKING_LOTS.find((l) => l.key === 'quan9')!.name;
+}
+
+/** Đã gửi bao lâu, chạy real-time (HH:MM:SS) từ mốc check-in tới `nowMs`. */
+function elapsedSince(checkInStamp: string, nowMs: number): string {
+  const start = new Date(checkInStamp.replace(' ', 'T')).getTime();
+  if (Number.isNaN(start)) return '';
+  const s = Math.max(0, Math.floor((nowMs - start) / 1000));
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+}
+
+export default function MyParking({ user, setView, currentSession, activeSessions = [], reservations, unpaidTotal, unpaidIsEstimate, unpaidSessionAmount = 0, unpaidReservationAmount = 0, unpaidOtherAmount = 0, feedbacks, savedVehicles, pricingRules = [], slots = [], onClearCheckedIn }: {
   user: User;
   setView: (view: string) => void;
   currentSession: ParkingSession;
+  /** Toàn bộ phiên gửi xe đang hoạt động của tài khoản này — một tài khoản có thể có nhiều xe đỗ cùng lúc, không chỉ currentSession. */
+  activeSessions?: ParkingSession[];
   reservations: Reservation[];
   unpaidTotal: number;
   unpaidIsEstimate?: boolean;
@@ -30,16 +52,30 @@ export default function MyParking({ user, setView, currentSession, reservations,
   unpaidOtherAmount?: number;
   feedbacks: Feedback[];
   savedVehicles: SavedVehicle[];
+  pricingRules?: PricingRule[];
+  /** Kho ô đỗ — dùng để suy ra tên bãi cho xe vãng lai (không có reservation.parkingLot). */
+  slots?: Slot[];
   onClearCheckedIn?: (ids: string[]) => void;
 }) {
   const [confirmClear, setConfirmClear] = useState(false);
   const activeFeedback = feedbacks.find(f => f.status !== 'Resolved');
   const defaultVeh = savedVehicles.find(v => v.userId === user.id && v.isDefault);
-  // All checked-in reservations = vehicles currently at the lot
-  const checkedInList = reservations.filter(r => r.status === 'Checked-in');
+  const isMySession = currentSession.userId === user.id;
+
+  // All checked-in reservations = vehicles currently at the lot (includes
+  // walk-ins synthesized from activeSessions — see buildCheckedInVehicles).
+  const checkedInList = buildCheckedInVehicles(reservations, activeSessions);
   // Pending and confirmed reservations = booked but not yet checked in
   const pendingList = reservations.filter(r => r.status === 'Pending' || r.status === 'Confirmed');
-  const isMySession = currentSession.userId === user.id;
+
+  // Xe đang đỗ → tick mỗi giây để "Phí tạm tính" (tính lại real-time qua
+  // perVisitOverstay) và thời lượng đã gửi chạy sống, không đứng yên như cũ.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (checkedInList.length === 0) return;
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [checkedInList.length]);
 
   // Breakdown so "Số dư chưa thanh toán" doesn't read as a single unexplained
   // lump sum that looks inconsistent with the per-vehicle "Phí tạm tính".
@@ -157,16 +193,20 @@ export default function MyParking({ user, setView, currentSession, reservations,
             <div className="space-y-3">
               {checkedInList.map((res) => {
                 // Supplement with session data if this reservation's vehicle matches
-                const matchedSession = isMySession && currentSession.licensePlate === res.licensePlate ? currentSession : null;
+                const matchedSession =
+                  activeSessions.find((s) => s.licensePlate === res.licensePlate) ??
+                  (isMySession && currentSession.licensePlate === res.licensePlate ? currentSession : null);
                 const sv = savedVehicles.find(v => v.licensePlate === res.licensePlate && v.userId === user.id);
-                const checkInTime = matchedSession ? formatDateTime(matchedSession.checkInTime) : `${res.date} ${res.startTime.slice(0, 5)}`;
+                // Mốc check-in THẬT (ghi ở backend lúc staff quét thẻ) — ưu tiên
+                // hơn cả session lẫn khung giờ dự kiến lúc đặt.
+                const checkInStamp = res.checkedInAt || matchedSession?.checkInTime || `${res.date} ${res.startTime}`;
+                const checkInTime = formatDateTime(checkInStamp);
+                const liveElapsed = elapsedSince(checkInStamp, nowMs);
                 const ticketCode = matchedSession?.ticketCode ?? '—';
-                // Fall back to the fee actually quoted/charged at booking time
-                // (reservation.estimatedCost) when there's no matching real
-                // ParkingSession tracked yet — otherwise this silently shows 0đ
-                // for every checked-in vehicle except whichever one happens to
-                // be App.tsx's single "currentSession".
-                const estimatedFee = matchedSession?.estimatedFee ?? (res.estimatedCost && res.estimatedCost > 0 ? res.estimatedCost : 0);
+                // Phí tạm tính CHẠY REAL-TIME: tính lại theo giờ hiện tại mỗi giây
+                // qua perVisitOverstay (cộng phụ phí quá giờ nếu có) thay vì đứng
+                // yên ở con số quote lúc đặt/check-in.
+                const estimatedFee = perVisitOverstay(res, pricingRules, nowMs).total;
                 const entryGate = matchedSession?.entryGate ?? '—';
 
                 return (
@@ -195,22 +235,32 @@ export default function MyParking({ user, setView, currentSession, reservations,
                         <div>
                           <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">Giờ vào</span>
                           <span className="font-semibold text-slate-700">{checkInTime}</span>
+                          {liveElapsed && (
+                            <span className="ml-1.5 inline-flex items-center gap-1 font-mono text-[10px] font-bold text-emerald-600">
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> {liveElapsed}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5 text-slate-600">
                         <MapPin className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                         <div>
                           <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">Vị trí</span>
-                          <span className="font-semibold text-slate-700">
-                            {[res.floor, res.area, res.slotCode].filter(Boolean).join(' · ')}
-                          </span>
+                          <span className="font-semibold text-slate-700">{res.slotCode || '—'}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 text-slate-600">
+                        <Building2 className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                        <div>
+                          <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">Bãi đỗ</span>
+                          <span className="font-semibold text-slate-700">{lotLabelFor(res, slots)}</span>
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5 text-slate-600">
                         <CreditCard className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                         <div>
                           <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">Phí tạm tính</span>
-                          <span className="font-bold text-rose-600">{estimatedFee.toLocaleString()} VND</span>
+                          <span className="font-bold text-rose-600 tabular-nums">{estimatedFee.toLocaleString()} VND</span>
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5 text-slate-600">
@@ -229,13 +279,6 @@ export default function MyParking({ user, setView, currentSession, reservations,
                       </div>
                     </div>
 
-                    {matchedSession && (
-                      <div className="pt-1">
-                        <button onClick={() => setView('session')} className="rounded-lg border border-blue-200 bg-white px-4 py-2 text-xs font-bold text-blue-600 hover:bg-blue-50 transition">
-                          Xem chi tiết vé gửi →
-                        </button>
-                      </div>
-                    )}
                   </div>
                 );
               })}

@@ -145,19 +145,19 @@ export const ROLE_POLICY: Record<Role, RolePolicy> = {
   'Parking Manager': {
     label: 'Parking Manager',
     home: 'managerdashboard',
-    routes: ['managerdashboard', 'parkinglots', 'parkinglotdetail', 'pricing-vehicles', 'reports', 'exceptions', 'issues', 'profile'],
+    routes: ['managerdashboard', 'parkinglots', 'parkinglotdetail', 'pricing-vehicles', 'reports', 'monthlycards', 'exceptions', 'feedback', 'profile'],
     permissions: permissionsFor('Parking Manager'),
   },
   'Parking Staff': {
     label: 'Parking Staff',
     home: 'staffdashboard',
-    routes: ['staffdashboard', 'gatecontrol', 'activitylog', 'emergency', 'profile'],
+    routes: ['staffdashboard', 'gatecontrol', 'parkingmonitor', 'activitylog', 'emergency', 'profile'],
     permissions: permissionsFor('Parking Staff'),
   },
   'Parking User / Driver': {
     label: 'Parking User / Driver',
     home: 'myparking',
-    routes: ['myparking', 'session', 'reservations', 'payments', 'feedback', 'profile', 'vnpay-return'],
+    routes: ['myparking', 'reservations', 'payments', 'feedback', 'profile', 'vnpay-return'],
     permissions: permissionsFor('Parking User / Driver'),
   },
 };
@@ -177,6 +177,23 @@ export function canAccessRoute(role: Role, route: string): boolean {
 
 export function can(role: Role, permission: string): boolean {
   return (ROLE_POLICY[role]?.permissions ?? []).includes(permission);
+}
+
+// ─── user-management permissions ───────────────────────────────────────────
+// Mirrors backend/server.js::canManageRole — the backend is the actual
+// enforcement point, this copy only drives what the UI shows/hides so the
+// two stay in sync. Admin: full manage over every role. Manager: no access —
+// "Quản lý người dùng"/"Quyền và vai trò" were removed from the Manager portal.
+export function canManageUserRole(actorRole: Role, targetRole: Role): boolean {
+  void targetRole;
+  return actorRole === 'System Administrator';
+}
+
+const ALL_ROLES: Role[] = ['Parking User / Driver', 'Parking Staff', 'Parking Manager', 'System Administrator'];
+
+/** Roles `actorRole` is allowed to create accounts for / reassign users into. */
+export function assignableRoles(actorRole: Role): Role[] {
+  return ALL_ROLES.filter((r) => canManageUserRole(actorRole, r));
 }
 
 export const ALL_PROTECTED_ROUTES: string[] = Object.values(ROLE_POLICY).flatMap((p) => p.routes);

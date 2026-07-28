@@ -1,45 +1,25 @@
-import React, { useState } from 'react';
+import { useEffect } from 'react';
 import {
   MapPin, Car, Bookmark, Wrench,
   LayoutGrid, ArrowLeft,
 } from 'lucide-react';
+import type { Slot } from '../../data/mockData';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
+import { sameLot } from '../../utils/parkingLots';
 
-const FLOORS = ['Tầng G'];
+/** Bãi đang xem chi tiết — do ManagerParkingLots truyền qua khi bấm "Xem chi tiết". */
+export interface LotDetailInfo {
+  name: string;
+  address: string;
+  status: string;
+}
 
-type SlotStatus = 'empty' | 'occupied' | 'reserved' | 'maintenance';
-
-interface SlotCell { id: string; label: string; status: SlotStatus }
-
-const makeRow = (prefix: string, statuses: SlotStatus[]): SlotCell[] =>
-  statuses.map((status, i) => ({ id: `${prefix}${i + 1}`, label: `${prefix}${i + 1}`, status }));
-
-const FLOOR_DATA: Record<string, SlotCell[]> = {
-  'Tầng G': [
-    ...makeRow('A', ['empty','occupied','empty','maintenance','empty','reserved','empty','occupied','empty','empty']),
-    ...makeRow('B', ['empty','empty','reserved','empty','empty','occupied','empty','empty','maintenance','empty']),
-  ],
-};
-
-const STATUS_MAP: Record<SlotStatus, MapSlot['status']> = {
-  empty: 'Available',
-  occupied: 'Occupied',
-  reserved: 'Reserved',
-  maintenance: 'Maintenance',
-};
-
-function toMapSlots(cells: SlotCell[]): MapSlot[] {
-  return cells
-    .map((cell) => ({
-      id: cell.id,
-      code: `${cell.id[0]}${cell.id.slice(1).padStart(2, '0')}`,
-      status: STATUS_MAP[cell.status],
-    }))
-    .filter((s) => {
-      const num = parseInt(s.code.slice(1), 10);
-      const p = s.code[0];
-      return (p === 'A' && num <= 11) || (p === 'B' && num <= 5);
-    });
+interface ManagerParkingLotDetailProps {
+  setView: (v: string) => void;
+  /** Bãi được chọn; thiếu (vd. F5 giữa chừng) → quay về danh sách. */
+  lot?: LotDetailInfo | null;
+  /** Toàn bộ ô đỗ hệ thống — trang tự lọc theo bãi đang xem. */
+  slots?: Slot[];
 }
 
 const ACTIVITY_LOG = [
@@ -55,10 +35,27 @@ const statusBadge = (s: string) => {
   return 'bg-red-100 text-red-700';
 };
 
-export default function ManagerParkingLotDetail({ setView }: { setView: (v: string) => void }) {
-  const [activeFloor, setActiveFloor] = useState('Tầng G');
-  const mapSlots = toMapSlots(FLOOR_DATA[activeFloor] ?? []);
-  const mapLevel = 1;
+export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: ManagerParkingLotDetailProps) {
+  // Không biết đang xem bãi nào (vd. refresh trang) → về danh sách bãi
+  useEffect(() => {
+    if (!lot) setView('parkinglots');
+  }, [lot, setView]);
+  if (!lot) return null;
+
+  // Cùng nguồn ô đỗ với sơ đồ của Staff và form Đặt chỗ của User — mọi role
+  // nhìn cùng một trạng thái bãi.
+  const lotSlots = slots.filter((s) => sameLot(s.parkingLot, lot.name));
+  const mapSlots: MapSlot[] = lotSlots.map((s) => ({
+    id: s.slotCode,
+    code: s.slotCode.split('-').pop() ?? s.slotCode,
+    status: s.status as MapSlot['status'],
+  }));
+
+  const occupied    = lotSlots.filter((s) => s.status === 'Occupied').length;
+  const reserved    = lotSlots.filter((s) => s.status === 'Reserved' || s.status === 'Pending').length;
+  const maintenance = lotSlots.filter((s) => s.status === 'Maintenance' || s.status === 'Locked').length;
+
+  const isActive = lot.status === 'Hoạt động';
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 space-y-6">
@@ -73,35 +70,36 @@ export default function ManagerParkingLotDetail({ setView }: { setView: (v: stri
       {/* Building header */}
       <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Toà nhà ParkFlow Long Phước</h1>
+          <h1 className="text-2xl font-bold text-slate-900">{lot.name}</h1>
           <div className="mt-2 flex flex-wrap items-center gap-3">
-            <span className="flex items-center gap-1.5 rounded-full border border-green-200 bg-green-50 px-3 py-1 text-xs font-semibold text-green-700">
-              <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
-              Đang hoạt động
+            <span className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+              isActive
+                ? 'border-green-200 bg-green-50 text-green-700'
+                : 'border-slate-200 bg-slate-50 text-slate-600'
+            }`}>
+              <span className={`h-1.5 w-1.5 rounded-full ${isActive ? 'bg-green-500' : 'bg-slate-400'}`} />
+              {isActive ? 'Đang hoạt động' : lot.status}
             </span>
             <span className="flex items-center gap-1.5 text-sm text-slate-500">
               <MapPin className="h-3.5 w-3.5" />
-              Tp, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam
+              {lot.address}
             </span>
           </div>
         </div>
       </div>
 
-      {/* Stat cards — 4 cards, no occupancy percentage */}
+      {/* Stat cards — số liệu thật của bãi đang xem */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         {([
-          { icon: LayoutGrid, color: 'text-slate-600', border: 'border-slate-200', label: 'Tổng số vị trí', value: 500, sub: '+12 tháng này' },
-          { icon: Car,        color: 'text-blue-600',  border: 'border-blue-200',  label: 'Đang dùng',      value: 210, sub: '' },
-          { icon: Bookmark,   color: 'text-purple-600',border: 'border-purple-200',label: 'Đã đặt',         value: 35,  sub: '' },
-          { icon: Wrench,     color: 'text-red-500',   border: 'border-red-200',   label: 'Bảo trì',        value: 15,  sub: '' },
+          { icon: LayoutGrid, color: 'text-slate-600', border: 'border-slate-200', label: 'Tổng số vị trí', value: lotSlots.length },
+          { icon: Car,        color: 'text-blue-600',  border: 'border-blue-200',  label: 'Đang dùng',      value: occupied },
+          { icon: Bookmark,   color: 'text-purple-600',border: 'border-purple-200',label: 'Đã đặt',         value: reserved },
+          { icon: Wrench,     color: 'text-red-500',   border: 'border-red-200',   label: 'Bảo trì',        value: maintenance },
         ] as const).map((s) => {
           const Icon = s.icon;
           return (
             <div key={s.label} className={`rounded-2xl border ${s.border} bg-white p-4 shadow-sm`}>
-              <div className="flex items-center justify-between">
-                <Icon className={`h-5 w-5 ${s.color}`} />
-                {s.sub && <span className="text-[10px] text-slate-400">{s.sub}</span>}
-              </div>
+              <Icon className={`h-5 w-5 ${s.color}`} />
               <p className="mt-3 text-xs text-slate-500">{s.label}</p>
               <p className={`mt-0.5 text-3xl font-bold ${s.color}`}>{s.value}</p>
             </div>
@@ -109,28 +107,22 @@ export default function ManagerParkingLotDetail({ setView }: { setView: (v: stri
         })}
       </div>
 
-      {/* Floor map */}
+      {/* Floor map — cùng sơ đồ mà Staff phụ trách bãi này và User đặt chỗ nhìn thấy */}
       <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-bold text-slate-800">Sơ đồ vị trí chi tiết</h2>
-          <div className="flex gap-1">
-            {FLOORS.map((f) => (
-              <button
-                key={f}
-                onClick={() => setActiveFloor(f)}
-                className={`rounded-lg px-4 py-1.5 text-sm font-semibold transition ${
-                  activeFloor === f
-                    ? 'bg-blue-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                {f}
-              </button>
-            ))}
-          </div>
+          <span className="rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700">
+            {lot.name}
+          </span>
         </div>
 
-        <ParkingFloorMap slots={mapSlots} level={mapLevel} />
+        {lotSlots.length > 0 ? (
+          <ParkingFloorMap slots={mapSlots} level={1} />
+        ) : (
+          <p className="py-10 text-center text-sm text-slate-400">
+            Bãi này chưa có dữ liệu ô đỗ trong hệ thống.
+          </p>
+        )}
       </div>
 
       {/* Activity log */}
@@ -142,22 +134,24 @@ export default function ManagerParkingLotDetail({ setView }: { setView: (v: stri
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-slate-100">
-                {['Thời gian', 'Biển số', 'Hành động', 'Loại xe', 'Trạng thái'].map((h) => (
-                  <th key={h} className="pb-3 text-left text-xs font-semibold text-slate-500">{h}</th>
-                ))}
+              <tr className="border-b border-slate-100 text-left text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                <th className="py-2.5 pr-3">Thời gian</th>
+                <th className="py-2.5 pr-3">Biển số</th>
+                <th className="py-2.5 pr-3">Hành động</th>
+                <th className="py-2.5 pr-3">Loại xe</th>
+                <th className="py-2.5 text-right">Trạng thái</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-50">
-              {ACTIVITY_LOG.map((log, i) => (
-                <tr key={i} className="hover:bg-slate-50/60">
-                  <td className="py-3 text-slate-500">{log.time}</td>
-                  <td className="py-3 font-mono font-semibold text-slate-800">{log.plate}</td>
-                  <td className="py-3 text-slate-700">{log.action}</td>
-                  <td className="py-3 text-slate-600">{log.type}</td>
-                  <td className="py-3">
-                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusBadge(log.status)}`}>
-                      {log.status}
+            <tbody>
+              {ACTIVITY_LOG.map((row) => (
+                <tr key={`${row.time}-${row.plate}`} className="border-b border-slate-50 last:border-0">
+                  <td className="py-2.5 pr-3 font-mono text-xs text-slate-500">{row.time}</td>
+                  <td className="py-2.5 pr-3 font-mono font-bold text-slate-800">{row.plate}</td>
+                  <td className="py-2.5 pr-3 text-slate-600">{row.action}</td>
+                  <td className="py-2.5 pr-3 text-slate-500">{row.type}</td>
+                  <td className="py-2.5 text-right">
+                    <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${statusBadge(row.status)}`}>
+                      {row.status}
                     </span>
                   </td>
                 </tr>

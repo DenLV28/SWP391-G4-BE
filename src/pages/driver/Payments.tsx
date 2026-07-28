@@ -1,16 +1,21 @@
-import React, { useState } from 'react';
-import { Receipt, X, Trash2, FileText, Printer } from 'lucide-react';
-import { Payment } from '../../data/mockData';
+import React, { useMemo, useState } from 'react';
+import { Receipt, X, Trash2, FileText, Printer, Ban } from 'lucide-react';
+import { Payment, Reservation } from '../../data/mockData';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
 import SectionTitle from '../../components/SectionTitle';
 import { createVNPayPayment } from '../../services/vnpayService';
+import { isPaymentVoided } from '../../utils/reservationPricing';
 
 export default function Payments({
   payments,
+  reservations = [],
   onClearPaid,
 }: {
   payments: Payment[];
+  /** Dùng để phát hiện hóa đơn Unpaid mồ côi — đặt chỗ/lượt gửi gắn với nó đã
+   *  bị hủy hoặc không còn tồn tại, nên không cho thanh toán tiếp nữa. */
+  reservations?: Reservation[];
   onClearPaid?: () => void;
 }) {
   const [filter, setFilter] = useState<'Tất cả' | 'Paid' | 'Unpaid' | 'Failed'>('Tất cả');
@@ -19,8 +24,22 @@ export default function Payments({
   const [loadingVNPay, setLoadingVNPay] = useState<string | null>(null);
   const [invoicePayment, setInvoicePayment] = useState<Payment | null>(null);
 
+  // Hóa đơn coi là "đã hủy thanh toán" khi: backend đã đánh dấu Failed, HOẶC
+  // còn Unpaid nhưng đặt chỗ liên quan (theo reservationCode/ticketCode) đã bị
+  // hủy/hết hạn hoặc không còn tồn tại nữa (vd. hủy ngay sau khi vừa đặt) —
+  // hóa đơn đó không còn ý nghĩa gì, không nên cho bấm thanh toán tiếp.
+  const voidedIds = useMemo(() => {
+    const ids = new Set<string>();
+    payments.forEach((p) => {
+      if (isPaymentVoided(p, reservations)) ids.add(p.id);
+    });
+    return ids;
+  }, [payments, reservations]);
+
   const filtered = payments.filter((payment) => {
     if (filter === 'Tất cả') return true;
+    if (filter === 'Failed') return payment.status === 'Failed' || voidedIds.has(payment.id);
+    if (filter === 'Unpaid') return payment.status === 'Unpaid' && !voidedIds.has(payment.id);
     return payment.status === filter;
   });
 
@@ -109,7 +128,7 @@ export default function Payments({
                     <FileText className="h-3.5 w-3.5" />
                     Hóa đơn
                   </button>
-                  <StatusBadge status={payment.status} />
+                  <StatusBadge status={voidedIds.has(payment.id) ? 'Cancelled' : payment.status} />
                 </div>
               </div>
 
@@ -124,7 +143,19 @@ export default function Payments({
                 </div>
               </div>
 
-              {payment.status === 'Unpaid' ? (
+              {voidedIds.has(payment.id) ? (
+                /* Đã hủy thanh toán — đặt chỗ/lượt gửi liên quan đã bị hủy
+                   hoặc không còn tồn tại, không cho thanh toán tiếp nữa */
+                <div className="flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3 pt-3">
+                  <Ban className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+                  <div>
+                    <p className="text-[11px] font-bold text-slate-600">Đã hủy thanh toán</p>
+                    <p className="mt-0.5 text-[10px] text-slate-500">
+                      Đặt chỗ liên quan đến hóa đơn này đã bị hủy hoặc không còn tồn tại — hóa đơn không còn hiệu lực, bạn không cần thanh toán.
+                    </p>
+                  </div>
+                </div>
+              ) : payment.status === 'Unpaid' ? (
                 payment.totalAmount <= 0 ? (
                   /* Xe đang trong bãi, chưa tính phí */
                   <div className="flex items-start gap-3 rounded-xl border border-amber-100 bg-amber-50 p-3 pt-3">

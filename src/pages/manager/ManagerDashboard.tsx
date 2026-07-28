@@ -1,18 +1,20 @@
-import { useState, useEffect, useRef } from 'react';
-import { BarChart3, AlertCircle, Bell, LayoutDashboard, DollarSign, LogOut, UserCircle2, Building2, MessageCircle, Plus, TrendingUp, Calendar, Car, Bike, Zap, LayoutGrid, List, ChevronDown, Wrench, X } from 'lucide-react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { BarChart3, AlertCircle, Bell, LayoutDashboard, DollarSign, LogOut, UserCircle2, Building2, MessageCircle, MessageSquare, TrendingUp, Calendar, Car, Bike, Zap, LayoutGrid, List, ChevronDown, Wrench, X } from 'lucide-react';
 import { User, Slot, Reservation, Payment, PricingRule, Floor, Area, Feedback, SlotIssue } from '../../data/mockData';
 import type { EmergencyLog } from '../../types/staff';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
 import PaymentWalletCard from '../../components/PaymentWalletCard';
 import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
-import { formatCurrency } from '../../utils/helpers';
+import { formatCurrency, localDateISO } from '../../utils/helpers';
+import { PARKING_LOTS, lotKeyOrDefault, type LotKey } from '../../utils/parkingLots';
 import ManagerParkingLots from './ManagerParkingLots';
-import ManagerParkingLotDetail from './ManagerParkingLotDetail';
+import ManagerParkingLotDetail, { type LotDetailInfo } from './ManagerParkingLotDetail';
 import ManagerPricingVehicles from './ManagerPricingVehicles';
 import ManagerReports from './ManagerReports';
 import ManagerExceptions from './ManagerExceptions';
-import ManagerIssues from './ManagerIssues';
+import ManagerFeedback from './ManagerFeedback';
+import ManagerMonthlyCards from './ManagerMonthlyCards';
 
 interface ManagerDashboardProps {
   slots: Slot[];
@@ -33,14 +35,16 @@ interface ManagerDashboardProps {
   onRejectIssue?: (id: string) => void;
   onRestoreIssue?: (id: string) => void;
   onForceClearSlot?: (slotCode: string, reason: string) => Promise<boolean>;
+  onRespondFeedback?: (id: string, response: string, status: Feedback['status']) => void;
+  addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
 }
 
 export default function ManagerDashboard({
-  slots,
+  slots: allSlots,
   payments,
-  reservations,
+  reservations: allReservations,
   users,
   pricingRules = [],
   feedbacks = [],
@@ -56,9 +60,27 @@ export default function ManagerDashboard({
   onRejectIssue,
   onRestoreIssue,
   onForceClearSlot,
+  onRespondFeedback,
+  addToast,
   onUpdateUser,
   onAssignStaff,
 }: ManagerDashboardProps) {
+  // ── Bộ chọn bãi đỗ ──────────────────────────────────────────────────────────
+  // Manager có quyền toàn cục: mặc định xem gộp cả 3 bãi, hoặc chọn một bãi
+  // để xem dữ liệu (ô đỗ, đặt chỗ, thống kê) của riêng bãi đó.
+  const [lotFilter, setLotFilter] = useState<'all' | LotKey>('all');
+  const slots = useMemo(
+    () => (lotFilter === 'all' ? allSlots : allSlots.filter((s) => lotKeyOrDefault(s.parkingLot) === lotFilter)),
+    [allSlots, lotFilter],
+  );
+  const reservations = useMemo(
+    () => (lotFilter === 'all' ? allReservations : allReservations.filter((r) => lotKeyOrDefault(r.parkingLot) === lotFilter)),
+    [allReservations, lotFilter],
+  );
+
+  // Bãi đang mở trang "Xem chi tiết" — do ManagerParkingLots đặt khi bấm nút
+  const [detailLot, setDetailLot] = useState<LotDetailInfo | null>(null);
+
   const [bellOpen, setBellOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
@@ -89,7 +111,7 @@ export default function ManagerDashboard({
   }, []);
 
   useEffect(() => {
-    if (!['managerdashboard', 'parkinglots', 'parkinglotdetail', 'pricing-vehicles', 'reports', 'exceptions', 'issues', 'profile'].includes(currentView)) {
+    if (!['managerdashboard', 'parkinglots', 'parkinglotdetail', 'pricing-vehicles', 'reports', 'monthlycards', 'exceptions', 'feedback', 'profile'].includes(currentView)) {
       setView('managerdashboard');
     }
   }, [currentView, setView]);
@@ -109,8 +131,9 @@ export default function ManagerDashboard({
     { key: 'parkinglots',      label: 'Quản lý Bãi xe',     icon: Building2       },
     { key: 'pricing-vehicles', label: 'Bảng giá & Loại xe', icon: DollarSign      },
     { key: 'reports',          label: 'Báo cáo',             icon: BarChart3       },
-    { key: 'exceptions',       label: 'Xử lý Ngoại lệ',     icon: AlertCircle     },
-    { key: 'issues',           label: 'Sự cố Ô đỗ',         icon: Wrench, badge: issues.filter(i => i.status === 'Pending').length },
+    { key: 'monthlycards',     label: 'Xe Thẻ tháng',       icon: Calendar        },
+    { key: 'exceptions',       label: 'Xử lý Ngoại lệ',     icon: AlertCircle, badge: issues.filter(i => i.status === 'Pending').length },
+    { key: 'feedback',         label: 'Phản hồi Người dùng', icon: MessageSquare, badge: feedbacks.filter(f => f.status === 'New').length },
   ];
 
   const handleMenuClick = (menuKey: string) => {
@@ -122,22 +145,34 @@ export default function ManagerDashboard({
   const renderContent = () => {
     switch (currentView) {
       case 'parkinglots':
-        return <ManagerParkingLots floors={floors} areas={areas} slots={slots} users={users} setView={setView} onAssignStaff={onAssignStaff} />;
+        // Trang danh sách bãi hiển thị cả 3 bãi → dùng allSlots (không theo bộ lọc bãi)
+        return <ManagerParkingLots floors={floors} areas={areas} slots={allSlots} users={users} setView={setView} onAssignStaff={onAssignStaff} onViewDetail={setDetailLot} />;
       case 'parkinglotdetail':
-        return <ManagerParkingLotDetail setView={setView} />;
+        return <ManagerParkingLotDetail setView={setView} lot={detailLot} slots={allSlots} />;
       case 'pricing-vehicles':
-        return <ManagerPricingVehicles setView={setView} payments={payments} />;
+        return <ManagerPricingVehicles setView={setView} />;
       case 'reports':
-        return <ManagerReports payments={payments} />;
+        // Báo cáo có bộ lọc bãi + thời gian riêng — nhận dữ liệu toàn hệ thống
+        return <ManagerReports payments={payments} reservations={allReservations} />;
+      case 'monthlycards':
+        return <ManagerMonthlyCards reservations={reservations} users={users} />;
       case 'exceptions':
-        return <ManagerExceptions setView={setView} emergencyLogs={emergencyLogs} />;
-      case 'issues':
         return (
-          <ManagerIssues
+          <ManagerExceptions
+            setView={setView}
+            emergencyLogs={emergencyLogs}
             issues={issues}
-            onApprove={(id) => onApproveIssue?.(id)}
-            onReject={(id) => onRejectIssue?.(id)}
-            onRestore={(id) => onRestoreIssue?.(id)}
+            onApproveIssue={onApproveIssue}
+            onRejectIssue={onRejectIssue}
+            onRestoreIssue={onRestoreIssue}
+          />
+        );
+      case 'feedback':
+        return (
+          <ManagerFeedback
+            feedbacks={feedbacks}
+            onRespondFeedback={onRespondFeedback}
+            addToast={addToast}
           />
         );
       case 'profile':
@@ -157,6 +192,8 @@ export default function ManagerDashboard({
             reservations={reservations}
             users={users}
             pricingRules={pricingRules}
+            allSlots={allSlots}
+            activeLotFilter={lotFilter}
           />
         );
     }
@@ -211,13 +248,6 @@ export default function ManagerDashboard({
 
         {/* Bottom section */}
         <div className="px-3 pb-5 space-y-1 border-t border-slate-100 pt-3">
-          <button
-            onClick={() => setView('parkinglots')}
-            className="w-full flex items-center justify-center gap-2 rounded-xl bg-blue-600 py-2.5 text-sm font-bold text-white hover:bg-blue-700 transition"
-          >
-            <Plus className="h-4 w-4" />
-            Thêm bãi mới
-          </button>
           {onLogout && (
             <button
               onClick={onLogout}
@@ -240,6 +270,21 @@ export default function ManagerDashboard({
               <input placeholder="Tìm kiếm ngoại lệ, biển số..." className="w-full rounded-xl bg-slate-100/70 py-2 pl-9 pr-3 text-sm focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-300" />
             </div>
             <div className="flex items-center gap-3">
+              {/* Parking-lot selector — switch which lot's data is shown */}
+              <div className="relative">
+                <select
+                  value={lotFilter}
+                  onChange={(e) => setLotFilter(e.target.value as 'all' | LotKey)}
+                  title="Chọn bãi đỗ để xem dữ liệu"
+                  className="appearance-none rounded-xl border border-slate-200 bg-slate-50 py-2 pl-3 pr-8 text-sm font-semibold text-slate-700 transition hover:bg-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-300"
+                >
+                  <option value="all">Tất cả bãi đỗ</option>
+                  {PARKING_LOTS.map((lot) => (
+                    <option key={lot.key} value={lot.key}>{lot.name}</option>
+                  ))}
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              </div>
               {/* Notification Bell */}
               {(() => {
                 const newFeedbacks = feedbacks.filter((f) => f.status === 'New');
@@ -274,7 +319,7 @@ export default function ManagerDashboard({
                             <div
                               key={fb.id}
                               className="px-4 py-3 hover:bg-slate-50 cursor-pointer"
-                              onClick={() => { setBellOpen(false); setView('managerdashboard'); }}
+                              onClick={() => { setBellOpen(false); setView('feedback'); }}
                             >
                               <div className="flex items-start justify-between gap-2">
                                 <div className="flex-1 min-w-0">
@@ -304,7 +349,7 @@ export default function ManagerDashboard({
                             <div
                               key={issue.id}
                               className="px-4 py-3 hover:bg-slate-50 cursor-pointer"
-                              onClick={() => { setBellOpen(false); setView('issues'); }}
+                              onClick={() => { setBellOpen(false); setView('exceptions'); }}
                             >
                               <p className="text-[10px] font-bold text-red-600 uppercase">Sự cố ô đỗ mới</p>
                               <p className="text-xs font-semibold text-slate-800">{issue.slotCode} — {issue.issueType}</p>
@@ -431,7 +476,7 @@ export default function ManagerDashboard({
                 </button>
               </div>
               <button
-                onClick={() => { setIssueAlert(null); setView('issues'); }}
+                onClick={() => { setIssueAlert(null); setView('exceptions'); }}
                 className="w-full text-xs text-blue-600 hover:underline"
               >
                 Xem tất cả sự cố →
@@ -469,15 +514,34 @@ function DashboardContent({
   reservations: _reservations,
   users: _users,
   pricingRules,
+  allSlots,
+  activeLotFilter = 'all',
 }: {
   slots: Slot[];
   payments: Payment[];
   reservations: Reservation[];
   users: User[];
   pricingRules: PricingRule[];
+  /** Toàn bộ ô đỗ của cả 3 bãi — cho bộ chọn bãi riêng của sơ đồ. */
+  allSlots?: Slot[];
+  /** Bãi đang chọn trên topbar — sơ đồ đồng bộ theo khi chọn một bãi cụ thể. */
+  activeLotFilter?: 'all' | LotKey;
 }) {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [areaMode, setAreaMode] = useState<'all' | 'car' | 'motorbike'>('all');
+
+  // ── Chọn bãi đỗ cho sơ đồ (giống form Đặt chỗ của user) ─────────────────────
+  // Sơ đồ luôn hiển thị MỘT bãi cụ thể (mỗi bãi có kho ô riêng trùng mã A01...,
+  // gộp chung sẽ chồng ô lên nhau). Chọn bãi ở đây → nhảy sang xem tình trạng
+  // bãi đó; chọn bãi trên topbar cũng tự đồng bộ xuống sơ đồ.
+  const [mapLot, setMapLot] = useState<LotKey>(activeLotFilter === 'all' ? 'quan9' : activeLotFilter);
+  useEffect(() => {
+    if (activeLotFilter !== 'all') setMapLot(activeLotFilter);
+  }, [activeLotFilter]);
+  const mapSlots = useMemo(
+    () => (allSlots ?? slots).filter((s) => lotKeyOrDefault(s.parkingLot) === mapLot),
+    [allSlots, slots, mapLot],
+  );
 
   const now = new Date();
   const dayNames = ['Chủ nhật', 'Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy'];
@@ -487,7 +551,7 @@ function DashboardContent({
   const occupiedCount = slots.filter((s) => s.status === 'Occupied').length;
   const occupancyPct = totalSlots > 0 ? Math.round((occupiedCount / totalSlots) * 100) : 0;
 
-  const todayStr = now.toISOString().slice(0, 10);
+  const todayStr = localDateISO(now);
   const paidPayments = payments.filter((p) => p.status === 'Paid');
   const todayRevenue = paidPayments
     .filter((p) => (p.paidAt || p.createdAt || '').startsWith(todayStr))
@@ -681,9 +745,25 @@ function DashboardContent({
             </div>
           </div>
         </div>
+        {/* Chọn bãi đỗ — giống list ở chức năng Đặt chỗ của user */}
+        <div className="border-b border-slate-100 bg-slate-50/50 px-6 py-3">
+          <label className="mb-1.5 block text-xs font-bold text-slate-600">Chọn bãi đỗ</label>
+          <div className="relative max-w-sm">
+            <select
+              value={mapLot}
+              onChange={(e) => setMapLot(e.target.value as LotKey)}
+              className="w-full appearance-none rounded-xl border border-slate-300 bg-white px-4 py-2.5 pr-10 text-sm font-semibold text-slate-800 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-600/10"
+            >
+              {PARKING_LOTS.map((lot) => (
+                <option key={lot.key} value={lot.key}>{lot.bookingLabel}</option>
+              ))}
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          </div>
+        </div>
         <div className="p-5">
           <ParkingFloorMap
-            slots={slots.map((s) => ({
+            slots={mapSlots.map((s) => ({
               id: s.id,
               code: s.slotCode.split('-').pop() ?? s.slotCode,
               status: s.status,

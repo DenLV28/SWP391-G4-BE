@@ -1,4 +1,4 @@
-# One-time setup for the PaddleOCR license-plate service.
+﻿# One-time setup for the PaddleOCR license-plate service.
 #   powershell -ExecutionPolicy Bypass -File setup.ps1 [-PaddleRepo <path>]
 param(
     # Path to the existing local PaddleOCR source folder (the model/code you already have).
@@ -34,14 +34,14 @@ Invoke-Expression "$pip install -r requirements.txt"
 $env:SETUPTOOLS_SCM_PRETEND_VERSION = "3.3.0"
 if (Test-Path $PaddleRepo) {
     Write-Host "Cài PaddleOCR từ thư mục local: $PaddleRepo"
-    Invoke-Expression "$pip install `"$PaddleRepo`""
+    & .\.venv\Scripts\python.exe -m pip install $PaddleRepo
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Cài từ thư mục local thất bại — dùng bản PyPI thay thế." -ForegroundColor Yellow
-        Invoke-Expression "$pip install `"paddleocr>=3.0,<4`""
+        & .\.venv\Scripts\python.exe -m pip install "paddleocr>=3.0,<4"
     }
 } else {
     Write-Host "Không thấy $PaddleRepo — cài paddleocr từ PyPI." -ForegroundColor Yellow
-    Invoke-Expression "$pip install `"paddleocr>=3.0,<4`""
+    & .\.venv\Scripts\python.exe -m pip install "paddleocr>=3.0,<4"
 }
 
 Write-Host ""

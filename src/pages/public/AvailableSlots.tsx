@@ -6,7 +6,9 @@ import VietQRModal from '../../components/VietQRModal';
 import ParkingFloorMap, { MapSlot } from '../../components/ParkingFloorMap';
 import { createVNPayPayment } from '../../services/vnpayService';
 import { createPayment } from '../../services/paymentService';
-import { PER_VISIT_OVERSTAY_HOURS, PER_VISIT_OVERSTAY_RATE } from '../../utils/reservationPricing';
+import { PARKING_LOTS, lotKeyOrDefault } from '../../utils/parkingLots';
+import { nowLocalStr } from '../../utils/helpers';
+import { addOneMonth, findActiveMonthlyReservation } from '../../utils/reservationPricing';
 
 interface Props {
   setView: (view: string) => void;
@@ -16,13 +18,32 @@ interface Props {
   savedVehicles: SavedVehicle[];
   onAddReservation: (res: any) => Reservation | null;
   onCancelReservation?: (id: string) => void;
+  /** Hủy ngay đặt chỗ vừa tạo từ modal thành công — xóa hẳn, không lưu bản ghi Cancelled. */
+  onDiscardReservation?: (id: string) => void;
   reservations: Reservation[];
   pricingRules: PricingRule[];
 }
 
 type PackageKey = 'hour' | 'overnight' | 'month';
 
-const todayISO = () => new Date().toISOString().split('T')[0];
+// LƯU Ý: không dùng toISOString() ở đây — nó quy đổi về UTC, nên từ 00:00 đến
+// trước 07:00 giờ Việt Nam (UTC+7) sẽ trả về NGÀY HÔM QUA. Phải lấy đúng
+// ngày/tháng/năm theo giờ địa phương của trình duyệt (giờ Việt Nam).
+const todayISO = () => {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+const WEEKDAY_VI = ['Chủ nhật', 'Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy'];
+
+/** '2026-07-25' → 'Thứ Bảy, 25/07/2026' — chỉ dùng để hiển thị "hôm nay". */
+function formatTodayLabel(iso: string): string {
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${WEEKDAY_VI[d.getDay()]}, ${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
 
 // Selectable arrival times for overnight/multi-day bookings — every 30 minutes.
 const ARRIVAL_TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => {
@@ -56,11 +77,8 @@ const PRICING_ROW_META: Record<VehicleKey, { sub: string; unit: string }> = {
   'electric vehicle': { sub: 'EV + trạm sạc kèm theo', unit: '/giờ' },
 };
 
-const LOT_OPTIONS = [
-  'ParkFlow Quận 9 - Lò Lu',
-  'ParkFlow Thủ Đức - Linh Xuân',
-  'ParkFlow Long Phước',
-];
+// Danh sách bãi lấy từ nguồn chung — nhãn giữ nguyên như dữ liệu đặt chỗ cũ.
+const LOT_OPTIONS = PARKING_LOTS.map((l) => l.bookingLabel);
 
 // Legend items
 
@@ -78,8 +96,12 @@ export default function AvailableSlots({
   savedVehicles,
   onAddReservation,
   onCancelReservation,
+  onDiscardReservation,
+  reservations,
   pricingRules,
 }: Props) {
+  // Hủy từ modal thành công: ưu tiên xóa hẳn; thiếu prop thì rơi về hủy thường.
+  const discardBooking = (id: string) => (onDiscardReservation ?? onCancelReservation)?.(id);
   const [selectedLot, setSelectedLot] = useState(LOT_OPTIONS[0]);
   const [fullName, setFullName] = useState(currentUser?.fullName ?? 'Nguyễn Văn A');
   const [phone, setPhone] = useState(currentUser?.phone ?? '090 123 4567');
@@ -100,6 +122,18 @@ export default function AvailableSlots({
     setArrivalDate(todayISO());
     setArrivalTime(packageKey === 'overnight' ? '18:00' : nextHalfHourLabel());
   }, [packageKey]);
+
+  // Chỉ nhận đặt chỗ trong ngày — "Ngày đến" không còn là ô chọn, luôn khóa
+  // theo ngày thực tế. Đồng bộ định kỳ để nếu trang mở qua nửa đêm thì ngày
+  // hiển thị vẫn tự chuyển sang hôm mới, không bị đứng ở ngày hôm qua.
+  useEffect(() => {
+    const syncToday = () => {
+      const today = todayISO();
+      setArrivalDate((prev) => (prev === today ? prev : today));
+    };
+    const id = setInterval(syncToday, 30_000);
+    return () => clearInterval(id);
+  }, []);
   const [loadingVNPay, setLoadingVNPay] = useState(false);
   const [isSubmittingBooking, setIsSubmittingBooking] = useState(false);
 
@@ -137,20 +171,38 @@ export default function AvailableSlots({
     setLicensePlate(v.licensePlate);
   };
 
+  // Mỗi bãi có kho ô đỗ riêng — sơ đồ và việc gán ô chỉ nhìn ô của bãi đã chọn.
+  const lotSlots = useMemo(
+    () => slots.filter((s) => lotKeyOrDefault(s.parkingLot) === lotKeyOrDefault(selectedLot)),
+    [slots, selectedLot],
+  );
+
+  // Đổi bãi thì ô đã chọn (thuộc bãi cũ) không còn hợp lệ.
+  useEffect(() => {
+    setSelectedSlotId(null);
+  }, [selectedLot]);
+
   const matchedSlot = useMemo(() => {
     // Only look up a real slot — skip virtual map spaces (no backing data)
     if (selectedSlotId && !selectedSlotId.startsWith('virtual-')) {
-      const found = slots.find((s) => s.id === selectedSlotId);
+      const found = lotSlots.find((s) => s.id === selectedSlotId);
       if (found) return found;
     }
     // Auto-assign: prefer matching vehicle type, then fallback
     const order: VehicleKey[] = [vehicleType, 'car', 'motorbike', 'electric vehicle'];
     for (const type of order) {
-      const slot = slots.find((s) => s.status === 'Available' && s.vehicleType === type);
+      const slot = lotSlots.find((s) => s.status === 'Available' && s.vehicleType === type);
       if (slot) return slot;
     }
-    return slots.find((s) => s.status === 'Available') ?? null;
-  }, [slots, vehicleType, selectedSlotId]);
+    return lotSlots.find((s) => s.status === 'Available') ?? null;
+  }, [lotSlots, vehicleType, selectedSlotId]);
+
+  // Bãi đã hết ô trống phù hợp loại xe đang chọn — chặn đặt chỗ và báo rõ cho
+  // khách thay vì để họ loay hoay tìm ô trên sơ đồ mà không có ô nào để chọn.
+  const isLotFull = useMemo(
+    () => !lotSlots.some((s) => s.status === 'Available' && s.vehicleType === vehicleType),
+    [lotSlots, vehicleType],
+  );
 
   const reservationMeta = useMemo(() => {
     if (packageKey === 'overnight')
@@ -192,11 +244,18 @@ export default function AvailableSlots({
     // rapid double-click (or double Enter-key) can't fire onAddReservation twice.
     if (isSubmittingBooking) return;
     if (!isLoggedIn) { setView('login'); return; }
+    // Kiểm tra lại lúc bấm (không chỉ dựa vào nút đã bị vô hiệu hoá) — sơ đồ
+    // cập nhật theo thời gian thực nên ô vừa chọn có thể vừa bị người khác
+    // đặt mất ngay trước khi bấm; luôn báo rõ ràng thay vì lỗi chung chung.
+    if (isLotFull || !matchedSlot || matchedSlot.status !== 'Available') {
+      alert('Rất tiếc, bãi đỗ hiện đã hết chỗ trống phù hợp với loại xe bạn chọn. Vui lòng thử lại sau.');
+      setSelectedSlotId(null);
+      return;
+    }
     if (!isSlotExplicitlySelected) {
       alert('Vui lòng chọn ô đỗ trên sơ đồ bãi trước khi đặt chỗ.');
       return;
     }
-    if (!matchedSlot) { alert('Hiện không còn chỗ phù hợp.'); return; }
     const plateErr = validateLicensePlate(licensePlate);
     if (plateErr) { alert(plateErr); return; }
     if (packageKey !== 'month') {
@@ -208,6 +267,22 @@ export default function AvailableSlots({
         return;
       }
     }
+    // Gửi theo tháng bắt buộc thanh toán trước — đặt chỗ chỉ được TẠO sau khi
+    // VNPay xác nhận thành công, không tạo đơn Pending rồi mới hỏi thanh toán
+    // như 2 gói còn lại (khách có thể lách bằng "Thanh toán sau").
+    if (packageKey === 'month') {
+      // Mỗi xe chỉ được 1 thẻ tháng còn hiệu lực tại một thời điểm — chặn TRƯỚC
+      // khi cho thanh toán, tránh mất tiền oan rồi mới bị từ chối tạo đặt chỗ.
+      const existingMonthly = findActiveMonthlyReservation(licensePlate, reservations ?? []);
+      if (existingMonthly) {
+        alert(
+          `Xe ${licensePlate.trim().toUpperCase()} đang có một thẻ tháng còn hiệu lực (${existingMonthly.reservationCode}, hết hạn ${addOneMonth(existingMonthly.date.split('T')[0])}). Vui lòng đợi thẻ hết hạn rồi mới đặt lại.`,
+        );
+        return;
+      }
+      void handlePayThenBookMonthly();
+      return;
+    }
     setIsSubmittingBooking(true);
     try {
       const created = onAddReservation({
@@ -215,7 +290,7 @@ export default function AvailableSlots({
         slotAssignmentMode: 'Auto',
         vehicleType,
         licensePlate: licensePlate.trim().toUpperCase(),
-        date: packageKey !== 'month' ? arrivalDate : new Date().toISOString().split('T')[0],
+        date: arrivalDate,
         startTime: reservationMeta.startTime,
         endTime: reservationMeta.endTime,
         floor: matchedSlot.floorName,
@@ -228,6 +303,63 @@ export default function AvailableSlots({
       if (created) setBookedReservation(created);
     } finally {
       setIsSubmittingBooking(false);
+    }
+  };
+
+  /** Gói tháng: tạo hóa đơn Unpaid + lưu tạm thông tin đặt chỗ vào localStorage
+   *  (khớp mẫu `pf_vnpay_ctx` đã dùng cho các luồng VNPay khác), rồi chuyển
+   *  thẳng sang VNPay. Đặt chỗ THẬT chỉ được tạo ở VNPayReturn sau khi thanh
+   *  toán thành công (xem `pf_pending_monthly_booking` trong App.tsx) — nếu
+   *  khách không thanh toán/hủy giữa chừng, không có đặt chỗ nào được tạo. */
+  const handlePayThenBookMonthly = async () => {
+    if (!currentUser || !matchedSlot) return;
+    setIsSubmittingBooking(true);
+    setLoadingVNPay(true);
+    const reservationCode = `RSV-${Math.floor(1000 + Math.random() * 9000)}`;
+    const paymentId = `PAY-${reservationCode}-${Date.now()}`;
+    const plateVal = licensePlate.trim().toUpperCase();
+    try {
+      const pendingBooking = {
+        reservationCode,
+        reservationType: reservationMeta.reservationType,
+        // Không khóa cứng slotCode: ô đã xem lúc đặt có thể bị chiếm mất trong
+        // lúc khách thao tác trên trang VNPay — để backend tự xếp ô Available
+        // còn trống cùng khu/tầng/loại xe tại đúng thời điểm thanh toán xong.
+        slotAssignmentMode: 'Auto' as const,
+        vehicleType,
+        licensePlate: plateVal,
+        date: todayISO(),
+        startTime: reservationMeta.startTime,
+        endTime: reservationMeta.endTime,
+        floor: matchedSlot.floorName,
+        area: matchedSlot.areaName,
+        note: reservationMeta.label,
+        estimatedCost,
+        parkingLot: selectedLot,
+      };
+      localStorage.setItem('pf_pending_monthly_booking', JSON.stringify({ paymentId, booking: pendingBooking }));
+      await createPayment({
+        id: paymentId,
+        userId: currentUser.id,
+        ticketCode: reservationCode,
+        reservationCode,
+        licensePlate: plateVal,
+        parkingFee: estimatedCost,
+        extraServiceFee: 0,
+        lostTicketFee: 0,
+        discount: 0,
+        totalAmount: estimatedCost,
+        method: '',
+        status: 'Unpaid',
+        createdAt: nowLocalStr(),
+      });
+      const url = await createVNPayPayment(paymentId, estimatedCost, `Dat xe thang ${reservationCode}`);
+      window.location.href = url;
+    } catch (err) {
+      localStorage.removeItem('pf_pending_monthly_booking');
+      alert(err instanceof Error ? err.message : 'Không thể kết nối VNPay. Vui lòng thử lại.');
+      setIsSubmittingBooking(false);
+      setLoadingVNPay(false);
     }
   };
 
@@ -254,7 +386,7 @@ export default function AvailableSlots({
         totalAmount: estimatedCost,
         method: '',
         status: 'Unpaid',
-        createdAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
+        createdAt: nowLocalStr(),
       });
       const url = await createVNPayPayment(
         paymentId,
@@ -416,7 +548,7 @@ export default function AvailableSlots({
                   </div>
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-2 overflow-hidden">
                     <ParkingFloorMap
-                      slots={slots.map((s) => ({ id: s.id, code: s.slotCode.split('-').pop() ?? s.slotCode, status: s.status } as MapSlot))}
+                      slots={lotSlots.map((s) => ({ id: s.id, code: s.slotCode.split('-').pop() ?? s.slotCode, status: s.status } as MapSlot))}
                       selectedId={selectedSlotId}
                       onSelect={(id) => setSelectedSlotId((prev) => (prev === id ? null : id))}
                       interactive={true}
@@ -463,13 +595,10 @@ export default function AvailableSlots({
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 p-4 space-y-4">
                     <div className="grid gap-5 md:grid-cols-2">
                       <Field label="Ngày đến">
-                        <input
-                          type="date"
-                          value={arrivalDate}
-                          min={todayISO()}
-                          onChange={(e) => setArrivalDate(e.target.value)}
-                          className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-[15px] outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-600/10"
-                        />
+                        <div className="flex h-12 w-full items-center gap-2 rounded-xl border border-slate-300 bg-slate-100 px-4 text-[15px] text-slate-700">
+                          <CalendarDays className="h-4 w-4 shrink-0 text-slate-400" />
+                          <span className="truncate font-semibold">{formatTodayLabel(arrivalDate)}</span>
+                        </div>
                       </Field>
                       <Field label="Giờ đến dự kiến">
                         <div className="relative">
@@ -491,30 +620,46 @@ export default function AvailableSlots({
                     <p className="flex items-start gap-2 text-[12px] leading-5 text-slate-600">
                       <Info className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
                       <span>
-                        {packageKey === 'overnight'
-                          ? 'Dành cho khách gửi xe qua đêm / nhiều ngày. '
-                          : 'Chọn thời điểm bạn sẽ đưa xe đến bãi. '}
+                        Hệ thống chỉ nhận đặt chỗ <strong>trong ngày</strong> — chọn giờ bạn sẽ đưa xe đến bãi hôm nay.{' '}
                         Nếu bạn không check-in trong vòng <strong>{CHECKIN_GRACE_HOURS} giờ</strong> sau giờ
-                        đến dự kiến, đặt chỗ sẽ <strong>tự động bị hủy</strong> để nhường chỗ cho khách khác.
+                        đến dự kiến, đặt chỗ sẽ <strong>tự động bị hủy</strong> để nhường chỗ cho khách khác —
+                        nếu bạn đã thanh toán trước, <strong>số tiền đó sẽ không được hoàn lại</strong>.
                       </span>
                     </p>
                     <p className="flex items-start gap-2 text-[12px] leading-5 text-amber-700">
                       <Triangle className="h-3.5 w-3.5 mt-0.5 shrink-0 text-amber-500 fill-amber-500" />
                       <span>
-                        {packageKey === 'hour' ? (
-                          <>Xe gửi theo lượt để quá <strong>{PER_VISIT_OVERSTAY_HOURS} giờ</strong> kể từ giờ đến</>
-                        ) : (
-                          <>Gửi qua đêm để xe quá <strong>24 giờ của ngày hôm sau</strong></>
-                        )}{' '}
-                        sẽ bị thu thêm <strong>phụ phí {Math.round(PER_VISIT_OVERSTAY_RATE * 100)}% giá vé</strong>{' '}
-                        (mỗi xe). Vé đã thanh toán chỉ thu phần phụ phí; vé chưa thanh toán thu giá vé + phụ phí.
+                        Xe đỗ qua <strong>0h00</strong> sẽ được tự động cộng thêm <strong>giá qua đêm</strong> cho mỗi
+                        đêm ở lại (mỗi xe).{' '}
+                        {packageKey === 'overnight'
+                          ? 'Giá đã chốt lúc đặt tính cho đêm đầu tiên — chỉ cộng thêm từ đêm thứ 2 trở đi.'
+                          : 'Vé đã thanh toán chỉ thu phần phát sinh qua đêm; vé chưa thanh toán thu đủ giá vé + phần qua đêm.'}
+                      </span>
+                    </p>
+                  </div>
+                )}
+
+                {packageKey === 'month' && (
+                  <div className="rounded-xl border border-blue-100 bg-blue-50/50 p-4">
+                    <p className="flex items-start gap-2 text-[12px] leading-5 text-slate-600">
+                      <Info className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+                      <span>
+                        Gửi xe <strong>theo tháng</strong> yêu cầu <strong>thanh toán trước qua VNPay</strong> ngay khi đặt —
+                        đặt chỗ chỉ được tạo sau khi thanh toán thành công, không có lựa chọn "thanh toán sau".
                       </span>
                     </p>
                   </div>
                 )}
 
                 {/* Selected slot indicator */}
-                {isSlotExplicitlySelected && matchedSlot ? (
+                {isLotFull ? (
+                  <div className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-[13px] text-rose-700">
+                    <Triangle className="h-4 w-4 shrink-0" />
+                    <span>
+                      <strong>Bãi đã hết chỗ</strong> cho loại xe bạn chọn — vui lòng đặt lại sau hoặc thử loại xe/bãi khác.
+                    </span>
+                  </div>
+                ) : isSlotExplicitlySelected && matchedSlot ? (
                   <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-[13px] text-emerald-700">
                     <CheckCircle className="h-4 w-4 shrink-0" />
                     <span>
@@ -532,10 +677,18 @@ export default function AvailableSlots({
                 <button
                   type={isLoggedIn ? 'submit' : 'button'}
                   onClick={() => { if (!isLoggedIn) setView('login'); }}
-                  disabled={isLoggedIn && (!isSlotExplicitlySelected || isSubmittingBooking)}
+                  disabled={isLoggedIn && (isLotFull || !isSlotExplicitlySelected || isSubmittingBooking)}
                   className="flex h-14 w-full items-center justify-center gap-3 rounded-xl bg-blue-600 text-[15px] font-bold text-white shadow-[0_8px_20px_rgba(37,99,235,0.25)] transition hover:bg-blue-700 mt-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
                 >
-                  {isLoggedIn ? (isSubmittingBooking ? 'Đang xử lý...' : 'Xác nhận đặt chỗ') : 'Đăng nhập để đặt chỗ'}
+                  {!isLoggedIn
+                    ? 'Đăng nhập để đặt chỗ'
+                    : isLotFull
+                    ? 'Bãi đã hết chỗ'
+                    : isSubmittingBooking
+                    ? (packageKey === 'month' ? 'Đang chuyển tới VNPay...' : 'Đang xử lý...')
+                    : packageKey === 'month'
+                    ? 'Thanh toán & Đặt chỗ tháng'
+                    : 'Xác nhận đặt chỗ'}
                   <ArrowRight className="h-5 w-5" />
                 </button>
               </form>
@@ -587,7 +740,7 @@ export default function AvailableSlots({
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent" />
                 <div className="absolute bottom-0 left-0 right-0 p-5 text-white">
-                  <h3 className="text-xl font-bold leading-tight">An tâm tuyệt đối với ParkFlow AI</h3>
+                  <h3 className="text-xl font-bold leading-tight">An tâm tuyệt đối với ParkFlow</h3>
                   <p className="mt-1 text-[13px] text-white/85">Hệ thống nhận diện biển số tự động chính xác 99.9%</p>
                 </div>
               </div>
@@ -602,10 +755,16 @@ export default function AvailableSlots({
       {bookedReservation && !showPayNow && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm">
           <div className="relative w-full max-w-sm rounded-3xl bg-white p-6 shadow-2xl space-y-4">
+            {/* Đóng modal bằng X = HỦY đặt chỗ vừa tạo — không tự giữ chỗ khi
+                user không xác nhận hướng thanh toán. */}
             <button
               type="button"
-              onClick={() => { setBookedReservation(null); setView('reservations'); }}
-              className="absolute right-4 top-4 text-slate-400 hover:text-slate-600 transition"
+              onClick={() => {
+                discardBooking(bookedReservation.id);
+                setBookedReservation(null);
+              }}
+              title="Hủy đặt chỗ này"
+              className="absolute right-4 top-4 text-slate-400 hover:text-rose-600 transition"
             >
               <X className="h-5 w-5" />
             </button>
@@ -638,8 +797,18 @@ export default function AvailableSlots({
             <div className="flex gap-2">
               <button
                 type="button"
+                onClick={() => {
+                  discardBooking(bookedReservation.id);
+                  setBookedReservation(null);
+                }}
+                className="flex-1 rounded-xl border border-rose-200 py-3 text-xs font-bold text-rose-600 hover:bg-rose-50 transition"
+              >
+                Hủy đặt chỗ
+              </button>
+              <button
+                type="button"
                 onClick={() => { setBookedReservation(null); setView('reservations'); }}
-                className="w-1/2 rounded-xl border border-slate-200 py-3 text-xs font-bold text-slate-600 hover:bg-slate-50 transition"
+                className="flex-1 rounded-xl border border-slate-200 py-3 text-xs font-bold text-slate-600 hover:bg-slate-50 transition"
               >
                 Thanh toán sau
               </button>
@@ -647,7 +816,7 @@ export default function AvailableSlots({
                 type="button"
                 onClick={handlePayVNPay}
                 disabled={loadingVNPay}
-                className="w-1/2 rounded-xl bg-blue-600 py-3 text-xs font-bold text-white hover:bg-blue-700 transition disabled:opacity-60 flex items-center justify-center gap-1.5"
+                className="flex-1 rounded-xl bg-blue-600 py-3 text-xs font-bold text-white hover:bg-blue-700 transition disabled:opacity-60 flex items-center justify-center gap-1.5"
               >
                 {loadingVNPay ? (
                   <>

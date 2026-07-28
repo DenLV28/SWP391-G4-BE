@@ -115,7 +115,7 @@ export function DriverSidebar({
   const menuItems = [
     { key: 'myparking', label: 'Trang của tôi', icon: LayoutDashboard },
     { key: 'session', label: 'Lượt gửi hiện tại', icon: Ticket, badge: currentSession?.sessionStatus === 'Active' },
-    { key: 'reservations', label: 'Đặt chỗ của tôi', icon: CalendarClock },
+    { key: 'reservations', label: 'Lịch sử đặt chỗ', icon: CalendarClock },
     { key: 'payments', label: 'Thanh toán', icon: CreditCard },
     { key: 'feedback', label: 'Phản hồi / Hỗ trợ', icon: MessageSquareWarning },
     { key: 'profile', label: 'Hồ sơ', icon: UserCircle2 },

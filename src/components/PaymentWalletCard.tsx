@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Wallet, Clock, Receipt, ChevronDown } from 'lucide-react';
 import type { Payment } from '../data/mockData';
-import { formatCurrency } from '../utils/helpers';
+import { formatCurrency, localDateISO } from '../utils/helpers';
 
 interface Props {
   payments: Payment[];
@@ -25,7 +25,7 @@ export default function PaymentWalletCard({ payments, recentLimit = 6 }: Props) 
   const paid = payments.filter((p) => p.status === 'Paid');
   const totalRevenue = paid.reduce((sum, p) => sum + p.totalAmount, 0);
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = localDateISO();
   const todayPayments = paid.filter((p) => paymentTime(p).startsWith(todayStr));
   const todayRevenue = todayPayments.reduce((sum, p) => sum + p.totalAmount, 0);
 

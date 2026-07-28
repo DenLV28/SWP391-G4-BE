@@ -78,6 +78,33 @@ import type { VehicleKey, Floor } from '../types/parking';
 import { vehicleTypes } from '../data/mockData';
 
 /**
+ * "YYYY-MM-DD" for a Date using its LOCAL date fields — never use
+ * `date.toISOString()` for this: it converts to UTC first, so anywhere
+ * between 00:00 and 06:59 Vietnam time (UTC+7) it silently returns
+ * YESTERDAY's date instead of today's.
+ */
+export const localDateISO = (date: Date = new Date()): string => {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`;
+};
+
+/**
+ * "YYYY-MM-DD HH:MM" (or "...:SS" with `withSeconds`) for a Date using its
+ * LOCAL fields — never use `date.toISOString().replace('T',' ')` for this:
+ * toISOString() converts to UTC first, so the result is silently 7 hours
+ * behind real Vietnam time (UTC+7) while still *looking* like a plausible
+ * local timestamp. This bit `checkOutTime`/`paidAt`/`createdAt` for years —
+ * always build local timestamps from this helper instead.
+ */
+export const nowLocalStr = (withSeconds = false, date: Date = new Date()): string => {
+  const p = (n: number) => String(n).padStart(2, '0');
+  const time = withSeconds
+    ? `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`
+    : `${p(date.getHours())}:${p(date.getMinutes())}`;
+  return `${localDateISO(date)} ${time}`;
+};
+
+/**
  * Format currency in VND
  */
 export const formatCurrency = (amount: number): string =>
@@ -154,7 +181,7 @@ export const formatDuration = (hours: number, minutes: number): string => {
  */
 export const generateTicketCode = (): string => {
   const now = new Date();
-  const date = now.toISOString().split('T')[0].replace(/-/g, '');
+  const date = localDateISO(now).replace(/-/g, '');
   const time = now.toTimeString().split(' ')[0].replace(/:/g, '').slice(0, 4);
   return `PK-${date}-${time}`;
 };
@@ -196,7 +223,7 @@ export const formatDateTime = (dateTimeString: string): string => {
  * Get today's date in YYYY-MM-DD format
  */
 export const getTodayDate = (): string => {
-  return new Date().toISOString().split('T')[0];
+  return localDateISO();
 };
 
 /**

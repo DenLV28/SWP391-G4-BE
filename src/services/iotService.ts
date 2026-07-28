@@ -110,12 +110,19 @@ export function connectIot(handlers: IotHandlers) {
   };
 
   const startPolling = () => {
-    handlers.onStatus('online');
+    handlers.onStatus('connecting');
     const poll = async () => {
       try {
         const res = await fetch(`${HTTP_URL}?since=${lastPollTs}`);
         if (res.ok) {
-          const list = (await res.json()) as Record<string, unknown>[];
+          const data = (await res.json()) as
+            | Record<string, unknown>[]
+            | { esp32Online?: boolean; events?: Record<string, unknown>[] };
+          // Backend mới trả { esp32Online, events }; giữ tương thích dạng mảng cũ.
+          const list = Array.isArray(data) ? data : (data.events ?? []);
+          const deviceOnline = Array.isArray(data) ? true : Boolean(data.esp32Online);
+          // "Trực tuyến" chỉ khi ESP32 thật sự gọi về backend trong ~10s qua.
+          handlers.onStatus(deviceOnline ? 'online' : 'offline');
           // Expect newest first; emit oldest first so the UI order is natural.
           for (const item of [...list].reverse()) {
             const ev = normalizeScan(item);
@@ -173,8 +180,10 @@ export function connectIot(handlers: IotHandlers) {
         return true;
       }
       if (HTTP_URL) {
-        // Fire and forget; the device confirms via a later scan/status frame.
-        fetch(`${HTTP_URL}/command`, {
+        // Đẩy vào hàng đợi gate-command thật của backend (ESP32 poll mỗi ~1s).
+        // HTTP_URL trỏ tới /api/iot/scan-events — thay path để ra đúng endpoint.
+        const commandUrl = HTTP_URL.replace(/\/api\/iot\/.*$/, '/api/iot/gate-command');
+        fetch(commandUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: payload,

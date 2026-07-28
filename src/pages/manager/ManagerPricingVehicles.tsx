@@ -1,10 +1,6 @@
 import { useEffect, useState } from 'react';
-import {
-  Edit2, Trash2, Plus, X, Car,
-  TrendingUp, Clock,
-} from 'lucide-react';
+import { Edit2, Trash2, Plus, X } from 'lucide-react';
 import { buildApiUrl } from '../../services/apiConfig';
-import type { Payment } from '../../data/mockData';
 
 interface VehiclePrice {
   id: string;
@@ -74,20 +70,14 @@ const PAGE_SIZE = 4;
 
 export default function ManagerPricingVehicles({
   setView: _setView,
-  payments = [],
 }: {
   setView: (view: string) => void;
-  payments?: Payment[];
 }) {
   const [vehicles, setVehicles] = useState<VehiclePrice[]>([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
   const [formData, setFormData] = useState<VehiclePrice | null>(null);
   const [page, setPage] = useState(1);
-
-  const currentIncome = payments
-    .filter((p) => p.status === 'Paid')
-    .reduce((sum, p) => sum + p.totalAmount, 0);
 
   const totalPages = Math.ceil(vehicles.length / PAGE_SIZE);
   const paged = vehicles.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
@@ -184,41 +174,6 @@ export default function ManagerPricingVehicles({
           <Plus className="h-4 w-4" />
           Thêm loại xe mới
         </button>
-      </div>
-
-      {/* Summary cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-        <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm flex items-center gap-4">
-          <div className="h-12 w-12 rounded-xl bg-blue-50 flex items-center justify-center shrink-0">
-            <Car className="h-6 w-6 text-blue-600" />
-          </div>
-          <div>
-            <p className="text-xs text-slate-500">Tổng số loại xe</p>
-            <p className="text-2xl font-bold text-slate-900 mt-0.5">
-              {String(vehicles.length).padStart(2, '0')} Nhóm
-            </p>
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm flex items-center gap-4">
-          <div className="h-12 w-12 rounded-xl bg-green-50 flex items-center justify-center shrink-0">
-            <Clock className="h-6 w-6 text-green-600" />
-          </div>
-          <div>
-            <p className="text-xs text-slate-500">Cập nhật lần cuối</p>
-            <p className="text-2xl font-bold text-slate-900 mt-0.5">14:20, Hôm nay</p>
-          </div>
-        </div>
-
-        <div className="rounded-2xl bg-blue-600 p-5 shadow-lg flex items-center gap-4">
-          <div className="h-12 w-12 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
-            <TrendingUp className="h-6 w-6 text-white" />
-          </div>
-          <div>
-            <p className="text-xs text-blue-100">Thu nhập hiện tại</p>
-            <p className="text-2xl font-bold text-white mt-0.5">{fmtVND(currentIncome)}</p>
-          </div>
-        </div>
       </div>
 
       {/* Table card */}

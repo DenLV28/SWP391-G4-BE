@@ -33,24 +33,42 @@ export async function fetchSessionsByUser(userId: string): Promise<ParkingSessio
 }
 
 export async function fetchActiveSession(userId: string): Promise<ParkingSession | null> {
+  const list = await fetchActiveSessionsByUser(userId);
+  return list[0] ?? null;
+}
+
+/** Mọi phiên đang hoạt động của MỘT khách — một tài khoản có thể có nhiều xe đang đỗ cùng lúc. */
+export async function fetchActiveSessionsByUser(userId: string): Promise<ParkingSession[]> {
   const res = await fetch(buildUrl(`/api/sessions?userId=${encodeURIComponent(userId)}&active=true`), {
     headers: headers(),
   });
   if (!res.ok) throw new Error(`Sessions API ${res.status}`);
   const data = await res.json();
   const list = (Array.isArray(data) ? data : []).map(toSession);
-  return list.find((s) => s.sessionStatus === 'Active') ?? null;
+  return list.filter((s) => s.sessionStatus === 'Active');
 }
 
-export async function createSession(session: ParkingSession): Promise<ParkingSession> {
+/** Mọi phiên đang hoạt động trong bãi (mọi khách) — trạm OCR xe ra dùng để tra vé theo biển số. */
+export async function fetchActiveSessions(): Promise<ParkingSession[]> {
+  const res = await fetch(buildUrl('/api/sessions?active=true'), { headers: headers() });
+  if (!res.ok) throw new Error(`Sessions API ${res.status}`);
+  const data = await res.json();
+  return (Array.isArray(data) ? data : []).map(toSession);
+}
+
+export async function createSession(
+  session: ParkingSession,
+  /** Chỉ dùng để backend tự chọn ô trống trong ĐÚNG bãi khi xe vào không có đặt chỗ (slotCode rỗng) — không phải cột lưu trên phiên gửi xe. */
+  parkingLot?: string,
+): Promise<{ session: ParkingSession; autoAssignedSlot: boolean }> {
   const res = await fetch(buildUrl('/api/sessions'), {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify(session),
+    body: JSON.stringify(parkingLot ? { ...session, parkingLot } : session),
   });
   if (!res.ok) throw new Error(`Sessions API ${res.status}`);
   const data = await res.json();
-  return toSession(data.session ?? data);
+  return { session: toSession(data.session ?? data), autoAssignedSlot: !!data.autoAssignedSlot };
 }
 
 export async function updateSession(

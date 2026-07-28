@@ -18,15 +18,20 @@ type ExtRow = {
   plateNum: string;
   plateFull: string;
   vehicleType: string;
-  direction: 'entry' | 'exit';
+  // 'awaiting': đơn đặt chỗ mới — xe chưa tới bãi, staff chưa check-in (không
+  // phải sự kiện qua cổng thật nên tách khỏi entry/exit).
+  direction: 'entry' | 'exit' | 'awaiting';
   lane: string;
   action: string;
-  status: 'ok' | 'err' | 'override';
+  status: 'ok' | 'err' | 'override' | 'pending';
   statusLabel: string;
   customerType: string;
 };
 
-const todayISO = new Date().toISOString().slice(0, 10);
+// Không dùng toISOString() — quy về UTC nên từ 00:00 đến trước 07:00 giờ VN
+// (UTC+7) sẽ trả về ngày hôm qua. Lấy theo ngày/tháng/năm địa phương.
+const todayDate = new Date();
+const todayISO = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, '0')}-${String(todayDate.getDate()).padStart(2, '0')}`;
 
 /** Maps real gate-scan events into table rows — no fake/sample rows mixed in. */
 function buildRows(realLogs: AccessLog[]): ExtRow[] {
@@ -35,6 +40,7 @@ function buildRows(realLogs: AccessLog[]): ExtRow[] {
     const pfx = parts[0] ?? log.vehicleId;
     const num = parts.slice(1).join(' ') || '—';
     const ok = log.status === 'GRANTED' || log.status === 'OVERRIDE';
+    const pending = !ok && log.status === 'PENDING';
     return {
       id: log.id,
       timeHMS: log.time,
@@ -43,12 +49,13 @@ function buildRows(realLogs: AccessLog[]): ExtRow[] {
       platePfx: pfx,
       plateNum: num,
       plateFull: log.vehicleId,
-      vehicleType: log.recognition === 'subscriber' ? 'Ô tô 4-7 chỗ (Xăng)' : 'Xe máy / Xe máy điện',
-      direction: log.direction,
-      lane: `Cổng ${log.gateId} - Làn 1`,
+      // Loại xe thật ghi tại thời điểm quét — không đoán từ loại khách nữa
+      vehicleType: log.vehicleType || '—',
+      direction: log.notArrivedYet ? 'awaiting' : log.direction,
+      lane: `Cổng ${log.gateId}`,
       action: log.action || '',
-      status: ok ? 'ok' : 'err',
-      statusLabel: ok ? 'Thành công' : 'Lỗi / Thanh toán',
+      status: ok ? 'ok' : pending ? 'pending' : 'err',
+      statusLabel: ok ? 'Thành công' : pending ? 'Đang chờ' : 'Lỗi / Thanh toán',
       customerType: log.recognition === 'subscriber' ? 'Khách tháng' : 'Khách vãng lai',
     };
   });
@@ -60,7 +67,7 @@ const PAGE_SIZE = 25;
 
 // Kept in sync with the vehicle types offered during booking (see AvailableSlots.tsx vehicleLabelMap).
 const VEHICLE_FILTER_OPTS = ['Tất cả', 'Ô tô 4-7 chỗ (Xăng)', 'Xe máy / Xe máy điện', 'Ô tô 4-7 chỗ (Điện / EV)'];
-const ACTION_FILTER_OPTS  = ['Tất cả', 'VÀO', 'RA'];
+const ACTION_FILTER_OPTS  = ['Tất cả', 'VÀO', 'RA', 'CHƯA VÀO'];
 
 export default function ActivityLog({ accessLogs, reservations = [], users = [] }: ActivityLogProps) {
   const allRows = buildRows(accessLogs);
@@ -86,6 +93,7 @@ export default function ActivityLog({ accessLogs, reservations = [], users = [] 
     if (vehicleFilter !== 'Tất cả' && r.vehicleType !== vehicleFilter) return false;
     if (actionFilter === 'VÀO' && r.direction !== 'entry') return false;
     if (actionFilter === 'RA'  && r.direction !== 'exit')  return false;
+    if (actionFilter === 'CHƯA VÀO' && r.direction !== 'awaiting') return false;
     return true;
   });
 
@@ -203,9 +211,13 @@ export default function ActivityLog({ accessLogs, reservations = [], users = [] 
                       <span className="inline-flex items-center rounded-md bg-blue-600 px-2.5 py-1 text-[11px] font-bold text-white">
                         VÀO
                       </span>
-                    ) : (
+                    ) : row.direction === 'exit' ? (
                       <span className="inline-flex items-center rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-500">
                         RA
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-600">
+                        CHƯA VÀO
                       </span>
                     )}
                   </td>
@@ -223,6 +235,11 @@ export default function ActivityLog({ accessLogs, reservations = [], users = [] 
                     ) : row.status === 'override' ? (
                       <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600">
                         <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                        {row.statusLabel}
+                      </span>
+                    ) : row.status === 'pending' ? (
+                      <span className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500">
+                        <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
                         {row.statusLabel}
                       </span>
                     ) : (
@@ -334,7 +351,7 @@ export default function ActivityLog({ accessLogs, reservations = [], users = [] 
                       { label: 'Biển số', value: detailRow.plateFull },
                       { label: 'Loại xe', value: detailRow.vehicleType },
                       { label: 'Thời gian', value: `${detailRow.timeHMS} · ${detailRow.dateStr}` },
-                      { label: 'Hành động', value: detailRow.direction === 'entry' ? 'VÀO' : 'RA' },
+                      { label: 'Hành động', value: detailRow.direction === 'entry' ? 'VÀO' : detailRow.direction === 'exit' ? 'RA' : 'CHƯA VÀO' },
                       { label: 'Làn / Cổng', value: detailRow.lane },
                       { label: 'Trạng thái', value: detailRow.statusLabel },
                     ].map((row) => (

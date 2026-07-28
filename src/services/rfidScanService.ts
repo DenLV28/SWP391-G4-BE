@@ -1,4 +1,4 @@
-import { buildApiUrl, defaultHeaders } from './apiConfig';
+import { buildApiUrl, buildDirectApiUrl, defaultHeaders } from './apiConfig';
 
 export type RfidScanStatus = 'Scanned' | 'Captured' | 'Linked';
 
@@ -65,6 +65,21 @@ export type RfidTapEvent = {
   ts: number;
 };
 
+/** Push an open/close command to the backend queue; ESP32 polls and consumes it.
+ * Dùng buildDirectApiUrl: lệnh mở rào phải tới nơi trong ~1s, không được xếp
+ * hàng sau các luồng SSE đang chiếm pool kết nối của origin dev server. */
+export async function sendGateCommand(gateId: string, command: 'open' | 'close'): Promise<void> {
+  try {
+    await fetch(buildDirectApiUrl('/api/iot/gate-command'), {
+      method: 'POST',
+      headers: defaultHeaders(),
+      body: JSON.stringify({ gateId, command }),
+    });
+  } catch {
+    // Best-effort — ESP32 may not be online
+  }
+}
+
 /**
  * Live stream of RFID taps relayed by the backend (POST /api/iot/rfid-tap →
  * SSE /api/iot/rfid-events). The Gate Control screen subscribes and runs the
@@ -121,9 +136,23 @@ export function subscribeToRfidTaps(onTap: (e: RfidTapEvent) => void): () => voi
   return () => { cancelled = true; clearTimeout(retryTimer); };
 }
 
-export async function fetchRfidScans(limit = 20): Promise<RfidScan[]> {
+/** Staff từ chối lượt quét → xóa hẳn bản ghi (kèm ảnh) khỏi DB. */
+export async function deleteRfidScan(id: string | number): Promise<boolean> {
   try {
-    const res = await fetch(buildApiUrl(`/api/rfid-scans?limit=${limit}`), { headers: defaultHeaders() });
+    const res = await fetch(buildApiUrl(`/api/rfid-scans/${encodeURIComponent(String(id))}`), {
+      method: 'DELETE',
+      headers: defaultHeaders(),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchRfidScans(limit = 20, rfidUid?: string): Promise<RfidScan[]> {
+  try {
+    const query = `limit=${limit}${rfidUid ? `&rfidUid=${encodeURIComponent(rfidUid)}` : ''}`;
+    const res = await fetch(buildApiUrl(`/api/rfid-scans?${query}`), { headers: defaultHeaders() });
     if (!res.ok) return [];
     const data = await res.json();
     return Array.isArray(data) ? data : [];

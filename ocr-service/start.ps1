@@ -1,4 +1,4 @@
-# Starts the PaddleOCR license-plate service on http://localhost:8868
+﻿# Starts the PaddleOCR license-plate service on http://localhost:8868
 #   powershell -ExecutionPolicy Bypass -File start.ps1
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot

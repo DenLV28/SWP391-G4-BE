@@ -124,6 +124,44 @@ CREATE TABLE payments (
 GO
 
 -- ============================================================
+-- 6. NHẬT KÝ HOẠT ĐỘNG STAFF (staff_activity_logs)
+--    Mỗi dòng = 1 sự kiện qua cổng hoặc thao tác của staff (quét tự động,
+--    xác nhận/từ chối, mở thủ công, RFID, đặt chỗ mới...). Khớp với màn
+--    "Nhật ký hoạt động" phía Staff — lọc/thống kê theo ngày qua log_date.
+-- ============================================================
+CREATE TABLE staff_activity_logs (
+    log_id          INT IDENTITY(1,1) PRIMARY KEY,
+    gate_id         NVARCHAR(20)  NOT NULL,                 -- Cổng A, A1, A2...
+    license_plate   NVARCHAR(20),                           -- biển số, RFID UID, hoặc NULL nếu chưa xác định
+    vehicle_type    NVARCHAR(50)
+                    CHECK (vehicle_type IN (
+                        N'Xe máy / Xe máy điện',
+                        N'Ô tô 4-7 chỗ (Xăng)',
+                        N'Ô tô 4-7 chỗ (Điện / EV)'
+                    )),
+    action          NVARCHAR(255) NOT NULL,                 -- vd "Nhận diện tự động", "Đặt chỗ mới (RSV-1234) — xe chưa tới bãi"
+    direction       NVARCHAR(10)  NOT NULL DEFAULT 'entry'
+                    CHECK (direction IN ('entry','exit','awaiting')), -- VÀO / RA / CHƯA VÀO
+    status          NVARCHAR(20)  NOT NULL
+                    CHECK (status IN ('GRANTED','DENIED','OVERRIDE','PENDING')),
+    recognition     NVARCHAR(20)  NOT NULL DEFAULT 'casual'
+                    CHECK (recognition IN ('subscriber','casual','unknown')),
+    fee             DECIMAL(10,2),
+    slot_id         INT,                                    -- ô đỗ liên quan (nếu có)
+    handled_by      INT,                                    -- staff xử lý; NULL = hệ thống tự ghi nhận
+    occurred_at     DATETIME2     NOT NULL DEFAULT GETDATE(),  -- thời điểm sự kiện xảy ra
+    log_date        AS CAST(occurred_at AS DATE) PERSISTED,    -- cột tính sẵn, dùng lọc/thống kê theo ngày
+    created_at      DATETIME2     NOT NULL DEFAULT GETDATE(),
+    FOREIGN KEY (slot_id)    REFERENCES parking_slots(slot_id),
+    FOREIGN KEY (handled_by) REFERENCES users(user_id)
+);
+GO
+
+-- Lọc nhanh theo ngày (khớp bộ lọc ngày ở màn "Nhật ký hoạt động")
+CREATE INDEX idx_staff_activity_logs_date ON staff_activity_logs(log_date);
+GO
+
+-- ============================================================
 -- DỮ LIỆU MẪU
 -- ============================================================
 
@@ -212,6 +250,22 @@ VALUES
  '2025-05-21 07:50:00','2025-05-21 17:00:00', 550,     0, 'monthly_pass','waived','2025-05-21 17:00:00',NULL, N'Nhân viên miễn phí');
 GO
 
+-- 6. STAFF ACTIVITY LOGS
+INSERT INTO staff_activity_logs
+  (gate_id, license_plate, vehicle_type, action, direction, status, recognition, fee, slot_id, handled_by, occurred_at)
+VALUES
+-- Xe tháng quét thẻ tự động vào bãi (hệ thống tự ghi nhận, không qua staff)
+('A1', '59F1-12345', N'Xe máy / Xe máy điện',     N'Nhận diện tự động',        'entry',    'GRANTED', 'subscriber', 0,    1,    NULL, '2025-05-21 08:30:00'),
+-- Staff xác nhận cho xe ra sau khi thu phí
+('A2', '59P2-67890', N'Xe máy / Xe máy điện',     N'Nhân viên xác nhận',       'exit',     'GRANTED', 'casual',     5000, 6,    3,    '2025-05-21 17:30:00'),
+-- Camera không đọc được biển số → nhân viên mở thủ công
+('A1', '51B-123.45', N'Ô tô 4-7 chỗ (Xăng)',      N'Mở thủ công (Nhân Viên)',  'entry',    'OVERRIDE','casual',     0,    8,    3,    '2025-05-20 09:00:00'),
+-- Lượt quét khả nghi bị nhân viên từ chối
+('A1', NULL,         NULL,                        N'Nhân viên từ chối',        'entry',    'DENIED',  'unknown',    NULL, NULL, 3,    '2025-05-21 10:05:00'),
+-- Đặt chỗ mới — xe chưa tới bãi, staff chưa check-in
+('A',  '51A-999.88', N'Ô tô 4-7 chỗ (Xăng)',      N'Đặt chỗ mới (RSV-7781) — xe chưa tới bãi', 'awaiting', 'PENDING', 'casual', NULL, NULL, NULL, '2025-05-21 07:55:00');
+GO
+
 -- ============================================================
 -- KIỂM TRA NHANH
 -- ============================================================
@@ -232,4 +286,9 @@ SELECT N'=== PAYMENTS ===' AS info;
 SELECT payment_id, license_plate, entry_time, exit_time,
        duration_min, amount, payment_method, payment_status
 FROM payments;
+
+SELECT N'=== STAFF ACTIVITY LOGS ===' AS info;
+SELECT log_id, gate_id, license_plate, vehicle_type, action, direction, status, log_date, occurred_at
+FROM staff_activity_logs
+ORDER BY occurred_at DESC;
 GO

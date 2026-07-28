@@ -184,7 +184,11 @@ async function createTables() {
         estimated_cost FLOAT NOT NULL DEFAULT 0,
         parking_lot NVARCHAR(100) NOT NULL DEFAULT '',
         created_at NVARCHAR(30) NOT NULL DEFAULT '',
-        db_created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+        db_created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        confirmed_at NVARCHAR(30) NOT NULL DEFAULT '',
+        checked_in_at NVARCHAR(30) NOT NULL DEFAULT '',
+        completed_at NVARCHAR(30) NOT NULL DEFAULT '',
+        cancelled_at NVARCHAR(30) NOT NULL DEFAULT ''
       );
       CREATE INDEX IX_reservations_user_id ON dbo.reservations(user_id);
     END
@@ -203,6 +207,24 @@ async function createTables() {
       IF COL_LENGTH('dbo.reservations', 'overstay_notified') IS NULL
       BEGIN
         ALTER TABLE dbo.reservations ADD overstay_notified BIT NOT NULL DEFAULT 0;
+      END
+      -- Dòng thời gian trạng thái — mốc giờ THẬT của từng lần chuyển trạng thái
+      -- (không suy ra từ db_created_at), hiển thị trong hóa đơn phía driver.
+      IF COL_LENGTH('dbo.reservations', 'confirmed_at') IS NULL
+      BEGIN
+        ALTER TABLE dbo.reservations ADD confirmed_at NVARCHAR(30) NOT NULL DEFAULT '';
+      END
+      IF COL_LENGTH('dbo.reservations', 'checked_in_at') IS NULL
+      BEGIN
+        ALTER TABLE dbo.reservations ADD checked_in_at NVARCHAR(30) NOT NULL DEFAULT '';
+      END
+      IF COL_LENGTH('dbo.reservations', 'completed_at') IS NULL
+      BEGIN
+        ALTER TABLE dbo.reservations ADD completed_at NVARCHAR(30) NOT NULL DEFAULT '';
+      END
+      IF COL_LENGTH('dbo.reservations', 'cancelled_at') IS NULL
+      BEGIN
+        ALTER TABLE dbo.reservations ADD cancelled_at NVARCHAR(30) NOT NULL DEFAULT '';
       END
     END
   `);
@@ -317,6 +339,13 @@ async function createTables() {
       END
     END
   `);
+  // parking_lot — mỗi bãi có kho ô đỗ riêng; hàng cũ mặc định thuộc bãi Quận 9
+  await pool.request().query(`
+    IF COL_LENGTH('dbo.parking_slots', 'parking_lot') IS NULL
+    BEGIN
+      ALTER TABLE dbo.parking_slots ADD parking_lot NVARCHAR(100) NOT NULL DEFAULT N'ParkFlow Quận 9';
+    END
+  `);
 
   // slot_issues
   await pool.request().query(`
@@ -331,8 +360,30 @@ async function createTables() {
         reported_by  NVARCHAR(100) NOT NULL DEFAULT '',
         reported_at  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
         status       NVARCHAR(20)  NOT NULL DEFAULT 'Pending'
-          CHECK (status IN ('Pending','Approved','Rejected'))
+          CHECK (status IN ('Pending','Approved','Rejected','Resolved'))
       );
+    END
+  `);
+  // Cột status của bản cài đặt cũ hơn có CHECK constraint thiếu 'Resolved' —
+  // Manager "Khôi phục ô đỗ" (Approved → Resolved) bị SQL Server chặn ở tầng
+  // DB dù code app đã cho phép. Tự dò tên constraint hệ thống đặt (không cố
+  // định) rồi thay bằng constraint mới có đủ 4 trạng thái.
+  await pool.request().query(`
+    IF EXISTS (SELECT * FROM sys.tables WHERE name = 'slot_issues' AND schema_id = SCHEMA_ID('dbo'))
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.check_constraints
+         WHERE parent_object_id = OBJECT_ID('dbo.slot_issues') AND definition LIKE '%Resolved%'
+       )
+    BEGIN
+      DECLARE @ckName NVARCHAR(200);
+      SELECT @ckName = cc.name
+      FROM sys.check_constraints cc
+      JOIN sys.columns col ON cc.parent_object_id = col.object_id AND cc.parent_column_id = col.column_id
+      WHERE cc.parent_object_id = OBJECT_ID('dbo.slot_issues') AND col.name = 'status';
+      IF @ckName IS NOT NULL
+        EXEC('ALTER TABLE dbo.slot_issues DROP CONSTRAINT ' + @ckName);
+      ALTER TABLE dbo.slot_issues
+        ADD CONSTRAINT CK_slot_issues_status CHECK (status IN ('Pending','Approved','Rejected','Resolved'));
     END
   `);
 
@@ -495,6 +546,23 @@ async function createTables() {
       CREATE INDEX IX_notifications_user_id ON dbo.notifications(user_id);
     END
   `);
+
+  // role_definitions — Admin-editable description/permission tags shown on
+  // the "Định nghĩa vai trò" cards. The 4 roles themselves are fixed in code
+  // (role_key mirrors normalizeRoleForStorage's 'user'/'staff'/'manager'/'admin');
+  // only their description text and permission tag list are editable data.
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'role_definitions' AND schema_id = SCHEMA_ID('dbo'))
+    BEGIN
+      CREATE TABLE dbo.role_definitions (
+        role_key NVARCHAR(50) PRIMARY KEY,
+        description NVARCHAR(1000) NOT NULL DEFAULT '',
+        permissions NVARCHAR(MAX) NOT NULL DEFAULT '[]',
+        updated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_by NVARCHAR(200) NOT NULL DEFAULT ''
+      );
+    END
+  `);
 }
 
 const INITIAL_SLOTS = [
@@ -541,22 +609,66 @@ const INITIAL_SLOTS = [
   { slotCode: 'F1-E11', floor: 1, zone: 'B', vehicleType: 'Xe máy / Xe máy điện', status: 'Available' },
 ];
 
+// Mỗi bãi có kho ô đỗ độc lập, cùng mặt bằng nhưng SỨC CHỨA KHÁC NHAU — `rows`
+// khai báo số ô mỗi dãy (A/D: ô tô, B/E: xe máy, C: EV). Mã ô của 2 bãi mới
+// được gắn tiền tố (TD-/LP-) để giữ UNIQUE trên slot_code; sơ đồ chỉ hiển thị
+// nhãn cuối (A01, B02...).
+//   Quận 9 - Lò Lu:      36 vị trí (đủ mặt bằng)
+//   Thủ Đức - Linh Xuân: 30 vị trí (dãy E chỉ 5 ô)
+//   Long Phước:          24 vị trí (mỗi dãy đều ít hơn)
+const SLOT_LOTS = [
+  { prefix: '',    name: 'ParkFlow Quận 9',     rows: { A: 11, B: 5, C: 5, D: 4, E: 11 } },
+  { prefix: 'TD-', name: 'ParkFlow Thủ Đức',    rows: { A: 11, B: 5, C: 5, D: 4, E: 5  } },
+  { prefix: 'LP-', name: 'ParkFlow Long Phước', rows: { A: 8,  B: 4, C: 3, D: 2, E: 7  } },
+];
+
+/** Các ô của INITIAL_SLOTS thuộc layout một bãi ('F1-A01' → dãy A, số 1). */
+function slotsForLot(lot) {
+  return INITIAL_SLOTS.filter((s) => {
+    const row = s.slotCode.slice(3, 4);
+    const num = Number(s.slotCode.slice(4));
+    return num <= (lot.rows[row] ?? 0);
+  });
+}
+
 async function seedSlots() {
   // INSERT-IF-NOT-EXISTS for every slot so missing rows are added on each server start.
   // Existing rows keep their current status (not overwritten).
-  for (const s of INITIAL_SLOTS) {
-    await pool.request()
-      .input('slot_code',    sql.NVarChar, s.slotCode)
-      .input('floor',        sql.Int,      s.floor)
-      .input('zone',         sql.NVarChar, s.zone)
-      .input('vehicle_type', sql.NVarChar, s.vehicleType)
-      .input('status',       sql.NVarChar, s.status)
-      .query(`
-        IF NOT EXISTS (SELECT 1 FROM dbo.parking_slots WHERE slot_code = @slot_code)
-          INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status)
-          VALUES (@slot_code, @floor, @zone, @vehicle_type, @status)
-      `);
+  for (const lot of SLOT_LOTS) {
+    const wanted = slotsForLot(lot);
+    for (const s of wanted) {
+      await pool.request()
+        .input('slot_code',    sql.NVarChar, `${lot.prefix}${s.slotCode}`)
+        .input('floor',        sql.Int,      s.floor)
+        .input('zone',         sql.NVarChar, s.zone)
+        .input('vehicle_type', sql.NVarChar, s.vehicleType)
+        // Bãi gốc giữ status demo; 2 bãi mới khởi tạo toàn ô trống
+        .input('status',       sql.NVarChar, lot.prefix ? 'Available' : s.status)
+        .input('parking_lot',  sql.NVarChar, lot.name)
+        .query(`
+          IF NOT EXISTS (SELECT 1 FROM dbo.parking_slots WHERE slot_code = @slot_code)
+            INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status, parking_lot)
+            VALUES (@slot_code, @floor, @zone, @vehicle_type, @status, @parking_lot)
+        `);
+    }
+    // DB cũ từng seed đủ 36 ô cho mọi bãi — dọn các ô ngoài layout của 2 bãi
+    // mới để sức chứa thật sự khác nhau. Chỉ xóa ô còn 'Available' (không đụng
+    // ô đang có xe/đặt chỗ); bãi Quận 9 (prefix rỗng) giữ nguyên mọi hàng cũ.
+    if (lot.prefix) {
+      const keep = wanted.map((s) => `N'${lot.prefix}${s.slotCode}'`).join(',');
+      await pool.request()
+        .input('lot_name', sql.NVarChar, lot.name)
+        .query(`
+          DELETE FROM dbo.parking_slots
+          WHERE parking_lot = @lot_name AND status = 'Available'
+            AND slot_code NOT IN (${keep})
+        `);
+    }
   }
+  // Hàng cũ tạo trước khi có cột parking_lot → gán về bãi Quận 9
+  await pool.request().query(`
+    UPDATE dbo.parking_slots SET parking_lot = N'ParkFlow Quận 9' WHERE parking_lot = ''
+  `);
 }
 
 async function migrateSlotAndRoles() {
@@ -578,6 +690,61 @@ async function initDatabase() {
   await migrateSlotAndRoles();
   await migrateLegacyPasswords();
   await ensureDemoAccounts();
+  await ensureRoleDefinitions();
+}
+
+// Seed defaults matching the text that was previously hardcoded on the
+// frontend (RoleManagement.tsx's roleDescription()/permissionLabel() maps) —
+// only inserted the first time each role_key is missing, so an admin/manager
+// edit made in a previous session is never overwritten by a later restart.
+const DEFAULT_ROLE_DEFINITIONS = [
+  {
+    roleKey: 'user',
+    description: 'Chỉ có quyền gửi xe, đặt chỗ và thanh toán.',
+    permissions: ['Xem thông tin bãi đỗ', 'Xem chỗ trống', 'Tạo đặt chỗ', 'Xem lượt gửi hiện tại', 'Thanh toán', 'Gửi phản hồi', 'Quản lý hồ sơ cá nhân'],
+  },
+  {
+    roleKey: 'staff',
+    description: 'Phụ trách kiểm soát làn, hỗ trợ check-in và xử lý tại bãi.',
+    permissions: ['Tạo lượt gửi xe', 'Xử lý xe vào', 'Xử lý xe ra', 'Cập nhật trạng thái chỗ', 'Xử lý mất vé'],
+  },
+  {
+    roleKey: 'manager',
+    description: 'Theo dõi vận hành, phê duyệt và kiểm soát cấu hình bãi xe.',
+    permissions: ['Quản lý bãi đỗ', 'Quản lý tầng và chỗ đỗ', 'Quản lý bảng giá', 'Xem báo cáo', 'Quản lý chính sách'],
+  },
+  {
+    roleKey: 'admin',
+    description: 'Toàn quyền quản trị người dùng, hệ thống và cấu hình.',
+    permissions: ['Quản lý người dùng', 'Quản lý vai trò', 'Quản lý cấu hình hệ thống'],
+  },
+];
+
+async function ensureRoleDefinitions() {
+  for (const def of DEFAULT_ROLE_DEFINITIONS) {
+    const existing = await pool.request()
+      .input('role_key', sql.NVarChar, def.roleKey)
+      .query(`SELECT role_key FROM dbo.role_definitions WHERE role_key = @role_key`);
+    if (existing.recordset.length) continue;
+
+    await pool.request()
+      .input('role_key', sql.NVarChar, def.roleKey)
+      .input('description', sql.NVarChar, def.description)
+      .input('permissions', sql.NVarChar, JSON.stringify(def.permissions))
+      .query(`
+        INSERT INTO dbo.role_definitions (role_key, description, permissions)
+        VALUES (@role_key, @description, @permissions)
+      `);
+  }
+}
+
+function safeParsePermissions(json) {
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((p) => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 function isBcryptHash(value) {
@@ -671,6 +838,20 @@ function normalizeRole(roleValue) {
   }
 }
 
+// Sessions carry the frontend's short VehicleKey ('car'/'motorbike'/'electric
+// vehicle') or, from some callers, the Vietnamese label directly — while
+// dbo.parking_slots.vehicle_type always stores the canonical Vietnamese label
+// (see INITIAL_SLOTS above). Normalize either shape to that canonical label so
+// walk-in auto-assignment can match a session's vehicle type to a real slot.
+function normalizeVehicleTypeForSlotMatch(vehicleType) {
+  const v = String(vehicleType || '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'car' || v.includes('xăng')) return 'Ô tô 4-7 chỗ (Xăng)';
+  if (v === 'electric vehicle' || v.includes('điện')) return 'Ô tô 4-7 chỗ (Điện / EV)';
+  if (v === 'motorbike' || v.includes('xe máy') || v.includes('xe may')) return 'Xe máy / Xe máy điện';
+  return null;
+}
+
 function normalizeRoleForStorage(roleValue) {
   const v = String(roleValue || '').trim().toLowerCase();
   switch (v) {
@@ -679,6 +860,30 @@ function normalizeRoleForStorage(roleValue) {
     case 'parking staff': case 'staff': return 'staff';
     default: return 'user';
   }
+}
+
+// ─── user-management authorization ─────────────────────────────────────────
+// Admin: full manage (create/edit/lock/delete) over every role, including
+// other admins/managers. Manager: no access — "Quản lý người dùng"/"Quyền và
+// vai trò" were removed from the Manager portal entirely.
+// Nobody can change their own role/status through these endpoints (avoids
+// self-lockout / self-escalation) — that always goes through the profile
+// endpoint instead, which never touches role/status.
+function canManageRole(actorRoleForStorage, targetRoleForStorage) {
+  return actorRoleForStorage === 'admin';
+}
+
+// Looks up the *real* role of whoever is performing a user-management action
+// straight from the DB — never trust a role the client claims for itself.
+async function loadActor(actorId) {
+  const idNum = Number(actorId);
+  if (!Number.isInteger(idNum)) return null;
+  const result = await pool.request()
+    .input('id', sql.Int, idNum)
+    .query(`SELECT user_id, full_name, role FROM dbo.users WHERE user_id = @id`);
+  if (!result.recordset.length) return null;
+  const row = result.recordset[0];
+  return { id: row.user_id, fullName: row.full_name, role: normalizeRoleForStorage(row.role) };
 }
 
 function normalizeStatus(record) {
@@ -709,8 +914,30 @@ function getSafeUser(record) {
   };
 }
 
+// Toàn bộ mốc giờ hiển thị trong app phải là GIỜ VIỆT NAM (UTC+7) — kể cả khi
+// server chạy trên máy/host có múi giờ khác (ví dụ máy chủ cloud mặc định
+// UTC). `toISOString()` luôn quy về UTC theo spec JS, nên KHÔNG được dùng
+// trực tiếp để hiển thị — cộng thêm 7 giờ vào epoch rồi mới format bằng
+// toISOString() là cách lấy đúng "giờ tường Việt Nam" một cách tất định,
+// không phụ thuộc timezone hệ điều hành của server.
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+function toVnStr(d) {
+  return new Date(d.getTime() + VN_OFFSET_MS).toISOString().replace('T', ' ').slice(0, 16);
+}
 function nowStr() {
-  return new Date().toISOString().replace('T', ' ').slice(0, 16);
+  return toVnStr(new Date());
+}
+
+// Chuẩn hóa tên bãi về 1 khóa để so sánh — bản sao tối thiểu của
+// src/utils/parkingLots.ts::lotKeyOf phía frontend, dùng để backend TỰ kiểm
+// tra quyền staff theo bãi (không chỉ tin client lọc UI).
+function lotKeyOfServer(value) {
+  const v = String(value || '').toLowerCase();
+  if (!v.trim()) return null;
+  if (v.includes('long phước') || v.includes('long phuoc')) return 'longphuoc';
+  if (v.includes('quận 9') || v.includes('quan 9')) return 'quan9';
+  if (v.includes('thủ đức') || v.includes('thu duc')) return 'thuduc';
+  return null;
 }
 
 // ─── health ─────────────────────────────────────────────────────────────────
@@ -743,14 +970,20 @@ app.get('/api/users', async (req, res) => {
 
 app.post('/api/users', async (req, res) => {
   try {
-    const { fullName, email, phone, role, status, password, assignedParkingLot } = req.body;
+    const { fullName, email, phone, role, status, password, assignedParkingLot, actorId } = req.body;
     if (!fullName || !email || !phone || !role)
       return res.status(400).json({ error: 'Thiếu thông tin bắt buộc.' });
+
+    const normalizedRole = normalizeRoleForStorage(role);
+
+    const actor = await loadActor(actorId);
+    if (!actor) return res.status(403).json({ error: 'Không xác định được người thực hiện thao tác.' });
+    if (!canManageRole(actor.role, normalizedRole))
+      return res.status(403).json({ error: 'Bạn không có quyền tạo tài khoản với vai trò này.' });
 
     const cleanEmail = email.trim();
     const cleanPhone = phone.trim();
     const passwordHash = await bcrypt.hash(password || '123456', 10);
-    const normalizedRole = normalizeRoleForStorage(role);
     const normalizedStatus = ['Active', 'Inactive', 'Locked'].includes(status) ? status : 'Active';
     const lotValue = (assignedParkingLot || '').trim();
 
@@ -790,12 +1023,33 @@ app.post('/api/users', async (req, res) => {
 app.put('/api/users/:id', async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { fullName, email, phone, role, status, assignedParkingLot } = req.body;
+    const { fullName, email, phone, role, status, assignedParkingLot, actorId } = req.body;
 
     const cur = await pool.request().input('id', sql.Int, id)
       .query(`SELECT user_id, full_name, email, phone, role, status, is_active, assigned_parking_lot, created_at, password_updated_at FROM dbo.users WHERE user_id = @id`);
     if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy người dùng.' });
     const ex = cur.recordset[0];
+
+    // Self edits of basic info (name/phone/email/lot) always go through — this
+    // is how every role updates its own profile. Any change to role or status,
+    // or any edit targeting someone else's account, must clear canManageRole()
+    // below — nobody may promote/demote or lock/unlock themselves this way.
+    const exRoleForStorage = normalizeRoleForStorage(ex.role);
+    const nextRoleForStorage = role ? normalizeRoleForStorage(role) : exRoleForStorage;
+    const roleChanging = nextRoleForStorage !== exRoleForStorage;
+    const statusChanging = status !== undefined && status !== null && status !== ex.status;
+    const isSelf = actorId !== undefined && actorId !== null && Number(actorId) === id;
+
+    if (roleChanging || statusChanging || !isSelf) {
+      const actor = await loadActor(actorId);
+      if (!actor) return res.status(403).json({ error: 'Không xác định được người thực hiện thao tác.' });
+      if (isSelf) {
+        return res.status(403).json({ error: 'Bạn không thể tự thay đổi vai trò hoặc trạng thái của chính mình.' });
+      }
+      if (!canManageRole(actor.role, exRoleForStorage) || (roleChanging && !canManageRole(actor.role, nextRoleForStorage))) {
+        return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa tài khoản này.' });
+      }
+    }
 
     const nextEmail = email ? email.trim() : ex.email;
     const nextPhone = phone ? phone.trim() : ex.phone;
@@ -875,6 +1129,21 @@ app.put('/api/users/:id/password', async (req, res) => {
 app.delete('/api/users/:id', async (req, res) => {
   try {
     const id = Number(req.params.id);
+    const actorId = req.query.actorId ?? req.body?.actorId;
+
+    const cur = await pool.request().input('id', sql.Int, id)
+      .query(`SELECT user_id, role FROM dbo.users WHERE user_id = @id`);
+    if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy người dùng.' });
+    const targetRoleForStorage = normalizeRoleForStorage(cur.recordset[0].role);
+
+    if (actorId !== undefined && Number(actorId) === id)
+      return res.status(403).json({ error: 'Bạn không thể tự xóa tài khoản của chính mình.' });
+
+    const actor = await loadActor(actorId);
+    if (!actor) return res.status(403).json({ error: 'Không xác định được người thực hiện thao tác.' });
+    if (!canManageRole(actor.role, targetRoleForStorage))
+      return res.status(403).json({ error: 'Bạn không có quyền xóa tài khoản này.' });
+
     const r = await pool.request().input('id', sql.Int, id)
       .query(`DELETE FROM dbo.users WHERE user_id = @id`);
     if (!r.rowsAffected[0]) return res.status(404).json({ error: 'Không tìm thấy người dùng.' });
@@ -882,6 +1151,77 @@ app.delete('/api/users/:id', async (req, res) => {
   } catch (err) {
     console.error('DELETE /api/users/:id', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi xóa người dùng.' });
+  }
+});
+
+// ─── role definitions ──────────────────────────────────────────────────────
+// The 4 roles themselves are fixed in code; only their description text and
+// permission tag list (shown on the "Định nghĩa vai trò" cards) are editable,
+// Admin-only data backed by dbo.role_definitions.
+
+app.get('/api/role-definitions', async (req, res) => {
+  try {
+    const result = await pool.request().query(`
+      SELECT role_key, description, permissions, updated_at, updated_by FROM dbo.role_definitions
+    `);
+    return res.json(result.recordset.map((r) => ({
+      roleKey: r.role_key,
+      description: r.description,
+      permissions: safeParsePermissions(r.permissions),
+      updatedAt: r.updated_at,
+      updatedBy: r.updated_by,
+    })));
+  } catch (err) {
+    console.error('GET /api/role-definitions', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi tải định nghĩa vai trò.' });
+  }
+});
+
+app.put('/api/role-definitions/:roleKey', async (req, res) => {
+  try {
+    const roleKey = normalizeRoleForStorage(req.params.roleKey);
+    const { description, permissions, actorId } = req.body;
+
+    const actor = await loadActor(actorId);
+    if (!actor) return res.status(403).json({ error: 'Không xác định được người thực hiện thao tác.' });
+    if (actor.role !== 'admin')
+      return res.status(403).json({ error: 'Chỉ Quản trị viên mới có quyền chỉnh sửa định nghĩa vai trò.' });
+
+    if (typeof description !== 'string' || !description.trim())
+      return res.status(400).json({ error: 'Thiếu mô tả vai trò.' });
+    const cleanPermissions = Array.isArray(permissions)
+      ? permissions.map((p) => String(p).trim()).filter(Boolean).slice(0, 30)
+      : [];
+
+    const exists = await pool.request().input('role_key', sql.NVarChar, roleKey)
+      .query(`SELECT role_key FROM dbo.role_definitions WHERE role_key = @role_key`);
+    if (!exists.recordset.length) return res.status(404).json({ error: 'Không tìm thấy vai trò.' });
+
+    await pool.request()
+      .input('role_key', sql.NVarChar, roleKey)
+      .input('description', sql.NVarChar, description.trim().slice(0, 1000))
+      .input('permissions', sql.NVarChar, JSON.stringify(cleanPermissions))
+      .input('updated_by', sql.NVarChar, actor.fullName || '')
+      .query(`
+        UPDATE dbo.role_definitions
+        SET description = @description, permissions = @permissions,
+            updated_at = SYSUTCDATETIME(), updated_by = @updated_by
+        WHERE role_key = @role_key
+      `);
+
+    const upd = await pool.request().input('role_key', sql.NVarChar, roleKey)
+      .query(`SELECT role_key, description, permissions, updated_at, updated_by FROM dbo.role_definitions WHERE role_key = @role_key`);
+    const row = upd.recordset[0];
+    return res.json({
+      roleKey: row.role_key,
+      description: row.description,
+      permissions: safeParsePermissions(row.permissions),
+      updatedAt: row.updated_at,
+      updatedBy: row.updated_by,
+    });
+  } catch (err) {
+    console.error('PUT /api/role-definitions/:roleKey', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật định nghĩa vai trò.' });
   }
 });
 
@@ -1163,20 +1503,46 @@ app.post('/api/rfid/link', async (req, res) => {
     if (dup.recordset.length)
       return res.status(409).json({ error: 'Thẻ này đã được liên kết với một phương tiện khác.' });
 
+    // So khớp chính xác trước; trượt thì so theo biển đã chuẩn hóa (bỏ gạch,
+    // chấm, khoảng trắng) — OCR trả "36A-363.63" vẫn khớp DB "36A-36363".
+    let vehicleId = null;
     const veh = await pool.request()
       .input('plate', sql.NVarChar, licensePlate.trim())
       .query(`SELECT TOP 1 vehicle_id FROM dbo.vehicles WHERE license_plate = @plate`);
-    if (!veh.recordset.length)
+    if (veh.recordset.length) {
+      vehicleId = veh.recordset[0].vehicle_id;
+    } else {
+      const wanted = normalizePlate(licensePlate);
+      const all = await pool.request().query(`SELECT vehicle_id, license_plate FROM dbo.vehicles`);
+      const hit = all.recordset.find((v) => normalizePlate(v.license_plate) === wanted);
+      if (hit) vehicleId = hit.vehicle_id;
+    }
+    if (vehicleId == null)
       return res.status(404).json({ error: 'Không tìm thấy phương tiện với biển số này.' });
 
     await pool.request()
       .input('uid', sql.NVarChar, uid)
-      .input('id', sql.Int, veh.recordset[0].vehicle_id)
+      .input('id', sql.Int, vehicleId)
       .query(`UPDATE dbo.vehicles SET rfid_uid = @uid WHERE vehicle_id = @id`);
 
     return res.json({ message: 'Đã liên kết thẻ RFID với phương tiện.' });
   } catch (err) {
     console.error('POST /api/rfid/link', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ.' });
+  }
+});
+
+// Xe ra cổng xong → trả thẻ về trạng thái trắng để phát cho khách tiếp theo.
+app.post('/api/rfid/unlink', async (req, res) => {
+  try {
+    const uid = String(req.body?.uid || '').trim();
+    if (!uid) return res.status(400).json({ error: 'Thiếu mã UID thẻ.' });
+    const r = await pool.request()
+      .input('uid', sql.NVarChar, uid)
+      .query(`UPDATE dbo.vehicles SET rfid_uid = NULL WHERE rfid_uid = @uid`);
+    return res.json({ ok: true, unlinked: r.rowsAffected[0] > 0 });
+  } catch (err) {
+    console.error('POST /api/rfid/unlink', err);
     return res.status(500).json({ error: 'Lỗi máy chủ.' });
   }
 });
@@ -1194,6 +1560,26 @@ function hashPlate(plate) {
   return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
+// Xe vào bãi không qua đặt chỗ/RFID (staff gõ tay biển số) không tự biết
+// user_id của chủ xe — tra theo biển số đã đăng ký trong dbo.vehicles, cùng
+// cách so khớp (chính xác → chuẩn hóa) đã dùng cho /api/rfid/link, để phiên
+// gửi xe của khách vãng lai vẫn hiện đúng trong "Xe đang đỗ tại bãi" của
+// đúng tài khoản chủ xe thay vì luôn để trống.
+async function findOwnerIdByPlate(licensePlate) {
+  const clean = String(licensePlate || '').trim();
+  if (!clean) return null;
+  const exact = await pool.request()
+    .input('plate', sql.NVarChar, clean)
+    .query(`SELECT TOP 1 user_id FROM dbo.vehicles WHERE license_plate = @plate`);
+  if (exact.recordset.length) return exact.recordset[0].user_id || null;
+
+  const wanted = normalizePlate(clean);
+  if (!wanted) return null;
+  const all = await pool.request().query(`SELECT user_id, license_plate FROM dbo.vehicles`);
+  const hit = all.recordset.find((v) => normalizePlate(v.license_plate) === wanted);
+  return hit ? (hit.user_id || null) : null;
+}
+
 function toRfidScanDto(r) {
   return {
     id: String(r.scan_id),
@@ -1207,9 +1593,7 @@ function toRfidScanDto(r) {
     vehicleId: r.vehicle_id != null ? String(r.vehicle_id) : '',
     scannedById: r.scanned_by_id || '',
     scannedByName: r.scanned_by_name || '',
-    createdAt: r.created_at
-      ? new Date(r.created_at).toISOString().replace('T', ' ').slice(0, 16)
-      : '',
+    createdAt: r.created_at ? toVnStr(new Date(r.created_at)) : '',
   };
 }
 
@@ -1296,6 +1680,22 @@ app.get('/api/rfid-scans', async (req, res) => {
   }
 });
 
+// Staff bấm "Từ chối" một lượt quét đang chờ → xóa hẳn bản ghi (kèm ảnh chụp)
+// khỏi DB để nó không xuất hiện lại trong hàng đợi hay lịch sử.
+app.delete('/api/rfid-scans/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID lượt quét không hợp lệ.' });
+    const r = await pool.request().input('id', sql.Int, id)
+      .query(`DELETE FROM dbo.rfid_scans WHERE scan_id = @id`);
+    if (!r.rowsAffected[0]) return res.status(404).json({ error: 'Không tìm thấy lượt quét thẻ.' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/rfid-scans/:id', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi xóa lượt quét thẻ.' });
+  }
+});
+
 // ─── reservations ────────────────────────────────────────────────────────────
 
 function toReservationDto(r) {
@@ -1318,6 +1718,12 @@ function toReservationDto(r) {
     estimatedCost: r.estimated_cost ?? 0,
     parkingLot: r.parking_lot || '',
     createdAt: r.created_at || '',
+    // Dòng thời gian trạng thái — mốc giờ thật của từng lần chuyển, dùng cho
+    // hóa đơn phía driver ("xem chi tiết" → thấy đủ mốc Xác nhận/Check-in/...).
+    confirmedAt: r.confirmed_at || '',
+    checkedInAt: r.checked_in_at || '',
+    completedAt: r.completed_at || '',
+    cancelledAt: r.cancelled_at || '',
   };
 }
 
@@ -1338,6 +1744,29 @@ app.get('/api/reservations', async (req, res) => {
     console.error('GET /api/reservations', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi tải đặt chỗ.' });
   }
+});
+
+// SSE: đẩy đặt chỗ mới/cập nhật ngay lập tức tới cả driver và staff/manager
+// đang mở app — user đặt chỗ xong staff thấy yêu cầu ngay, không phải chờ
+// tới chu kỳ poll 10 giây tiếp theo.
+const reservationSseClients = new Set();
+
+function broadcastReservationEvent(dto) {
+  const payload = `data: ${JSON.stringify(dto)}\n\n`;
+  for (const client of reservationSseClients) {
+    try { client.write(payload); } catch { reservationSseClients.delete(client); }
+  }
+}
+
+app.get('/api/reservations/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
+  reservationSseClients.add(res);
+  req.on('close', () => { clearInterval(heartbeat); reservationSseClients.delete(res); });
 });
 
 app.post('/api/reservations', async (req, res) => {
@@ -1381,7 +1810,7 @@ app.post('/api/reservations', async (req, res) => {
       `);
 
     // Successful booking → bell notification for the driver (guests have no
-    // account to notify). Clicking it routes to "Đặt chỗ của tôi".
+    // account to notify). Clicking it routes to "Lịch sử đặt chỗ".
     if (String(userId).toUpperCase() !== 'GUEST') {
       createNotification(
         String(userId),
@@ -1392,7 +1821,9 @@ app.post('/api/reservations', async (req, res) => {
       ).catch((err) => console.error('createNotification(booking_created)', err));
     }
 
-    return res.status(201).json({ reservation: toReservationDto(ins.recordset[0]) });
+    const dto = toReservationDto(ins.recordset[0]);
+    broadcastReservationEvent(dto);
+    return res.status(201).json({ reservation: dto });
   } catch (err) {
     console.error('POST /api/reservations', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi tạo đặt chỗ.' });
@@ -1417,7 +1848,31 @@ app.put('/api/reservations/:id', async (req, res) => {
 
     const ex = cur.recordset[0];
     // cancelledBy/cancelReason chỉ dùng để chọn nội dung thông báo — không lưu DB.
-    const { status, note, slotCode, endTime, cancelledBy, cancelReason } = req.body;
+    // staffId: gửi kèm khi THAO TÁC XUẤT PHÁT TỪ STAFF (xác nhận/hủy) — backend
+    // tự tra bãi được gán của staff đó và CHẶN nếu khác bãi của đặt chỗ, không
+    // chỉ tin bộ lọc phía UI. User tự hủy đặt chỗ của mình thì không gửi staffId
+    // nên không bị áp quy tắc này.
+    const { status, note, slotCode, endTime, cancelledBy, cancelReason, staffId } = req.body;
+
+    if (staffId && (status === 'Confirmed' || status === 'Checked-in' || status === 'Completed' || (status === 'Cancelled' && cancelledBy === 'staff'))) {
+      const staffRow = await pool.request().input('sid', sql.Int, Number(staffId))
+        .query(`SELECT assigned_parking_lot FROM dbo.users WHERE user_id = @sid`);
+      const staffLot = lotKeyOfServer(staffRow.recordset[0]?.assigned_parking_lot);
+      const resLot = lotKeyOfServer(ex.parking_lot);
+      if (!staffLot || staffLot !== resLot) {
+        return res.status(403).json({ error: 'Bạn không được phân công phụ trách bãi đỗ của đặt chỗ này.' });
+      }
+    }
+
+    // Chỉ ghi mốc giờ dòng thời gian khi status THẬT SỰ đổi sang trạng thái đó
+    // (không ghi đè nếu request PUT chỉ sửa note/slotCode mà giữ nguyên status).
+    const statusChanged = status !== undefined && status !== ex.status;
+    const stampCol =
+      statusChanged && status === 'Confirmed' ? 'confirmed_at' :
+      statusChanged && status === 'Checked-in' ? 'checked_in_at' :
+      statusChanged && status === 'Completed' ? 'completed_at' :
+      statusChanged && status === 'Cancelled' ? 'cancelled_at' :
+      null;
 
     await pool.request()
       .input('id', sql.Int, ex.reservation_id)
@@ -1425,10 +1880,29 @@ app.put('/api/reservations/:id', async (req, res) => {
       .input('note', sql.NVarChar, note !== undefined ? note : ex.note)
       .input('slot_code', sql.NVarChar, slotCode !== undefined ? slotCode : ex.slot_code)
       .input('end_time', sql.NVarChar, endTime !== undefined ? endTime : ex.end_time)
-      .query(`UPDATE dbo.reservations SET status=@status, note=@note, slot_code=@slot_code, end_time=@end_time WHERE reservation_id=@id`);
+      .input('stamp', sql.NVarChar, nowStr())
+      .query(`
+        UPDATE dbo.reservations
+        SET status=@status, note=@note, slot_code=@slot_code, end_time=@end_time
+            ${stampCol ? `, ${stampCol} = @stamp` : ''}
+        WHERE reservation_id=@id
+      `);
 
     const upd = await pool.request().input('id', sql.Int, ex.reservation_id)
       .query(`SELECT * FROM dbo.reservations WHERE reservation_id=@id`);
+
+    // Hủy đặt chỗ → mọi payment còn "Unpaid" gắn với nó (vd. đã bấm "Thanh
+    // toán VNPay" nhưng bỏ dở, chưa từng thu tiền thật) không còn ý nghĩa gì —
+    // đánh dấu Failed để không bị tính nhầm là "còn nợ" ở Số dư chưa thanh
+    // toán của khách hay các màn hình thanh toán của staff. Payment ĐÃ 'Paid'
+    // thì giữ nguyên (mất tiền theo đúng chính sách không hoàn tiền).
+    if (statusChanged && status === 'Cancelled') {
+      await pool.request()
+        .input('code', sql.NVarChar, String(ex.reservation_code))
+        .query(`UPDATE dbo.payments SET status='Failed'
+                WHERE status='Unpaid' AND (reservation_code=@code OR ticket_code=@code)`)
+        .catch((err) => console.error('void unpaid payments on cancel', err));
+    }
 
     // Staff confirming a Pending booking → notify the driver on their bell.
     if (status === 'Confirmed' && ex.status !== 'Confirmed') {
@@ -1441,8 +1915,33 @@ app.put('/api/reservations/:id', async (req, res) => {
       ).catch((err) => console.error('createNotification(booking_confirmed)', err));
     }
 
+    // Staff check-in tại cổng (quẹt thẻ/biển số khớp đặt chỗ) → báo cho driver
+    // biết xe đã vào bãi và ở ô nào.
+    if (status === 'Checked-in' && ex.status !== 'Checked-in' && String(ex.user_id).toUpperCase() !== 'GUEST') {
+      const finalSlot = upd.recordset[0].slot_code || ex.slot_code || '';
+      createNotification(
+        ex.user_id,
+        'booking_checked_in',
+        'Xe đã check-in vào bãi',
+        `${ex.reservation_code} · ${ex.license_plate}${finalSlot ? ` · Ô ${finalSlot}` : ''}`,
+        'reservations',
+      ).catch((err) => console.error('createNotification(booking_checked_in)', err));
+    }
+
+    // Staff check-out tại cổng (quẹt thẻ khớp lượt gửi đã check-in trước đó) →
+    // báo cho driver biết xe đã rời bãi, lượt gửi đã kết thúc.
+    if (status === 'Completed' && ex.status !== 'Completed' && String(ex.user_id).toUpperCase() !== 'GUEST') {
+      createNotification(
+        ex.user_id,
+        'booking_completed',
+        'Xe đã check-out — cảm ơn đã sử dụng ParkFlow',
+        `${ex.reservation_code} · ${ex.license_plate}`,
+        'reservations',
+      ).catch((err) => console.error('createNotification(booking_completed)', err));
+    }
+
     // Any cancellation → bell notification saying who cancelled and why.
-    // Clicking it routes to "Đặt chỗ của tôi" (targetView 'reservations').
+    // Clicking it routes to "Lịch sử đặt chỗ" (targetView 'reservations').
     if (status === 'Cancelled' && ex.status !== 'Cancelled' && String(ex.user_id).toUpperCase() !== 'GUEST') {
       let type = 'booking_cancelled';
       let title = 'Đặt chỗ đã bị hủy';
@@ -1465,7 +1964,9 @@ app.put('/api/reservations/:id', async (req, res) => {
       ).catch((err) => console.error(`createNotification(${type})`, err));
     }
 
-    return res.json({ reservation: toReservationDto(upd.recordset[0]) });
+    const dto = toReservationDto(upd.recordset[0]);
+    broadcastReservationEvent(dto);
+    return res.json({ reservation: dto });
   } catch (err) {
     console.error('PUT /api/reservations/:id', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật đặt chỗ.' });
@@ -1476,15 +1977,36 @@ app.delete('/api/reservations/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const numericId = Number(id);
-    let r;
+    // Đọc trước để biết reservation_id thật — cần cho sự kiện SSE "deleted"
+    // (client xóa theo id cục bộ, không phải reservation_id trong DB).
+    let cur;
     if (!isNaN(numericId) && numericId > 0) {
-      r = await pool.request().input('id', sql.Int, numericId)
-        .query(`DELETE FROM dbo.reservations WHERE reservation_id = @id`);
+      cur = await pool.request().input('id', sql.Int, numericId)
+        .query(`SELECT reservation_id, reservation_code FROM dbo.reservations WHERE reservation_id = @id`);
     } else {
-      r = await pool.request().input('code', sql.NVarChar, id)
-        .query(`DELETE FROM dbo.reservations WHERE reservation_code = @code`);
+      cur = await pool.request().input('code', sql.NVarChar, id)
+        .query(`SELECT reservation_id, reservation_code FROM dbo.reservations WHERE reservation_code = @code`);
     }
+    if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy đặt chỗ.' });
+    const dbId = cur.recordset[0].reservation_id;
+    const dbCode = cur.recordset[0].reservation_code;
+
+    const r = await pool.request().input('id', sql.Int, dbId)
+      .query(`DELETE FROM dbo.reservations WHERE reservation_id = @id`);
     if (!r.rowsAffected[0]) return res.status(404).json({ error: 'Không tìm thấy đặt chỗ.' });
+
+    // Đặt chỗ bị xóa hẳn (hủy ngay sau khi vừa đặt, chưa từng xác nhận) →
+    // payment Unpaid gắn với nó (vd. đã bấm "Thanh toán VNPay" nhưng bỏ dở
+    // giữa chừng, kể cả khi client-side chưa kịp dọn do race điều hướng sang
+    // VNPay) cũng không còn ý nghĩa gì — xóa luôn, không để sót trên trang
+    // Thanh toán. Payment đã 'Paid' thì không đụng tới (không thể xảy ra ở
+    // đây vì reservation vừa mới tạo, nhưng vẫn chừa an toàn).
+    await pool.request()
+      .input('code', sql.NVarChar, String(dbCode))
+      .query(`DELETE FROM dbo.payments WHERE status <> 'Paid' AND (reservation_code=@code OR ticket_code=@code)`)
+      .catch((err) => console.error('void unpaid payments on reservation delete', err));
+
+    broadcastReservationEvent({ deleted: true, id: String(dbId) });
     return res.json({ message: 'Đã xóa đặt chỗ.' });
   } catch (err) {
     console.error('DELETE /api/reservations/:id', err);
@@ -1540,31 +2062,81 @@ app.get('/api/sessions', async (req, res) => {
 });
 
 app.post('/api/sessions', async (req, res) => {
+  const tx = new sql.Transaction(pool);
   try {
     const {
       userId, ticketCode, licensePlate, vehicleType,
-      checkInTime, expectedEndTime, entryGate, floor, area, slotCode,
+      checkInTime, expectedEndTime, entryGate, floor, area, slotCode, parkingLot,
       estimatedFee, paymentStatus, paymentMethod, sessionStatus, barrierStatus,
     } = req.body;
 
     if (!licensePlate || !vehicleType) return res.status(400).json({ error: 'Thiếu thông tin bắt buộc.' });
 
+    // Reservation/RFID check-ins pass userId directly. A manually-typed
+    // walk-in plate doesn't know its owner — resolve it from dbo.vehicles so
+    // the driver (if the plate is registered to one) sees this session as
+    // "their" car currently parked, same as a pre-booked check-in would.
+    const resolvedUserId = userId || (await findOwnerIdByPlate(licensePlate)) || '';
+
     const code = ticketCode || `TK-${Date.now().toString().slice(-6)}`;
-    const ins = await pool.request()
-      .input('user_id', sql.NVarChar, String(userId || ''))
+    const effectiveStatus = sessionStatus || 'Active';
+
+    await tx.begin();
+    let finalFloor = floor || '';
+    let finalArea = area || '';
+    let finalSlotCode = slotCode || '';
+    let autoAssignedSlot = false;
+
+    // Walk-in (no reservation → no slotCode from the client): auto-pick a
+    // free slot matching the vehicle type instead of leaving the session
+    // unparked. The subquery's UPDLOCK+READPAST makes "pick one Available row
+    // and flip it to Occupied" atomic against concurrent entries — two staff
+    // scanning cars in at the same moment can never grab the same slot.
+    if (!finalSlotCode && effectiveStatus === 'Active') {
+      const wantedVehicleType = normalizeVehicleTypeForSlotMatch(vehicleType);
+      if (wantedVehicleType) {
+        const pickReq = new sql.Request(tx);
+        pickReq.input('vehicle_type', sql.NVarChar, wantedVehicleType);
+        let pickQuery = `
+          UPDATE dbo.parking_slots
+          SET status = 'Occupied'
+          OUTPUT inserted.slot_code, inserted.floor, inserted.zone
+          WHERE slot_id = (
+            SELECT TOP 1 slot_id FROM dbo.parking_slots WITH (UPDLOCK, ROWLOCK, READPAST)
+            WHERE status = 'Available' AND vehicle_type = @vehicle_type
+        `;
+        if (parkingLot) {
+          pickReq.input('parking_lot', sql.NVarChar, parkingLot);
+          pickQuery += ` AND parking_lot = @parking_lot`;
+        }
+        pickQuery += ` ORDER BY slot_code)`;
+        const picked = await pickReq.query(pickQuery);
+        if (picked.recordset.length) {
+          const row = picked.recordset[0];
+          finalSlotCode = row.slot_code;
+          finalFloor = String(row.floor);
+          finalArea = row.zone;
+          autoAssignedSlot = true;
+        }
+      }
+    }
+
+    const insReq = new sql.Request(tx);
+    const ins = await insReq
+      .input('user_id', sql.NVarChar, String(resolvedUserId))
       .input('ticket_code', sql.NVarChar, code)
       .input('license_plate', sql.NVarChar, licensePlate)
       .input('vehicle_type', sql.NVarChar, vehicleType)
       .input('check_in_time', sql.NVarChar, checkInTime || nowStr())
       .input('expected_end_time', sql.NVarChar, expectedEndTime || '')
       .input('entry_gate', sql.NVarChar, entryGate || '')
-      .input('floor', sql.NVarChar, floor || '')
-      .input('area', sql.NVarChar, area || '')
-      .input('slot_code', sql.NVarChar, slotCode || '')
+      .input('floor', sql.NVarChar, finalFloor)
+      .input('area', sql.NVarChar, finalArea)
+      .input('slot_code', sql.NVarChar, finalSlotCode)
       .input('estimated_fee', sql.Float, estimatedFee || 0)
       .input('payment_status', sql.NVarChar, paymentStatus || 'Unpaid')
       .input('payment_method', sql.NVarChar, paymentMethod || 'Cash')
-      .input('session_status', sql.NVarChar, sessionStatus || 'Active')
+      .input('session_status', sql.NVarChar, effectiveStatus)
       .input('barrier_status', sql.NVarChar, barrierStatus || 'Closed')
       .query(`
         INSERT INTO dbo.parking_sessions
@@ -1577,8 +2149,11 @@ app.post('/api/sessions', async (req, res) => {
            @entry_gate, @floor, @area, @slot_code, @estimated_fee, @payment_status, @payment_method,
            @session_status, @barrier_status)
       `);
-    return res.status(201).json({ session: toSessionDto(ins.recordset[0]) });
+    await tx.commit();
+    if (autoAssignedSlot) broadcastSlotUpdate(finalSlotCode, 'Occupied');
+    return res.status(201).json({ session: toSessionDto(ins.recordset[0]), autoAssignedSlot });
   } catch (err) {
+    await tx.rollback().catch(() => {});
     console.error('POST /api/sessions', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi tạo phiên gửi xe.' });
   }
@@ -1799,7 +2374,7 @@ app.put('/api/payments/:id', async (req, res) => {
     if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy thanh toán.' });
 
     const ex = cur.recordset[0];
-    const { status, method, paidAt, totalAmount, parkingFee, extraServiceFee, lostTicketFee, discount, ticketCode } = req.body;
+    const { status, method, paidAt, totalAmount, parkingFee, extraServiceFee, overtimeFee, lostTicketFee, discount, ticketCode } = req.body;
 
     await pool.request()
       .input('id',                 sql.Int,      ex.payment_id)
@@ -1809,13 +2384,15 @@ app.put('/api/payments/:id', async (req, res) => {
       .input('total_amount',       sql.Float,    totalAmount        !== undefined ? totalAmount        : ex.total_amount)
       .input('parking_fee',        sql.Float,    parkingFee         !== undefined ? parkingFee         : ex.parking_fee)
       .input('extra_service_fee',  sql.Float,    extraServiceFee    !== undefined ? extraServiceFee    : ex.extra_service_fee)
+      .input('overtime_fee',       sql.Float,    overtimeFee        !== undefined ? overtimeFee        : ex.overtime_fee)
       .input('lost_ticket_fee',    sql.Float,    lostTicketFee      !== undefined ? lostTicketFee      : ex.lost_ticket_fee)
       .input('discount',           sql.Float,    discount           !== undefined ? discount           : ex.discount)
       .input('ticket_code',        sql.NVarChar, ticketCode         !== undefined ? ticketCode         : ex.ticket_code)
       .query(`UPDATE dbo.payments
         SET status=@status, method=@method, paid_at=@paid_at,
             total_amount=@total_amount, parking_fee=@parking_fee,
-            extra_service_fee=@extra_service_fee, lost_ticket_fee=@lost_ticket_fee,
+            extra_service_fee=@extra_service_fee, overtime_fee=@overtime_fee,
+            lost_ticket_fee=@lost_ticket_fee,
             discount=@discount, ticket_code=@ticket_code
         WHERE payment_id=@id`);
 
@@ -2094,7 +2671,10 @@ app.get('/api/iot/rfid-events', (req, res) => {
 
 // Called by the Arduino/ESP32 firmware — body: { "rfidUid": "04A2B1C3",
 // "gateId": "A1", "direction": "entry" } (gateId/direction optional).
-app.post('/api/iot/rfid-tap', (req, res) => {
+// Now async: looks up the UID in dbo.vehicles and returns openBarrier=true
+// if the card is registered so the ESP32 knows whether to open the servo.
+app.post('/api/iot/rfid-tap', async (req, res) => {
+  lastEsp32SeenMs = Date.now();
   const { rfidUid, gateId, direction } = req.body || {};
   const uid = String(rfidUid || '').trim().toUpperCase();
   if (!uid) return res.status(400).json({ error: 'Thiếu rfidUid.' });
@@ -2104,9 +2684,107 @@ app.post('/api/iot/rfid-tap', (req, res) => {
     direction: direction === 'exit' ? 'exit' : 'entry',
     ts: Date.now(),
   };
+
+  // Đẩy sự kiện cho web NGAY LẬP TỨC — camera bắt đầu chụp song song trong lúc
+  // backend còn đang tra DB trả lời ESP32, không bắt web đợi thêm một lượt query.
   broadcastRfidTap(evt);
-  console.log(`IoT RFID tap: ${evt.rfidUid} (gate=${evt.gateId || '?'} dir=${evt.direction}) → ${iotRfidSseClients.size} client(s)`);
-  return res.json({ ok: true, received: evt, listeners: iotRfidSseClients.size });
+
+  // Check if this UID is registered → tell ESP32 whether to open the barrier.
+  // CHIỀU RA không bao giờ tự mở: xe phải qua bước staff xác nhận thu phí, lệnh
+  // mở rào sẽ tới qua hàng đợi gate-command sau khi thanh toán xong.
+  let openBarrier = false;
+  let vehicleInfo = null;
+  try {
+    const r = await pool.request()
+      .input('uid', sql.NVarChar, uid)
+      .query(`
+        SELECT v.license_plate, v.vehicle_type, u.full_name
+        FROM dbo.vehicles v
+        LEFT JOIN dbo.users u ON TRY_CAST(v.user_id AS INT) = u.user_id
+        WHERE v.rfid_uid = @uid
+      `);
+    if (r.recordset.length > 0) {
+      openBarrier = evt.direction === 'entry';
+      vehicleInfo = r.recordset[0];
+    }
+  } catch (err) {
+    console.error('IoT RFID lookup error:', err.message);
+  }
+
+  console.log(`IoT RFID tap: ${uid} → openBarrier=${openBarrier} (gate=${evt.gateId || '?'} dir=${evt.direction}) → ${iotRfidSseClients.size} client(s)`);
+  return res.json({
+    ok: true,
+    received: evt,
+    listeners: iotRfidSseClients.size,
+    openBarrier,
+    vehicle: vehicleInfo ? {
+      licensePlate: vehicleInfo.license_plate,
+      vehicleType: vehicleInfo.vehicle_type,
+      ownerName: vehicleInfo.full_name || '',
+    } : null,
+  });
+});
+
+// ─── IoT: Manual gate command queue (ESP32 polls, frontend pushes) ────────────
+// Staff bấm "Mở rào / Đóng rào" → POST đây → ESP32 poll GET và thực thi.
+const gateCommandQueue = new Map(); // gateId → 'open' | 'close'
+
+// ESP32 poll lệnh rào mỗi ~1s — mốc thời gian này cho biết thiết bị còn sống.
+// Badge "IoT: Trực tuyến" trên web chỉ bật khi ESP32 gọi về trong 10s gần nhất.
+let lastEsp32SeenMs = 0;
+
+app.post('/api/iot/gate-command', (req, res) => {
+  const { gateId, command } = req.body || {};
+  const gid = String(gateId || '').trim();
+  if (!gid || !['open', 'close'].includes(command)) {
+    return res.status(400).json({ error: 'Cần gateId và command (open | close).' });
+  }
+  gateCommandQueue.set(gid, command);
+  console.log(`IoT gate command queued: gate=${gid} cmd=${command}`);
+  return res.json({ ok: true, gateId: gid, command });
+});
+
+// ESP32 gọi endpoint này mỗi ~1 giây; lệnh bị xóa ngay sau khi đọc.
+app.get('/api/iot/gate-command/:gateId', (req, res) => {
+  lastEsp32SeenMs = Date.now();
+  const gateId = String(req.params.gateId || '').trim();
+  const command = gateCommandQueue.get(gateId) || null;
+  if (command) gateCommandQueue.delete(gateId);
+  return res.json({ command });
+});
+
+// HTTP polling source for iotService.ts (VITE_IOT_HTTP_URL).
+// Returns recent RFID scan rows formatted as ScanEvent so the frontend
+// IoT status badge shows "online" and scans appear in the live list.
+app.get('/api/iot/scan-events', async (req, res) => {
+  try {
+    const sinceMs = Number(req.query.since) || 0;
+    // Default window: last 30 seconds on the very first poll
+    const sinceDate = new Date(sinceMs > 0 ? sinceMs : Date.now() - 30000);
+    const r = await pool.request()
+      .input('since', sql.DateTime2, sinceDate)
+      .query(`
+        SELECT TOP 50
+          scan_id, rfid_uid, gate_id, direction, license_plate, status, created_at
+        FROM dbo.rfid_scans
+        WHERE created_at > @since
+        ORDER BY created_at DESC
+      `);
+    const events = r.recordset.map((row) => ({
+      id:           `RFID-${row.scan_id}`,
+      gateId:       row.gate_id      || 'A1',
+      direction:    row.direction    || 'entry',
+      licensePlate: row.license_plate || '',
+      rfidUid:      row.rfid_uid,
+      recognition:  row.license_plate ? 'casual' : 'unknown',
+      timestamp:    new Date(row.created_at).toISOString(),
+    }));
+    // esp32Online: thiết bị có gọi về (poll lệnh rào / quẹt thẻ) trong 10s qua
+    return res.json({ esp32Online: Date.now() - lastEsp32SeenMs < 10000, events });
+  } catch (err) {
+    console.error('GET /api/iot/scan-events', err);
+    return res.status(500).json({ esp32Online: false, events: [] });
+  }
 });
 
 /** Inserts a notification row for a user and pushes it out over SSE. */
@@ -2207,11 +2885,16 @@ app.get('/api/slots/events', (req, res) => {
   req.on('close', () => { clearInterval(heartbeat); sseClients.delete(res); });
 });
 
-app.get('/api/slots', async (_req, res) => {
+app.get('/api/slots', async (req, res) => {
   try {
-    const r = await pool.request().query(
-      `SELECT slot_code, floor, zone, vehicle_type, status FROM dbo.parking_slots ORDER BY slot_code`
-    );
+    // ?lot=ParkFlow Thủ Đức — lọc theo bãi (bỏ trống = tất cả các bãi)
+    const lotFilter = req.query.lot ? String(req.query.lot) : null;
+    const r = lotFilter
+      ? await pool.request().input('lot', sql.NVarChar, lotFilter).query(
+          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot
+           FROM dbo.parking_slots WHERE parking_lot = @lot ORDER BY slot_code`)
+      : await pool.request().query(
+          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot FROM dbo.parking_slots ORDER BY slot_code`);
     const vtMap = {
       'Xe máy / Xe máy điện':    'motorbike',
       'Ô tô 4-7 chỗ (Xăng)':    'car',
@@ -2220,14 +2903,25 @@ app.get('/api/slots', async (_req, res) => {
       'Ô tô':   'car',       'car':       'car',
       'Xe đạp': 'electric vehicle', 'electric vehicle': 'electric vehicle', 'bicycle': 'electric vehicle',
     };
-    const floorLabel = (f) => f < 0 ? `Tầng hầm B${Math.abs(f)}` : `Tầng ${f}`;
+    // Toàn bộ bãi hiện chỉ vận hành trên 1 tầng duy nhất — luôn hiển thị
+    // "Tầng 1" bất kể giá trị floor thô trong DB (giữ nguyên số floor gốc
+    // để không ảnh hưởng logic khác, chỉ chuẩn hóa nhãn hiển thị).
+    const floorLabel = (_f) => 'Tầng 1';
+    // Seed data ghi status chữ thường ("available") còn API PATCH ghi chuẩn
+    // ("Available") — chuẩn hóa một chỗ ở đây để sơ đồ bãi của mọi role
+    // (user đặt chỗ / staff / manager) nhận cùng một bộ giá trị.
+    const canonStatus = {
+      available: 'Available', occupied: 'Occupied', reserved: 'Reserved',
+      pending: 'Pending', maintenance: 'Maintenance', locked: 'Locked',
+    };
     return res.json(r.recordset.map((s) => ({
       id: `SL-${s.slot_code.replace(/^F1-/, '')}`,
       slotCode: s.slot_code,
       floorName: floorLabel(s.floor),
       areaName: `Khu ${s.zone} — ${s.vehicle_type}`,
       vehicleType: vtMap[s.vehicle_type] ?? 'car',
-      status: s.status,
+      status: canonStatus[String(s.status || '').toLowerCase()] || 'Available',
+      parkingLot: s.parking_lot || 'ParkFlow Quận 9',
       nearestGate: 'Cổng chính',
     })));
   } catch (err) {
@@ -2347,6 +3041,113 @@ app.post('/api/slots/:slotCode/force-clear', async (req, res) => {
   }
 });
 
+// Staff/Manager: di chuyển xe đang đỗ từ ô hiện tại sang một ô Trống khác —
+// dùng khi cần sắp xếp lại bãi. Ô đích BẮT BUỘC cùng loại xe với ô hiện tại
+// (khoá chung trong câu UPDATE atomic bên dưới, không tin dữ liệu client gửi
+// lên) và phải đang "Available", tránh đá xe khác đang đỗ hoặc gán nhầm loại.
+app.post('/api/slots/:fromSlotCode/relocate', async (req, res) => {
+  const tx = new sql.Transaction(pool);
+  try {
+    const fromSlotCode = decodeURIComponent(req.params.fromSlotCode);
+    const { toSlotCode, actorId } = req.body;
+    if (!toSlotCode) return res.status(400).json({ error: 'Thiếu ô đỗ đích.' });
+    if (fromSlotCode === toSlotCode) return res.status(400).json({ error: 'Ô đích phải khác ô hiện tại.' });
+
+    const actor = await loadActor(actorId);
+    if (!actor) return res.status(403).json({ error: 'Không xác định được người thực hiện thao tác.' });
+    if (!['staff', 'manager', 'admin'].includes(actor.role))
+      return res.status(403).json({ error: 'Bạn không có quyền chuyển ô đỗ.' });
+
+    await tx.begin();
+
+    const fromReq = new sql.Request(tx);
+    const fromResult = await fromReq.input('slot_code', sql.NVarChar, fromSlotCode)
+      .query(`SELECT status, vehicle_type FROM dbo.parking_slots WHERE slot_code = @slot_code`);
+    if (!fromResult.recordset.length) {
+      await tx.rollback();
+      return res.status(404).json({ error: 'Không tìm thấy ô đỗ hiện tại.' });
+    }
+    const fromSlot = fromResult.recordset[0];
+    if (fromSlot.status !== 'Occupied') {
+      await tx.rollback();
+      return res.status(409).json({ error: 'Ô hiện tại không có xe đang đỗ.' });
+    }
+
+    // Chiếm ô đích một cách atomic — chỉ khớp khi còn Trống VÀ đúng loại xe
+    // với ô nguồn; UPDLOCK+READPAST tránh hai yêu cầu chuyển ô cùng lúc giành
+    // trùng một ô đích.
+    const toReq = new sql.Request(tx);
+    toReq.input('vehicle_type', sql.NVarChar, fromSlot.vehicle_type);
+    toReq.input('to_slot_code', sql.NVarChar, toSlotCode);
+    const toPicked = await toReq.query(`
+      UPDATE dbo.parking_slots
+      SET status = 'Occupied'
+      OUTPUT inserted.slot_code, inserted.floor, inserted.zone
+      WHERE slot_id = (
+        SELECT TOP 1 slot_id FROM dbo.parking_slots WITH (UPDLOCK, ROWLOCK, READPAST)
+        WHERE slot_code = @to_slot_code AND status = 'Available' AND vehicle_type = @vehicle_type
+      )
+    `);
+    if (!toPicked.recordset.length) {
+      await tx.rollback();
+      return res.status(409).json({ error: 'Ô đích không còn trống hoặc không đúng loại xe với xe đang đỗ.' });
+    }
+    const toSlot = toPicked.recordset[0];
+
+    const freeReq = new sql.Request(tx);
+    await freeReq.input('slot_code', sql.NVarChar, fromSlotCode)
+      .query(`UPDATE dbo.parking_slots SET status = 'Available' WHERE slot_code = @slot_code`);
+
+    // Cập nhật CẢ hai nguồn nếu có — một lượt check-in từ đặt chỗ trước có cả
+    // dbo.parking_sessions lẫn dbo.reservations cùng trỏ về ô cũ, phải đồng bộ
+    // cả hai để "Xe đang đỗ trong bãi" (mọi nơi, kể cả phía user) khớp nhau.
+    const sessReq = new sql.Request(tx);
+    const sessUpd = await sessReq
+      .input('from_slot', sql.NVarChar, fromSlotCode)
+      .input('to_slot', sql.NVarChar, toSlot.slot_code)
+      .input('floor', sql.NVarChar, String(toSlot.floor))
+      .input('area', sql.NVarChar, toSlot.zone)
+      .query(`
+        UPDATE dbo.parking_sessions
+        SET slot_code = @to_slot, floor = @floor, area = @area
+        OUTPUT inserted.session_id
+        WHERE slot_code = @from_slot AND session_status = 'Active'
+      `);
+
+    const resvReq = new sql.Request(tx);
+    const resvUpd = await resvReq
+      .input('from_slot', sql.NVarChar, fromSlotCode)
+      .input('to_slot', sql.NVarChar, toSlot.slot_code)
+      .input('floor', sql.NVarChar, String(toSlot.floor))
+      .input('area', sql.NVarChar, toSlot.zone)
+      .query(`
+        UPDATE dbo.reservations
+        SET slot_code = @to_slot, floor = @floor, area = @area
+        OUTPUT inserted.reservation_id
+        WHERE slot_code = @from_slot AND status = 'Checked-in'
+      `);
+
+    if (!sessUpd.recordset.length && !resvUpd.recordset.length) {
+      await tx.rollback();
+      return res.status(404).json({ error: 'Không tìm thấy xe đang đỗ tại ô này.' });
+    }
+
+    await tx.commit();
+    broadcastSlotUpdate(fromSlotCode, 'Available');
+    broadcastSlotUpdate(toSlot.slot_code, 'Occupied');
+    return res.json({
+      fromSlotCode,
+      toSlotCode: toSlot.slot_code,
+      floor: String(toSlot.floor),
+      area: toSlot.zone,
+    });
+  } catch (err) {
+    await tx.rollback().catch(() => {});
+    console.error('POST /api/slots/:fromSlotCode/relocate', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi chuyển ô đỗ.' });
+  }
+});
+
 app.get('/api/force-clear-logs', async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
@@ -2361,9 +3162,7 @@ app.get('/api/force-clear-logs', async (req, res) => {
       performedByName: row.performed_by_name || '',
       performedByRole: row.performed_by_role || '',
       reason: row.reason || '',
-      createdAt: row.created_at
-        ? new Date(row.created_at).toISOString().replace('T', ' ').slice(0, 16)
-        : '',
+      createdAt: row.created_at ? toVnStr(new Date(row.created_at)) : '',
     })));
   } catch (err) {
     console.error('GET /api/force-clear-logs', err);
@@ -2406,9 +3205,7 @@ app.get('/api/issues', async (_req, res) => {
       description: row.description,
       imageUrl: row.image_url || '',
       reportedBy: row.reported_by,
-      reportedAt: row.reported_at
-        ? new Date(row.reported_at).toISOString().replace('T', ' ').slice(0, 16)
-        : '',
+      reportedAt: row.reported_at ? toVnStr(new Date(row.reported_at)) : '',
       status: row.status,
     })));
   } catch (err) {
@@ -2440,9 +3237,7 @@ app.post('/api/issues', async (req, res) => {
       description: description || '',
       imageUrl: imageUrl || '',
       reportedBy: reportedBy || '',
-      reportedAt: row.reported_at
-        ? new Date(row.reported_at).toISOString().replace('T', ' ').slice(0, 16)
-        : '',
+      reportedAt: row.reported_at ? toVnStr(new Date(row.reported_at)) : '',
       status: 'Pending',
     };
     broadcastIssueEvent(issue);
@@ -2514,7 +3309,7 @@ function toPricingRuleDto(r) {
     overtimeRate30Min: r.overtime_rate_30min || 0,
     note: r.note || '',
     status: r.status || 'active',
-    updatedAt: r.updated_at ? new Date(r.updated_at).toISOString().replace('T', ' ').slice(0, 16) : '',
+    updatedAt: r.updated_at ? toVnStr(new Date(r.updated_at)) : '',
   };
 }
 
@@ -2635,6 +3430,17 @@ app.post('/api/vnpay/create-payment', (req, res) => {
     const origin = req.headers.origin || req.headers.referer?.split('/api')[0] || VNPAY_CONFIG.frontendUrl;
     const frontendUrl = origin.startsWith('http') ? origin.replace(/\/$/, '') : VNPAY_CONFIG.frontendUrl;
     pendingFrontendUrls.set(String(paymentId), frontendUrl);
+
+    // vnp_ReturnUrl phải là địa chỉ mà TRÌNH DUYỆT CỦA KHÁCH với tới được sau
+    // khi VNPay redirect — không thể hardcode "localhost" vì trên máy khác
+    // "localhost" trỏ về chính máy đó, không phải máy chạy backend này.
+    // KHÔNG dùng req.headers.host: Vite dev proxy (changeOrigin: true) ghi đè
+    // Host thành target nội bộ (127.0.0.1:4000) trước khi tới đây. Dùng thẳng
+    // frontendUrl vừa dò ở trên (từ Origin/Referer, không bị proxy đổi) — vì
+    // frontend luôn gọi API qua đường dẫn tương đối "/api/..." nên VNPay quay
+    // về "<frontendUrl>/api/vnpay/return" cũng sẽ được chính proxy đó chuyển
+    // tiếp đúng vào backend, dùng được từ bất kỳ máy nào truy cập frontend.
+    const returnUrl = `${frontendUrl}/api/vnpay/return`;
     // Tự xóa sau 30 phút để tránh memory leak
     setTimeout(() => pendingFrontendUrls.delete(String(paymentId)), 30 * 60 * 1000);
 
@@ -2655,7 +3461,7 @@ app.post('/api/vnpay/create-payment', (req, res) => {
       vnp_OrderInfo: orderInfo || `Thanh toan phi giu xe ${paymentId}`,
       vnp_OrderType: 'other',
       vnp_Amount:    String(Math.round(Number(amount)) * 100),
-      vnp_ReturnUrl: VNPAY_CONFIG.returnUrl,
+      vnp_ReturnUrl: returnUrl,
       vnp_IpAddr:    ipAddr,
       vnp_CreateDate: createDate,
     };
@@ -2695,7 +3501,7 @@ app.get('/api/vnpay/return', async (req, res) => {
 
     if (secureHash === signed) {
       if (responseCode === '00') {
-        const paidAt = new Date().toISOString().replace('T', ' ').slice(0, 16);
+        const paidAt = nowStr();
         await pool.request()
           .input('code',    sql.NVarChar, paymentId)
           .input('amount',  sql.Float,    amount)
@@ -2748,7 +3554,7 @@ app.get('/api/vnpay/ipn', async (req, res) => {
     }
 
     if (responseCode === '00') {
-      const paidAt = new Date().toISOString().replace('T', ' ').slice(0, 16);
+      const paidAt = nowStr();
       await pool.request()
         .input('code',    sql.NVarChar, paymentId)
         .input('amount',  sql.Float,    amount)
@@ -2797,16 +3603,34 @@ async function autoCancelOverdueReservations() {
 
     if (now - arrival < CHECKIN_GRACE_HOURS * 60 * 60 * 1000) continue;
 
+    // Không có cơ chế hoàn tiền trong hệ thống — nếu khách đã thanh toán
+    // trước mà không tới, số tiền đó bị mất. Kiểm tra trước khi hủy để báo
+    // rõ cho khách, thay vì im lặng giữ tiền mà không giải thích.
+    const payQ = await pool.request()
+      .input('code', sql.NVarChar, String(row.reservation_code))
+      .query(`SELECT TOP 1 payment_id FROM dbo.payments
+              WHERE status = 'Paid' AND (reservation_code = @code OR ticket_code = @code)`);
+    const wasPaid = payQ.recordset.length > 0;
+
     // Re-check status in the UPDATE itself so a check-in racing this sweep wins.
     const upd = await pool.request()
       .input('id', sql.Int, row.reservation_id)
       .input('note', sql.NVarChar,
-        `${row.note ? row.note + ' · ' : ''}Tự động hủy: không check-in trong ${CHECKIN_GRACE_HOURS} giờ sau giờ đến dự kiến`)
+        `${row.note ? row.note + ' · ' : ''}Tự động hủy: không check-in trong ${CHECKIN_GRACE_HOURS} giờ sau giờ đến dự kiến${wasPaid ? ' · Đã mất số tiền thanh toán trước (không hoàn tiền)' : ''}`)
       .query(`UPDATE dbo.reservations SET status='Expired', note=@note
               WHERE reservation_id=@id AND status IN ('Pending', 'Confirmed')`);
     if (!upd.rowsAffected[0]) continue;
 
-    console.log(`Auto-cancelled reservation ${row.reservation_code} (no check-in ${CHECKIN_GRACE_HOURS}h after ${dateOnly} ${timeOnly})`);
+    console.log(`Auto-cancelled reservation ${row.reservation_code} (no check-in ${CHECKIN_GRACE_HOURS}h after ${dateOnly} ${timeOnly}) paid=${wasPaid}`);
+
+    // Same as manual cancel: void any abandoned 'Unpaid' payment attempt tied
+    // to this no-show — it was never actually collected, so it shouldn't sit
+    // around looking like money still owed. Paid rows are untouched (forfeited).
+    await pool.request()
+      .input('code', sql.NVarChar, String(row.reservation_code))
+      .query(`UPDATE dbo.payments SET status='Failed'
+              WHERE status='Unpaid' AND (reservation_code=@code OR ticket_code=@code)`)
+      .catch((err) => console.error('void unpaid payments on auto-cancel', err));
 
     // Release the held slot so other customers can book it.
     if (row.slot_code) {
@@ -2820,26 +3644,30 @@ async function autoCancelOverdueReservations() {
     createNotification(
       row.user_id,
       'reservation_auto_cancelled',
-      'Đặt chỗ đã tự động hủy (quá giờ check-in)',
-      `${row.reservation_code} · quá ${CHECKIN_GRACE_HOURS} giờ sau giờ đến dự kiến ${dateOnly} ${timeOnly}`,
+      wasPaid ? 'Đặt chỗ đã tự động hủy — mất tiền đã thanh toán trước' : 'Đặt chỗ đã tự động hủy (quá giờ check-in)',
+      wasPaid
+        ? `${row.reservation_code} · quá ${CHECKIN_GRACE_HOURS} giờ sau giờ đến dự kiến ${dateOnly} ${timeOnly} · Số tiền đã thanh toán trước sẽ KHÔNG được hoàn lại.`
+        : `${row.reservation_code} · quá ${CHECKIN_GRACE_HOURS} giờ sau giờ đến dự kiến ${dateOnly} ${timeOnly}`,
       'reservations',
     ).catch((err) => console.error('createNotification(reservation_auto_cancelled)', err));
   }
 }
 
 // ─── overstay fee notification ───────────────────────────────────────────────
-// Vé Fixed-time còn trong bãi quá giờ:
-// - Gửi theo lượt: quá giờ từ SAU 24 GIỜ kể từ giờ đến; phụ phí = 40% giá lượt.
-// - Qua đêm:       quá giờ từ SAU 24:00 CỦA NGÀY HÔM SAU; phụ phí = 40% giá qua đêm.
-// Vé đã thanh toán chỉ còn phải thu phụ phí; chưa thanh toán thì thu giá vé +
-// phụ phí. Cột overstay_notified chặn thông báo lặp lại.
-const PER_VISIT_OVERSTAY_HOURS = 24;
-const PER_VISIT_OVERSTAY_RATE = 0.4;
+// Vé Fixed-time còn trong bãi qua 00:00 — khớp đúng mô hình tính tiền thực tế
+// của app (xem src/utils/reservationPricing.ts::realtimeParkingFee): mỗi lần
+// qua 00:00 (theo ngày dương lịch của giờ vào THẬT, không phải giờ đặt) tính
+// thêm 1 lần giá qua đêm. Gói "Qua đêm" đã trả trước cho đêm đầu tiên nên chỉ
+// tính thêm từ đêm thứ 2. Vé đã thanh toán chỉ còn phải thu phần qua đêm phát
+// sinh; chưa thanh toán thì thu giá vé + phần qua đêm. Cột overstay_notified
+// chặn thông báo lặp lại (chỉ báo 1 lần — số dư thực tế vẫn cập nhật live
+// trong app dù không có thông báo mới cho mỗi đêm tiếp theo).
+const ONE_DAY_MS_OVERSTAY = 24 * 60 * 60 * 1000;
 
 async function notifyPerVisitOverstays() {
   const candidates = await pool.request().query(`
     SELECT reservation_id, reservation_code, user_id, license_plate, vehicle_type,
-           date, start_time, end_time, estimated_cost
+           date, start_time, end_time, checked_in_at, estimated_cost
     FROM dbo.reservations
     WHERE status = 'Checked-in' AND reservation_type = 'Fixed-time'
       AND overstay_notified = 0`);
@@ -2850,28 +3678,29 @@ async function notifyPerVisitOverstays() {
     const timeOnly = String(row.start_time || '').slice(0, 5);
     const isOvernight = !String(row.end_time || '').trim();
 
-    let deadline;
-    if (isOvernight) {
-      // Qua đêm: ân hạn tới hết 24:00 của ngày hôm sau ngày đến (00:00 ngày +2)
-      const d = new Date(`${dateOnly}T00:00:00`);
-      if (Number.isNaN(d.getTime())) continue;
-      d.setDate(d.getDate() + 2);
-      deadline = d.getTime();
-    } else {
-      const arrival = new Date(`${dateOnly}T${timeOnly}:00`).getTime();
-      if (!Number.isFinite(arrival)) continue;
-      deadline = arrival + PER_VISIT_OVERSTAY_HOURS * 60 * 60 * 1000;
-    }
-    if (now <= deadline) continue;
+    // Ưu tiên mốc check-in THẬT (staff quẹt thẻ) — không phải khung giờ dự
+    // kiến lúc đặt, vốn có thể lệch xa giờ xe thực sự vào bãi.
+    const checkInStamp = String(row.checked_in_at || '').trim() || `${dateOnly} ${timeOnly}`;
+    const checkIn = new Date(checkInStamp.replace(' ', 'T'));
+    if (Number.isNaN(checkIn.getTime())) continue;
+
+    const checkInDayStart = new Date(checkIn.getFullYear(), checkIn.getMonth(), checkIn.getDate()).getTime();
+    const firstMidnight = checkInDayStart + ONE_DAY_MS_OVERSTAY;
+    if (now < firstMidnight) continue; // chưa qua đêm nào — chưa có gì để báo
+
+    const nightsCrossed = Math.floor((now - firstMidnight) / ONE_DAY_MS_OVERSTAY) + 1;
+    const extraNights = isOvernight ? Math.max(0, nightsCrossed - 1) : nightsCrossed;
+    if (extraNights <= 0) continue; // gói "Qua đêm" mới ở đêm đầu (đã trả trước) — chưa phát sinh thêm
 
     // Giá vé đã chốt lúc đặt (fallback: bảng giá theo gói — lượt hoặc qua đêm)
     const ruleQ = await pool.request()
       .input('key', sql.NVarChar, String(row.vehicle_type || ''))
       .query(`SELECT TOP 1 hourly_price, overnight_price FROM dbo.pricing_rules WHERE vehicle_key = @key`);
     const rule = ruleQ.recordset[0] || {};
-    const fallback = isOvernight ? rule.overnight_price : rule.hourly_price;
+    const overnightPrice = rule.overnight_price || 0;
+    const fallback = isOvernight ? overnightPrice : rule.hourly_price;
     const base = row.estimated_cost > 0 ? row.estimated_cost : (fallback || 0);
-    const surcharge = Math.round(base * PER_VISIT_OVERSTAY_RATE);
+    const surcharge = extraNights * overnightPrice;
 
     // Vé đã có giao dịch Paid chưa (reservation_code giữ nguyên qua check-in)?
     const payQ = await pool.request()
@@ -2888,16 +3717,16 @@ async function notifyPerVisitOverstays() {
     if (!upd.rowsAffected[0]) continue;
 
     const dueStr = `${Number(due).toLocaleString('vi-VN')}đ`;
-    console.log(`Overstay >24h: ${row.reservation_code} (${row.license_plate}) paid=${paid} → còn thu ${dueStr}`);
+    console.log(`Overstay (qua đêm): ${row.reservation_code} (${row.license_plate}) paid=${paid} → còn thu ${dueStr}`);
 
     if (String(row.user_id).toUpperCase() !== 'GUEST') {
       createNotification(
         row.user_id,
         'overstay_fee',
-        'Xe gửi quá giờ — đã tính phụ phí quá giờ',
+        'Xe đã qua đêm — đã tính phí qua đêm',
         paid
-          ? `${row.reservation_code} · ${row.license_plate} · còn thu ${dueStr} (phụ phí ${PER_VISIT_OVERSTAY_RATE * 100}% giá vé — giá vé đã thanh toán)`
-          : `${row.reservation_code} · ${row.license_plate} · còn thu ${dueStr} (giá vé + phụ phí ${PER_VISIT_OVERSTAY_RATE * 100}%)`,
+          ? `${row.reservation_code} · ${row.license_plate} · còn thu ${dueStr} (phí qua đêm — giá vé đã thanh toán)`
+          : `${row.reservation_code} · ${row.license_plate} · còn thu ${dueStr} (giá vé + phí qua đêm)`,
         'reservations',
       ).catch((err) => console.error('createNotification(overstay_fee)', err));
     }

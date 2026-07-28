@@ -17,19 +17,19 @@ const guides = [
     icon: Ticket,
     title: 'Đặt chỗ gửi xe như thế nào?',
     content:
-      'Vào mục "Đặt chỗ" trên thanh điều hướng, chọn loại xe và gói giá phù hợp (theo giờ, qua đêm hoặc theo tháng), chọn ô đỗ còn trống trên sơ đồ bãi rồi bấm "Xác nhận đặt chỗ". Bạn có thể xem lại và quản lý các đặt chỗ trong mục "Đặt chỗ của tôi".',
+      'Vào mục "Đặt chỗ" trên thanh điều hướng, chọn loại xe và gói giá phù hợp (theo giờ, qua đêm hoặc theo tháng), chọn ô đỗ còn trống trên sơ đồ bãi rồi bấm "Xác nhận đặt chỗ". Bạn có thể xem lại và quản lý các đặt chỗ trong mục "Lịch sử đặt chỗ".',
   },
   {
     icon: Car,
     title: 'Check-in và check-out khi vào/ra bãi ra sao?',
     content:
-      'Khi đến bãi, nhân viên sẽ quét biển số hoặc thẻ RFID để ghi nhận xe vào. Bạn cũng có thể tự bấm "Check-in" trong mục "Đặt chỗ của tôi" nếu đã đặt chỗ trước. Khi ra bãi, hệ thống tự tính phí tạm thời — nếu đã thanh toán trước, barie sẽ mở tự động ngay khi thanh toán thành công.',
+      'Khi đến bãi, nhân viên hoặc hệ thống sẽ quét biển số hoặc thẻ RFID để ghi nhận xe vào — bạn không cần tự thao tác check-in. Khi ra bãi, hệ thống tự tính phí tạm thời — nếu đã thanh toán trước, barie sẽ mở tự động ngay khi thanh toán thành công.',
   },
   {
     icon: CreditCard,
     title: 'Thanh toán và hoàn tiền hoạt động thế nào?',
     content:
-      'ParkFlow sử dụng cổng thanh toán VNPay để xử lý mọi giao dịch an toàn. Bạn có thể thanh toán ngay khi đặt chỗ hoặc thanh toán khi xe ra khỏi bãi trong mục "Thanh toán". Với các trường hợp hủy hợp lệ (trước giờ bắt đầu ít nhất 15 phút và chưa thanh toán), khoản phí sẽ không bị tính.',
+      'ParkFlow sử dụng cổng thanh toán VNPay để xử lý mọi giao dịch an toàn. Bạn có thể thanh toán ngay khi đặt chỗ hoặc thanh toán khi xe ra khỏi bãi trong mục "Thanh toán". Với các trường hợp hủy hợp lệ (trong vòng 5 phút sau khi đặt chỗ và chưa thanh toán), khoản phí sẽ không bị tính. Sau 5 phút, vui lòng liên hệ nhân viên bãi đỗ để được hỗ trợ hủy.',
   },
   {
     icon: KeyRound,

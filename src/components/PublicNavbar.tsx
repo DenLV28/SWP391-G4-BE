@@ -29,7 +29,7 @@ export default function PublicNavbar({
   notificationCount?: number;
   onClearNotifications?: () => void;
   bellNotifications?: BellNotification[];
-  /** Marks the clicked item as read and routes to its page (reservation → Đặt chỗ của tôi, feedback → Phản hồi). */
+  /** Marks the clicked item as read and routes to its page (reservation → Lịch sử đặt chỗ, feedback → Phản hồi). */
   onNotificationClick?: (n: BellNotification) => void;
 }) {
   const isDriverUser = user?.role === 'Parking User / Driver';

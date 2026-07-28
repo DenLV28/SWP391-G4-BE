@@ -6,6 +6,7 @@ import FormInput from '../../components/FormInput';
 import SectionTitle from '../../components/SectionTitle';
 import StatusBadge from '../../components/StatusBadge';
 import { Role, User, validateEmail, validatePhone, validateRequired } from '../../data/mockData';
+import { assignableRoles, canManageUserRole } from '../../services/authService';
 
 // The 3 real ParkFlow parking lots — staff can only be assigned to one of these.
 const PARKING_LOT_OPTIONS = ['ParkFlow Quận 9', 'ParkFlow Thủ Đức', 'ParkFlow Long Phước'];
@@ -17,6 +18,7 @@ export default function UserManagement({
   onDeleteUser,
   onToggleLockUser,
   activeAdminEmail,
+  viewerRole,
 }: {
   users: User[];
   onCreateUser: (u: any) => boolean | Promise<boolean>;
@@ -24,7 +26,14 @@ export default function UserManagement({
   onDeleteUser: (id: string) => void | Promise<void>;
   onToggleLockUser: (id: string) => void | Promise<void>;
   activeAdminEmail: string;
+  /** Role of the account currently viewing this page — governs which rows can be edited/locked/deleted vs. view-only. */
+  viewerRole: Role;
 }) {
+  const editableRoles = assignableRoles(viewerRole);
+  // Always allow editing your own row (profile-style edits) even if your role
+  // wouldn't normally manage accounts of your own role bucket (e.g. an Admin
+  // viewing their own Admin row) — Lock/Delete still separately refuse "self".
+  const canManage = (u: User) => u.email === activeAdminEmail || canManageUserRole(viewerRole, u.role);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState('All');
   const [statusFilter, setStatusFilter] = useState('All');
@@ -231,35 +240,43 @@ export default function UserManagement({
                         <button onClick={() => handleOpenView(u)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600" title="Xem chi tiết">
                           <Eye className="h-4 w-4" />
                         </button>
-                        <button onClick={() => handleOpenEdit(u)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-blue-50 hover:text-blue-600" title="Sửa người dùng">
-                          <Edit className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={() => {
-                            if (u.email === activeAdminEmail) {
-                              alert('Bạn không thể khóa tài khoản quản trị đang đăng nhập của chính mình.');
-                              return;
-                            }
-                            onToggleLockUser(u.id);
-                          }}
-                          className={`rounded-lg p-1.5 transition ${u.status === 'Locked' ? 'text-emerald-500 hover:bg-emerald-50' : 'text-amber-500 hover:bg-amber-50'}`}
-                          title={u.status === 'Locked' ? 'Mở khóa người dùng' : 'Khóa người dùng'}
-                        >
-                          {u.status === 'Locked' ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
-                        </button>
-                        <button
-                          onClick={() => {
-                            if (u.email === activeAdminEmail) {
-                              alert('Bạn không thể xóa tài khoản quản trị đang đăng nhập của chính mình.');
-                              return;
-                            }
-                            setDeleteConfirmId(u.id);
-                          }}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                          title="Xóa người dùng"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        {!canManage(u) ? (
+                          <span className="rounded-lg px-2 py-1 text-[10px] font-semibold uppercase text-slate-300" title="Bạn chỉ có quyền xem tài khoản này.">
+                            Chỉ xem
+                          </span>
+                        ) : (
+                          <>
+                            <button onClick={() => handleOpenEdit(u)} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-blue-50 hover:text-blue-600" title="Sửa người dùng">
+                              <Edit className="h-4 w-4" />
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (u.email === activeAdminEmail) {
+                                  alert('Bạn không thể tự khóa tài khoản đang đăng nhập của chính mình.');
+                                  return;
+                                }
+                                onToggleLockUser(u.id);
+                              }}
+                              className={`rounded-lg p-1.5 transition ${u.status === 'Locked' ? 'text-emerald-500 hover:bg-emerald-50' : 'text-amber-500 hover:bg-amber-50'}`}
+                              title={u.status === 'Locked' ? 'Mở khóa người dùng' : 'Khóa người dùng'}
+                            >
+                              {u.status === 'Locked' ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (u.email === activeAdminEmail) {
+                                  alert('Bạn không thể tự xóa tài khoản đang đăng nhập của chính mình.');
+                                  return;
+                                }
+                                setDeleteConfirmId(u.id);
+                              }}
+                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                              title="Xóa người dùng"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -309,11 +326,18 @@ export default function UserManagement({
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="mb-1 block text-xs font-bold uppercase text-slate-500">Vai trò</label>
-                <select value={role} onChange={(e) => setRole(e.target.value as Role)} className="w-full rounded-xl border border-slate-200 bg-white p-2.5 text-slate-800 outline-none">
-                  <option value="Parking User / Driver">Người dùng / tài xế</option>
-                  <option value="Parking Staff">Nhân viên</option>
-                  <option value="Parking Manager">Quản lý</option>
-                  <option value="System Administrator">Quản trị viên</option>
+                <select
+                  value={role}
+                  disabled={selectedUser.email === activeAdminEmail}
+                  onChange={(e) => setRole(e.target.value as Role)}
+                  className="w-full rounded-xl border border-slate-200 bg-white p-2.5 text-slate-800 outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {/* Always include the account's current role even if it falls outside what the
+                      viewer can newly assign (e.g. an Admin viewing their own Admin row, disabled
+                      above) — otherwise the browser silently falls back to showing another option. */}
+                  {(editableRoles.includes(selectedUser.role) ? editableRoles : [selectedUser.role, ...editableRoles]).map((r) => (
+                    <option key={r} value={r}>{roleLabel(r)}</option>
+                  ))}
                 </select>
               </div>
               <div>
@@ -371,10 +395,9 @@ export default function UserManagement({
               <div>
                 <label className="mb-1 block text-xs font-bold uppercase text-slate-500">Vai trò hệ thống</label>
                 <select value={role} onChange={(e) => setRole(e.target.value as Role)} className="w-full rounded-xl border border-slate-200 bg-white p-2.5 text-slate-800 outline-none">
-                  <option value="Parking User / Driver">Người dùng / tài xế</option>
-                  <option value="Parking Staff">Nhân viên</option>
-                  <option value="Parking Manager">Quản lý</option>
-                  <option value="System Administrator">Quản trị viên</option>
+                  {editableRoles.map((r) => (
+                    <option key={r} value={r}>{roleLabel(r)}</option>
+                  ))}
                 </select>
               </div>
               <div>

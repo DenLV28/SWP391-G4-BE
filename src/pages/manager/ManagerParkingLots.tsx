@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { MapPin, Plus, LayoutGrid, List, X, Building2, Car, BarChart3, UserCog } from 'lucide-react';
 import { Floor, Area, Slot, User } from '../../data/mockData';
+import { sameLot } from '../../utils/parkingLots';
 // Same real lot photos the public "Bãi xe nổi bật" list uses (per-lot match)
 import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
 import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
@@ -25,6 +26,8 @@ interface ManagerParkingLotsProps {
   users?: User[];
   setView: (view: string) => void;
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
+  /** Bấm "Xem chi tiết" — báo cho ManagerDashboard biết bãi nào để trang chi tiết render đúng bãi. */
+  onViewDetail?: (lot: { name: string; address: string; status: string }) => void;
 }
 
 const INITIAL_LOTS: ParkingLot[] = [
@@ -71,7 +74,7 @@ const STATUS_DOT: Record<LotStatus, string> = {
 
 const EMPTY_FORM = { name: '', address: '', totalSlots: '', status: 'Hoạt động' as LotStatus };
 
-export default function ManagerParkingLots({ setView, users = [], onAssignStaff }: ManagerParkingLotsProps) {
+export default function ManagerParkingLots({ setView, users = [], slots = [], onAssignStaff, onViewDetail }: ManagerParkingLotsProps) {
   const [lots, setLots] = useState<ParkingLot[]>(INITIAL_LOTS);
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
   const [showAdd, setShowAdd] = useState(false);
@@ -90,17 +93,43 @@ export default function ManagerParkingLots({ setView, users = [], onAssignStaff 
 
   const staffUsers = users.filter((u) => u.role === 'Parking Staff');
 
+  /** Staff đang phụ trách một bãi (so khớp mọi biến thể tên bãi). */
+  const staffOfLot = (lotName: string) =>
+    staffUsers.find((u) => sameLot(u.assignedParkingLot, lotName));
+
+  // Quy tắc 1 bãi ↔ 1 nhân viên: gán người mới thì gỡ người cũ của bãi đó;
+  // chọn "— Chưa gán —" thì gỡ người đang phụ trách. users.assigned_parking_lot
+  // chỉ có 1 cột nên staff được gán bãi mới tự động rời bãi cũ.
   const handleAssignChange = async (lotName: string, userId: string) => {
-    if (!userId || !onAssignStaff) return;
+    if (!onAssignStaff) return;
     setAssigningLot(lotName);
-    await onAssignStaff(userId, lotName);
-    setAssigningLot(null);
+    try {
+      const current = staffOfLot(lotName);
+      if (current && current.id !== userId) {
+        await onAssignStaff(current.id, '');
+      }
+      if (userId && current?.id !== userId) {
+        await onAssignStaff(userId, lotName);
+      }
+    } finally {
+      setAssigningLot(null);
+    }
   };
 
-  const totalCapacity = lots.reduce((s, l) => s + l.totalSlots, 0);
+  /** Sức chứa/lấp đầy thật từ kho ô đỗ của bãi; bãi chưa có ô đỗ → dùng số tĩnh. */
+  const lotStats = (lot: ParkingLot) => {
+    const lotSlots = slots.filter((s) => sameLot(s.parkingLot, lot.name));
+    if (lotSlots.length === 0) return { totalSlots: lot.totalSlots, occupied: lot.occupied };
+    return {
+      totalSlots: lotSlots.length,
+      occupied: lotSlots.filter((s) => s.status === 'Occupied').length,
+    };
+  };
+
+  const totalCapacity = lots.reduce((s, l) => s + lotStats(l).totalSlots, 0);
   const activeLots = lots.filter((l) => l.status === 'Hoạt động');
   const activeOccupancy = activeLots.length > 0
-    ? Math.round((activeLots.reduce((s, l) => s + l.occupied, 0) / activeLots.reduce((s, l) => s + l.totalSlots, 0)) * 100)
+    ? Math.round((activeLots.reduce((s, l) => s + lotStats(l).occupied, 0) / Math.max(1, activeLots.reduce((s, l) => s + lotStats(l).totalSlots, 0))) * 100)
     : 0;
 
   const validate = () => {
@@ -201,7 +230,8 @@ export default function ManagerParkingLots({ setView, users = [], onAssignStaff 
       {/* Lot cards */}
       <div className={`space-y-4 ${viewMode === 'grid' ? 'grid grid-cols-1 md:grid-cols-2 gap-4 !space-y-0' : ''}`}>
         {lots.map((lot) => {
-          const pct = lot.totalSlots > 0 ? Math.round((lot.occupied / lot.totalSlots) * 100) : 0;
+          const { totalSlots, occupied } = lotStats(lot);
+          const pct = totalSlots > 0 ? Math.round((occupied / totalSlots) * 100) : 0;
           return (
             <div key={lot.id} className="flex overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-sm hover:shadow-md transition-shadow">
               {/* Lot image */}
@@ -233,7 +263,7 @@ export default function ManagerParkingLots({ setView, users = [], onAssignStaff 
                 <div className="mt-4">
                   <div className="mb-1.5 flex items-center justify-between text-xs">
                     <span className="text-slate-500">
-                      Tình trạng: {lot.occupied.toLocaleString('vi-VN')}/{lot.totalSlots.toLocaleString('vi-VN')}
+                      Tình trạng: {occupied.toLocaleString('vi-VN')}/{totalSlots.toLocaleString('vi-VN')}
                     </span>
                     <span className="font-bold text-blue-600">{pct}%</span>
                   </div>
@@ -250,7 +280,7 @@ export default function ManagerParkingLots({ setView, users = [], onAssignStaff 
                   <UserCog className="h-4 w-4 shrink-0 text-slate-400" />
                   <span className="shrink-0 text-xs text-slate-500">Nhân viên phụ trách:</span>
                   <select
-                    value={staffUsers.find((u) => u.assignedParkingLot === lot.name)?.id ?? ''}
+                    value={staffOfLot(lot.name)?.id ?? ''}
                     onChange={(e) => handleAssignChange(lot.name, e.target.value)}
                     disabled={assigningLot === lot.name}
                     className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-300 disabled:opacity-50"
@@ -274,7 +304,10 @@ export default function ManagerParkingLots({ setView, users = [], onAssignStaff 
                     Chỉnh sửa
                   </button>
                   <button
-                    onClick={() => setView('parkinglotdetail')}
+                    onClick={() => {
+                      onViewDetail?.({ name: lot.name, address: lot.address, status: lot.status });
+                      setView('parkinglotdetail');
+                    }}
                     className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-bold text-white hover:bg-blue-700 transition"
                   >
                     Xem chi tiết

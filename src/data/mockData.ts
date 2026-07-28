@@ -101,6 +101,8 @@ export type Slot = {
   slotCode: string;
   vehicleType: VehicleKey;
   status: 'Available' | 'Occupied' | 'Reserved' | 'Pending' | 'Maintenance' | 'Locked';
+  /** Bãi đỗ sở hữu ô này (mỗi bãi có kho ô riêng); rỗng = bãi gốc Quận 9. */
+  parkingLot?: string;
   nearestGate?: string;
 };
 
@@ -143,6 +145,12 @@ export type Reservation = {
   /** Which ParkFlow lot the driver booked (one of the /baixe lots), e.g. "ParkFlow Quận 9 - Lò Lu". */
   parkingLot?: string;
   createdAt?: string;
+  // Dòng thời gian trạng thái — mốc giờ THẬT của từng lần chuyển (không suy ra
+  // từ createdAt), hiển thị trong hóa đơn "Xem chi tiết" phía driver.
+  confirmedAt?: string;
+  checkedInAt?: string;
+  completedAt?: string;
+  cancelledAt?: string;
 };
 
 export type Payment = {

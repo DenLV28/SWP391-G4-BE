@@ -26,6 +26,33 @@ export async function updateSlotStatus(slotCode: string, status: SlotStatusValue
   } catch {}
 }
 
+export type RelocateResult =
+  | { ok: true; fromSlotCode: string; toSlotCode: string; floor: string; area: string }
+  | { ok: false; error: string };
+
+/** Staff/Manager-only: move a parked vehicle from its current slot to a different Available slot of the SAME vehicle type. */
+export async function relocateSlot(fromSlotCode: string, toSlotCode: string, actorId: string): Promise<RelocateResult> {
+  try {
+    const res = await fetch(buildApiUrl(`/api/slots/${encodeURIComponent(fromSlotCode)}/relocate`), {
+      method: 'POST',
+      headers: h(),
+      body: JSON.stringify({ toSlotCode, actorId }),
+    });
+    const body: { error?: string; fromSlotCode?: string; toSlotCode?: string; floor?: string; area?: string } =
+      await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: body.error || 'Không thể chuyển ô đỗ.' };
+    return {
+      ok: true,
+      fromSlotCode: body.fromSlotCode || fromSlotCode,
+      toSlotCode: body.toSlotCode || toSlotCode,
+      floor: body.floor || '',
+      area: body.area || '',
+    };
+  } catch {
+    return { ok: false, error: 'Không kết nối được tới máy chủ.' };
+  }
+}
+
 export type ForceClearResult =
   | { ok: true; sessionClosed: boolean; ticketCode: string; licensePlate: string }
   | { ok: false; error: string };

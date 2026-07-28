@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { User, validateEmail, validateLicensePlate, validatePhone, validateRequired } from '../../data/mockData';
 import FormInput from '../../components/FormInput';
 import authService from '../../services/authService';
+import { localDateISO } from '../../utils/helpers';
 
 export default function Register({ onRegister, setView, users }: {
   onRegister: (newUser: User, plateNumber: string, vehicleType: string, brand: string, model: string) => void;
@@ -77,7 +78,7 @@ export default function Register({ onRegister, setView, users }: {
         phone: response.user.phone,
         role: response.user.role as any,
         status: response.user.status as any,
-        createdAt: response.user.createdAt || new Date().toISOString().split('T')[0],
+        createdAt: response.user.createdAt || localDateISO(),
         password,
       };
 
@@ -101,7 +102,7 @@ export default function Register({ onRegister, setView, users }: {
         phone: phone.trim(),
         role: 'Parking User / Driver',
         status: 'Active',
-        createdAt: new Date().toISOString().split('T')[0],
+        createdAt: localDateISO(),
         password,
       };
 

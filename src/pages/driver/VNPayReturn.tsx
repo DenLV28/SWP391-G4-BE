@@ -10,16 +10,37 @@ export type VNPayCheckoutContext = {
   amount: number;
 };
 
+/** Đặt chỗ theo tháng chờ tạo — lưu tạm lúc chuyển sang VNPay, chỉ trở thành
+ *  đặt chỗ thật trong DB sau khi thanh toán thành công (xem App.tsx). */
+export type PendingMonthlyBooking = {
+  reservationCode: string;
+  reservationType: 'Fixed-time' | 'Flexible';
+  slotAssignmentMode: 'Auto';
+  vehicleType: string;
+  licensePlate: string;
+  date: string;
+  startTime: string;
+  endTime?: string;
+  floor: string;
+  area: string;
+  note: string;
+  estimatedCost: number;
+  parkingLot: string;
+};
+
 interface VNPayReturnProps {
   onPaymentSuccess: (paymentId: string, ctx: VNPayCheckoutContext | null) => void;
+  /** Gói tháng: thanh toán vừa thành công → tạo đặt chỗ thật ngay bây giờ. */
+  onMonthlyBookingPaid?: (paymentId: string, booking: PendingMonthlyBooking) => void;
   setView: (view: string) => void;
 }
 
-export default function VNPayReturn({ onPaymentSuccess, setView }: VNPayReturnProps) {
+export default function VNPayReturn({ onPaymentSuccess, onMonthlyBookingPaid, setView }: VNPayReturnProps) {
   const [status, setStatus] = useState<ReturnStatus>(null);
   const [paymentId, setPaymentId] = useState('');
   const [amount, setAmount] = useState(0);
   const [isSessionCheckout, setIsSessionCheckout] = useState(false);
+  const [isMonthlyBooking, setIsMonthlyBooking] = useState(false);
   const successCalled = useRef(false);
 
   useEffect(() => {
@@ -43,7 +64,23 @@ export default function VNPayReturn({ onPaymentSuccess, setView }: VNPayReturnPr
         if (raw) { ctx = JSON.parse(raw) as VNPayCheckoutContext; localStorage.removeItem('pf_vnpay_ctx'); }
       } catch { /* ignore */ }
       setIsSessionCheckout(!!ctx?.sessionId);
-      onPaymentSuccess(pid, ctx);
+
+      let pendingMonthly: { paymentId: string; booking: PendingMonthlyBooking } | null = null;
+      try {
+        const raw = localStorage.getItem('pf_pending_monthly_booking');
+        if (raw) {
+          const parsed = JSON.parse(raw) as { paymentId: string; booking: PendingMonthlyBooking };
+          if (parsed.paymentId === pid) pendingMonthly = parsed;
+          localStorage.removeItem('pf_pending_monthly_booking');
+        }
+      } catch { /* ignore */ }
+
+      if (pendingMonthly) {
+        setIsMonthlyBooking(true);
+        onMonthlyBookingPaid?.(pid, pendingMonthly.booking);
+      } else {
+        onPaymentSuccess(pid, ctx);
+      }
     }
   }, []);
 
@@ -52,9 +89,11 @@ export default function VNPayReturn({ onPaymentSuccess, setView }: VNPayReturnPr
     setView('payments');
   };
 
+  // Trang "Lượt gửi hiện tại" của user đã chuyển thành "Theo dõi bãi xe" phía
+  // staff — sau thanh toán, đưa khách về lịch sử thanh toán.
   const goToSession = () => {
-    window.location.hash = '#/session';
-    setView('session');
+    window.location.hash = '#/payments';
+    setView('payments');
   };
 
   return (
@@ -78,7 +117,9 @@ export default function VNPayReturn({ onPaymentSuccess, setView }: VNPayReturnPr
               )}
             </div>
             <p className="text-xs text-slate-400">
-              Giao dịch VNPay hoàn tất. Lượt gửi xe đã <strong>kết thúc</strong>, ô đỗ đã <strong>được giải phóng</strong> và barie đã mở. Bạn có thể xem lịch sử trong mục Thanh toán.
+              {isMonthlyBooking
+                ? 'Giao dịch VNPay hoàn tất. Đặt chỗ gửi xe theo tháng của bạn đã được tạo — xem chi tiết trong mục Đặt chỗ.'
+                : (<>Giao dịch VNPay hoàn tất. Lượt gửi xe đã <strong>kết thúc</strong>, ô đỗ đã <strong>được giải phóng</strong> và barie đã mở. Bạn có thể xem lịch sử trong mục Thanh toán.</>)}
             </p>
           </>
         )}
@@ -116,13 +157,21 @@ export default function VNPayReturn({ onPaymentSuccess, setView }: VNPayReturnPr
           </>
         )}
 
-        {status === 'success' && isSessionCheckout ? (
+        {status === 'success' && isMonthlyBooking ? (
+          <button
+            onClick={() => { window.location.hash = '#/reservations'; setView('reservations'); }}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-3 font-bold text-white transition hover:bg-blue-500"
+          >
+            <ParkingSquare className="h-4 w-4" />
+            Xem đặt chỗ của tôi
+          </button>
+        ) : status === 'success' && isSessionCheckout ? (
           <button
             onClick={goToSession}
             className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-3 font-bold text-white transition hover:bg-blue-500"
           >
             <ParkingSquare className="h-4 w-4" />
-            Chuyển đến trang lượt gửi hiện tại
+            Xem lịch sử thanh toán
           </button>
         ) : (
           <button

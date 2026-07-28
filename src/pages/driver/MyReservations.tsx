@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowRight,
   CalendarClock,
-  CheckCircle,
   ChevronRight,
   FileText,
   History,
@@ -28,28 +27,30 @@ import ConfirmModal from '../../components/ConfirmModal';
 import parkingHeroImage from '../../assets/images/parkflow_bg_1779336618673.png';
 import QRCode from 'react-qr-code';
 // isReservationPaid: file này đã có sẵn hàm cục bộ cùng logic (dùng cho getPaymentStatusMeta)
-import { perVisitOverstay, overstayDue } from '../../utils/reservationPricing';
+import { perVisitOverstay, overstayDue, minutesSinceCreated, SELF_CANCEL_WINDOW_MINUTES, synthesizeWalkInReservations } from '../../utils/reservationPricing';
 
 export default function MyReservations({
   reservations,
+  activeSessions = [],
   payments = [],
   onAddReservation: _onAddReservation,
   onCancelReservation,
   floors: _floors,
-  areas,
+  areas: _areas,
   slots,
-  driverStatus,
+  driverStatus: _driverStatus,
   savedVehicles,
   systemConfig: _systemConfig,
-  onCheckInReservation,
   onExpireReservation,
   onClearHistory,
-  setView,
+  setView: _setView,
   currentUser,
   currentSession,
   pricingRules = [],
 }: {
   reservations: Reservation[];
+  /** Phiên gửi xe đang hoạt động của tài khoản — bổ sung xe vãng lai (không đặt chỗ trước) vào danh sách. */
+  activeSessions?: ParkingSession[];
   payments?: Payment[];
   onAddReservation: (reservation: any) => void;
   onCancelReservation: (id: string) => void;
@@ -59,7 +60,6 @@ export default function MyReservations({
   driverStatus: string;
   savedVehicles: SavedVehicle[];
   systemConfig: SystemConfig;
-  onCheckInReservation: (reservationId: string) => { success: boolean; ticketCode?: string; slotCode?: string; error?: string };
   onExpireReservation: (id: string) => void;
   onClearHistory?: (ids: string[]) => void;
   setView: (view: string) => void;
@@ -74,7 +74,6 @@ export default function MyReservations({
   const [confirmClearHistory, setConfirmClearHistory] = useState(false);
   const [detailReservation, setDetailReservation] = useState<Reservation | null>(null);
   const [invoiceReservation, setInvoiceReservation] = useState<Reservation | null>(null);
-  const [checkInSuccessData, setCheckInSuccessData] = useState<{ ticketCode: string; slotCode: string; floor: string; area: string } | null>(null);
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -82,8 +81,17 @@ export default function MyReservations({
     return () => clearInterval(id);
   }, []);
 
+  // Xe vãng lai đang đỗ (không qua đặt chỗ trước) — không có bản ghi
+  // reservation nào nên tự thân sẽ không bao giờ xuất hiện ở "Lịch sử đỗ xe"
+  // trừ khi được bổ sung thủ công vào đây (giả lập thành Reservation trạng
+  // thái "Checked-in" để tái dùng nguyên UI danh sách bên dưới).
+  const allReservations = useMemo(
+    () => [...reservations, ...synthesizeWalkInReservations(reservations, activeSessions)],
+    [reservations, activeSessions],
+  );
+
   const reservationStats = useMemo(() => {
-    return reservations.reduce(
+    return allReservations.reduce(
       (acc, reservation) => {
         acc.total += 1;
         if (reservation.status === 'Confirmed') acc.confirmed += 1;
@@ -94,15 +102,15 @@ export default function MyReservations({
       },
       { total: 0, confirmed: 0, pending: 0, completed: 0, checkedIn: 0 },
     );
-  }, [reservations]);
+  }, [allReservations]);
 
   const sortedReservations = useMemo(() => {
-    return [...reservations].sort((a, b) => {
+    return [...allReservations].sort((a, b) => {
       const first = new Date(`${b.date}T${b.startTime}:00`).getTime();
       const second = new Date(`${a.date}T${a.startTime}:00`).getTime();
       return first - second;
     });
-  }, [reservations]);
+  }, [allReservations]);
 
   const filteredReservations = useMemo(() => {
     return sortedReservations.filter((reservation) => {
@@ -125,49 +133,11 @@ export default function MyReservations({
       alert('Bạn không thể hủy đặt chỗ này vì đã thanh toán. Vui lòng liên hệ bộ phận CSKH để được hỗ trợ.');
       return;
     }
-    const dateOnly = reservation.date.split('T')[0];
-    const timeOnly = reservation.startTime.slice(0, 5);
-    const startDate = new Date(`${dateOnly}T${timeOnly}:00`);
-    const diffMs = startDate.getTime() - Date.now();
-    if (diffMs > 0 && diffMs < 15 * 60 * 1000) {
-      alert('Chỉ có thể hủy đặt chỗ trước ít nhất 15 phút so với giờ bắt đầu.');
+    if (minutesSinceCreated(reservation) > SELF_CANCEL_WINDOW_MINUTES) {
+      alert(`Chỉ có thể tự hủy đặt chỗ trong vòng ${SELF_CANCEL_WINDOW_MINUTES} phút sau khi đặt. Vui lòng liên hệ nhân viên bãi đỗ để được hỗ trợ hủy.`);
       return;
     }
     setCancelConfirmId(reservation.id);
-  };
-
-  const handleSimulateCheckIn = (reservation: Reservation) => {
-    if (reservation.status !== 'Confirmed') {
-      alert(statusMessage(reservation.status));
-      return;
-    }
-    if (driverStatus !== 'Active') {
-      alert('Tài khoản hiện không hoạt động.');
-      return;
-    }
-
-    const areaRecord = areas.find((area) => area.areaName === reservation.area);
-    if (!areaRecord) {
-      alert('Khu vực đặt trước không còn hợp lệ hoặc không tồn tại.');
-      return;
-    }
-    if (areaRecord.vehicleType !== reservation.vehicleType) {
-      alert('Khu vực đã chọn không hỗ trợ loại xe này.');
-      return;
-    }
-
-    const result = onCheckInReservation(reservation.id);
-    if (result.success && result.ticketCode && result.slotCode) {
-      setCheckInSuccessData({
-        ticketCode: result.ticketCode,
-        slotCode: result.slotCode,
-        floor: reservation.floor,
-        area: reservation.area,
-      });
-      setDetailReservation(null);
-    } else {
-      alert(result.error || 'Không thể vào bãi.');
-    }
   };
 
   return (
@@ -460,54 +430,8 @@ export default function MyReservations({
           pricingRules={pricingRules}
           onClose={() => setDetailReservation(null)}
           onCancel={() => handleCancelClick(detailReservation)}
-          onCheckIn={() => handleSimulateCheckIn(detailReservation)}
           onExpire={() => onExpireReservation(detailReservation.id)}
-          onOpenSession={() => setView('session')}
         />
-      )}
-
-      {checkInSuccessData && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-sm space-y-4 rounded-3xl border border-slate-100 bg-white p-6 text-center shadow-2xl">
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-50 text-emerald-600">
-              <CheckCircle className="h-6 w-6" />
-            </div>
-            <div>
-              <h3 className="text-lg font-bold text-slate-800">Check-in thành công</h3>
-              <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                Mã vé gửi xe của bạn là <span className="font-mono font-bold text-blue-600">{checkInSuccessData.ticketCode}</span>.
-              </p>
-            </div>
-
-            <div className="space-y-2 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-left text-xs">
-              <DetailRow label="Tầng" value={checkInSuccessData.floor} />
-              <DetailRow label="Khu vực" value={trimAreaName(checkInSuccessData.area)} />
-              <DetailRow label="Ô đỗ" value={checkInSuccessData.slotCode} tone="blue" />
-            </div>
-
-            <p className="rounded-xl border border-amber-100 bg-amber-50 p-2.5 text-[11px] font-bold text-amber-600">
-              Vui lòng di chuyển ngay đến ô {checkInSuccessData.slotCode}.
-            </p>
-
-            <div className="flex gap-2">
-              <button
-                onClick={() => setCheckInSuccessData(null)}
-                className="w-1/2 cursor-pointer rounded-xl border border-slate-200 py-3 text-xs font-bold text-slate-700 transition hover:bg-slate-50"
-              >
-                Đóng
-              </button>
-              <button
-                onClick={() => {
-                  setCheckInSuccessData(null);
-                  setView('session');
-                }}
-                className="w-1/2 cursor-pointer rounded-xl bg-blue-600 py-3 text-xs font-bold text-white transition hover:bg-blue-500"
-              >
-                Xem lượt gửi
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );
@@ -524,13 +448,21 @@ function formatDateTimeLine(date: string, time: string) {
   return `${formatDate(date)} • ${time.slice(0, 5)}`;
 }
 
+/** "2026-07-22 10:25" (mốc giờ thật lưu ở backend) → "10:25 · 22/07/2026". */
+function formatTimelineStamp(value?: string) {
+  if (!value) return '';
+  const [datePart, timePart] = value.split(' ');
+  return `${(timePart || '').slice(0, 5)} · ${formatDate(datePart || value)}`;
+}
+
 /** Monthly subscription validity runs 1 calendar month from the booking date. */
 function addOneMonth(value: string) {
   const dateOnly = value.split('T')[0];
-  const d = new Date(dateOnly);
+  const d = new Date(`${dateOnly}T00:00:00`);
   if (isNaN(d.getTime())) return value;
   d.setMonth(d.getMonth() + 1);
-  return d.toISOString().split('T')[0];
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function formatCreatedAt(value: string) {
@@ -549,7 +481,38 @@ function trimAreaName(value: string) {
   return value.split(' - ')[1] || value;
 }
 
-function durationLabel(reservation: Reservation) {
+/** "2026-07-22 10:25" (mốc giờ thật lưu ở backend) → epoch ms, hoặc NaN. */
+function parseStamp(value?: string): number {
+  if (!value) return NaN;
+  return new Date(value.replace(' ', 'T')).getTime();
+}
+
+function toDurationHMS(totalSeconds: number) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+/**
+ * Thời lượng gửi xe:
+ * - Đang đỗ (Checked-in): tính THỜI GIAN THỰC từ lúc check-in tới `nowMs` — chạy
+ *   từng giây, không phải khung giờ dự kiến lúc đặt.
+ * - Đã xong (Completed): thời lượng THẬT từ check-in tới check-out (cố định).
+ * - Chưa vào bãi (Pending/Confirmed...): vẫn dùng khung giờ dự kiến để ước tính.
+ */
+function durationLabel(reservation: Reservation, nowMs?: number) {
+  const checkedIn = parseStamp(reservation.checkedInAt);
+  if (!Number.isNaN(checkedIn)) {
+    if (reservation.status === 'Checked-in' && nowMs != null) {
+      return toDurationHMS((nowMs - checkedIn) / 1000);
+    }
+    const completed = parseStamp(reservation.completedAt);
+    if (!Number.isNaN(completed)) {
+      return toDurationHMS((completed - checkedIn) / 1000);
+    }
+  }
   if (!reservation.endTime) return '01:00:00';
   const startMinutes = toMinutes(reservation.startTime);
   const endMinutes = toMinutes(reservation.endTime);
@@ -558,8 +521,8 @@ function durationLabel(reservation: Reservation) {
 }
 
 function estimateReservationCost(reservation: Reservation, rules: PricingRule[] = [], payments: Payment[] = []) {
-  // Quá 24 giờ (theo lượt / quá 1 đêm với vé qua đêm): đã thanh toán giá vé
-  // thì chỉ còn phụ phí 40%; chưa thanh toán thì giá vé + phụ phí 40%.
+  // Đã qua ít nhất 1 đêm (00:00) kể từ giờ vào: đã thanh toán thì chỉ còn phần
+  // qua đêm phát sinh; chưa thanh toán thì giá vé + phần qua đêm.
   const overstay = perVisitOverstay(reservation, rules);
   if (overstay.overstayed) return overstayDue(overstay, isReservationPaid(reservation, payments));
   // Use the price actually shown/agreed to at booking time (set in AvailableSlots.tsx's
@@ -603,9 +566,11 @@ function vehicleLabel(value: string) {
   }
 }
 
-/** Badge hiển thị: vé đã check-in nhưng đỗ quá 24 giờ được gắn "Quá giờ" thay cho "Đã vào bãi". */
+/** Badge hiển thị: vé đã check-in mà thật sự phát sinh thêm phí qua đêm được gắn "Quá giờ" thay cho "Đã vào bãi".
+ *  Dùng surcharge > 0 chứ không phải overstayed — vé "Qua đêm" luôn overstayed
+ *  ngay từ đêm đầu (đã trả trước, surcharge = 0) nên không tính là quá giờ. */
 function getDisplayStatusMeta(reservation: Reservation, rules: PricingRule[] = []) {
-  if (perVisitOverstay(reservation, rules).overstayed) {
+  if (perVisitOverstay(reservation, rules).surcharge > 0) {
     return { label: 'Quá giờ', className: 'bg-amber-100 text-amber-700' };
   }
   return getReservationStatusMeta(reservation.status);
@@ -645,28 +610,19 @@ function isReservationPaid(reservation: Reservation, payments: Payment[]): boole
 }
 
 function getPaymentStatusMeta(reservation: Reservation, payments: Payment[]) {
+  const wasPaid = isReservationPaid(reservation, payments);
   if (reservation.status === 'Cancelled' || reservation.status === 'Expired') {
-    return { label: '—', className: 'bg-slate-100 text-slate-400' };
+    // Không có cơ chế hoàn tiền trong hệ thống — xe đã trả tiền trước mà bị
+    // hủy/hết hạn (không tới) thì số tiền đó bị mất. Phải hiện rõ ra đây,
+    // không được để dấu "—" khiến khách tưởng nhầm là không mất gì.
+    return wasPaid
+      ? { label: 'Đã mất (không hoàn tiền)', className: 'bg-rose-50 text-rose-700' }
+      : { label: '—', className: 'bg-slate-100 text-slate-400' };
   }
-  if (isReservationPaid(reservation, payments)) {
+  if (wasPaid) {
     return { label: 'Đã thanh toán', className: 'bg-emerald-50 text-emerald-700' };
   }
   return { label: 'Chưa thanh toán', className: 'bg-amber-50 text-amber-700' };
-}
-
-function statusMessage(status: Reservation['status']) {
-  switch (status) {
-    case 'Cancelled':
-      return 'Đặt chỗ đã bị hủy.';
-    case 'Expired':
-      return 'Đặt chỗ đã hết hạn.';
-    case 'Checked-in':
-      return 'Đặt chỗ đã được ghi nhận vào bãi trước đó.';
-    case 'Completed':
-      return 'Đặt chỗ đã hoàn tất.';
-    default:
-      return `Trạng thái đặt chỗ hiện tại là ${status}.`;
-  }
 }
 
 function CompactInfo({
@@ -716,9 +672,21 @@ function ReservationInvoiceModal({
   onClose: () => void;
 }) {
   const statusMeta = getDisplayStatusMeta(reservation, pricingRules);
+  const resPaid = isReservationPaid(reservation, payments);
+
+  // Xe đang đỗ trong bãi (Checked-in) → tick mỗi giây để thời lượng VÀ phí quá
+  // giờ (perVisitOverstay/estimateReservationCost tự lấy Date.now() mới nhất
+  // mỗi lần render) chạy thời gian thực; xe đã ra hoặc chưa vào bãi thì đứng
+  // yên, khỏi tốn render vô ích.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (reservation.status !== 'Checked-in') return;
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [reservation.status]);
+
   const estimatedCost = estimateReservationCost(reservation, pricingRules, payments);
   const overstay = perVisitOverstay(reservation, pricingRules);
-  const resPaid = isReservationPaid(reservation, payments);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm" onClick={onClose}>
@@ -780,8 +748,15 @@ function ReservationInvoiceModal({
 
           <div className="rounded-xl border border-slate-100 divide-y divide-slate-50">
             <div className="flex items-center justify-between px-4 py-2.5">
-              <span className="text-xs text-slate-500">Thời lượng</span>
-              <span className="text-xs font-bold text-slate-700">{durationLabel(reservation)}</span>
+              <span className="text-xs text-slate-500">
+                Thời lượng
+                {reservation.status === 'Checked-in' && (
+                  <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] font-bold text-emerald-600">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> trực tiếp
+                  </span>
+                )}
+              </span>
+              <span className="text-xs font-bold text-slate-700 tabular-nums">{durationLabel(reservation, nowMs)}</span>
             </div>
             {overstay.overstayed && (
               <>
@@ -798,7 +773,7 @@ function ReservationInvoiceModal({
                 )}
                 <div className="flex items-center justify-between px-4 py-2.5 bg-amber-50/60">
                   <span className="text-xs text-amber-700">
-                    Phụ phí gửi quá giờ (+40% giá vé)
+                    Phí qua đêm
                   </span>
                   <span className="text-xs font-bold text-amber-700">{formatMoney(overstay.surcharge)}</span>
                 </div>
@@ -819,6 +794,36 @@ function ReservationInvoiceModal({
             </span>
           </div>
 
+          {/* Dòng thời gian — mốc giờ THẬT của từng lần chuyển trạng thái, đồng
+              bộ từ thao tác staff tại cổng (xác nhận/check-in/check-out). */}
+          <div className="rounded-xl border border-slate-100 p-3.5">
+            <p className="mb-2.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">Dòng thời gian</p>
+            <div className="space-y-2.5">
+              {[
+                { label: 'Đặt chỗ thành công', time: reservation.createdAt, done: true },
+                { label: 'Nhân viên xác nhận', time: reservation.confirmedAt, done: !!reservation.confirmedAt },
+                { label: 'Xe check-in vào bãi', time: reservation.checkedInAt, done: !!reservation.checkedInAt },
+                reservation.cancelledAt
+                  ? { label: 'Đã hủy', time: reservation.cancelledAt, done: true, danger: true }
+                  : { label: 'Xe check-out — hoàn tất', time: reservation.completedAt, done: !!reservation.completedAt },
+              ].map((step, i) => (
+                <div key={i} className="flex items-center gap-2.5">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      step.danger ? 'bg-rose-500' : step.done ? 'bg-emerald-500' : 'bg-slate-200'
+                    }`}
+                  />
+                  <span className={`flex-1 text-xs ${step.done ? 'font-semibold text-slate-700' : 'text-slate-400'}`}>
+                    {step.label}
+                  </span>
+                  <span className={`text-[11px] ${step.danger ? 'text-rose-600' : 'text-slate-400'}`}>
+                    {step.time ? formatTimelineStamp(step.time) : '—'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <button
             onClick={() => window.print()}
             className="w-full flex items-center justify-center gap-2 rounded-xl bg-slate-800 py-3 text-sm font-bold text-white hover:bg-slate-700 transition"
@@ -837,19 +842,16 @@ function ReservationDetailModal({
   pricingRules = [],
   onClose,
   onCancel,
-  onCheckIn,
   onExpire,
-  onOpenSession,
 }: {
   reservation: Reservation;
   pricingRules?: PricingRule[];
   onClose: () => void;
   onCancel: () => void;
-  onCheckIn: () => void;
   onExpire: () => void;
-  onOpenSession: () => void;
 }) {
   const statusMeta = getDisplayStatusMeta(reservation, pricingRules);
+  const canSelfCancel = minutesSinceCreated(reservation) <= SELF_CANCEL_WINDOW_MINUTES;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm">
@@ -905,19 +907,21 @@ function ReservationDetailModal({
           </div>
         )}
 
+        {(reservation.status === 'Confirmed' || reservation.status === 'Pending') && !canSelfCancel && (
+          <p className="rounded-xl bg-amber-50 px-3.5 py-2.5 text-xs leading-5 text-amber-700">
+            Đã quá {SELF_CANCEL_WINDOW_MINUTES} phút kể từ lúc đặt — bạn không thể tự hủy nữa. Vui lòng liên hệ nhân viên bãi đỗ để được hỗ trợ hủy.
+          </p>
+        )}
+
         <div className="flex flex-wrap gap-2 pt-1">
           {reservation.status === 'Confirmed' && (
             <>
-              <ActionButton tone="blue" onClick={onCheckIn}>Check-in</ActionButton>
-              <ActionButton tone="rose" onClick={onCancel}>Hủy đặt chỗ</ActionButton>
+              {canSelfCancel && <ActionButton tone="rose" onClick={onCancel}>Hủy đặt chỗ</ActionButton>}
               <ActionButton tone="slate" onClick={onExpire}>Đánh dấu hết hạn</ActionButton>
             </>
           )}
-          {reservation.status === 'Pending' && (
+          {reservation.status === 'Pending' && canSelfCancel && (
             <ActionButton tone="rose" onClick={onCancel}>Hủy đặt chỗ</ActionButton>
-          )}
-          {reservation.status === 'Checked-in' && (
-            <ActionButton tone="blue" onClick={onOpenSession}>Xem lượt gửi hiện tại</ActionButton>
           )}
         </div>
 
