@@ -38,7 +38,7 @@ const lots: Lot[] = [
       { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
-    priceFrom: '700.000đ',
+    priceFrom: '200.000đ',
     floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
   {
@@ -55,7 +55,7 @@ const lots: Lot[] = [
       { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
-    priceFrom: '850.000đ',
+    priceFrom: '200.000đ',
     floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
   {
@@ -74,7 +74,7 @@ const lots: Lot[] = [
       { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
     ],
-    priceFrom: '1.100.000đ',
+    priceFrom: '200.000đ',
     floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
   },
 ];

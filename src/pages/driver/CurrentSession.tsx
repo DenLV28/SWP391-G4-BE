@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, BadgeInfo, Car, CheckCircle, Clock, Lock, MapPin, Search, Ticket, Unlock, X } from 'lucide-react';
+import { BadgeInfo, Car, CheckCircle, Clock, Lock, MapPin, Search, Ticket, Unlock, X } from 'lucide-react';
 import { ParkingSession, PricingRule, Reservation, SavedVehicle, User, Slot, Payment } from '../../data/mockData';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
@@ -248,18 +248,6 @@ export default function CurrentSession({
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
-
-  // Overstay detection for prepaid reservations
-  const overstayInfo = useMemo(() => {
-    if (!activeSession || activeSession.paymentStatus !== 'Paid' || !activeSession.expectedEndTime) return null;
-    const expectedEnd = new Date(activeSession.expectedEndTime.replace(' ', 'T'));
-    if (Number.isNaN(expectedEnd.getTime())) return null;
-    const diffMins = Math.floor((nowMs - expectedEnd.getTime()) / 60_000);
-    if (diffMins <= 0) return null;
-    const periods = Math.ceil(diffMins / 30);
-    const fee = periods * (pricingRule?.overtimeRatePer30Minutes ?? 0);
-    return { diffMins, periods, fee, expectedEndDisplay: activeSession.expectedEndTime };
-  }, [activeSession, pricingRule, nowMs]);
 
   // Reset modal state when selected vehicle changes
   const prevIdxRef = useRef(selectedIdx);
@@ -732,38 +720,6 @@ export default function CurrentSession({
             </div>
           </div>
 
-          {/* Overstay notification banner */}
-          {overstayInfo && activeSession.sessionStatus === 'Active' && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
-              <div className="flex items-start gap-3">
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-600">
-                  <AlertTriangle className="h-5 w-5" />
-                </div>
-                <div className="flex-1">
-                  <p className="text-[13px] font-black text-amber-800">Quá giờ đặt chỗ!</p>
-                  <p className="mt-1 text-[12px] text-amber-700">
-                    Xe đã quá giờ dự kiến ra (<strong>{formatDateTime(overstayInfo.expectedEndDisplay)}</strong>) được{' '}
-                    <strong>{overstayInfo.diffMins} phút</strong>. Phí phát sinh sẽ được tính khi thanh toán.
-                  </p>
-                  <div className="mt-3 grid grid-cols-3 gap-2 text-center text-[11px]">
-                    <div className="rounded-xl bg-white border border-amber-200 px-2 py-2">
-                      <p className="text-[9px] font-bold uppercase tracking-wide text-amber-500">Quá giờ</p>
-                      <p className="mt-1 font-black text-amber-800">{overstayInfo.diffMins} phút</p>
-                    </div>
-                    <div className="rounded-xl bg-white border border-amber-200 px-2 py-2">
-                      <p className="text-[9px] font-bold uppercase tracking-wide text-amber-500">Số kỳ</p>
-                      <p className="mt-1 font-black text-amber-800">{overstayInfo.periods} × 30 phút</p>
-                    </div>
-                    <div className="rounded-xl bg-amber-600 px-2 py-2 text-white">
-                      <p className="text-[9px] font-bold uppercase tracking-wide text-amber-100">Phí phát sinh</p>
-                      <p className="mt-1 font-black">{formatMoney(overstayInfo.fee)}</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
           <div className="flex flex-wrap gap-2 pt-2">
             {activeSession.sessionStatus === 'Active' && (
               <>
@@ -868,52 +824,19 @@ export default function CurrentSession({
         <Modal
           onClose={() => setShowCheckoutModal(false)}
           title="Xe ra cổng"
-          subtitle={overstayInfo ? 'Có phí quá giờ — Thanh toán thêm để ra' : 'Đã thanh toán — Xác nhận mở barie'}
+          subtitle="Đã thanh toán — Xác nhận mở barie"
         >
-          {/* Overstay warning inside modal */}
-          {overstayInfo ? (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
-              <div className="flex items-center gap-2 text-amber-700">
-                <AlertTriangle className="h-4 w-4 shrink-0" />
-                <p className="text-xs font-black">Phát hiện quá giờ đặt trước!</p>
-              </div>
-              <div className="rounded-xl bg-white border border-amber-200 p-3 space-y-1.5 text-xs">
-                <div className="flex justify-between border-b border-slate-100 pb-1">
-                  <span className="text-slate-400">Giờ kết thúc dự kiến:</span>
-                  <span className="font-semibold text-slate-700">{formatDateTime(overstayInfo.expectedEndDisplay)}</span>
-                </div>
-                <div className="flex justify-between border-b border-slate-100 pb-1">
-                  <span className="text-slate-400">Quá giờ:</span>
-                  <span className="font-semibold text-amber-700">{overstayInfo.diffMins} phút ({overstayInfo.periods} kỳ × 30 phút)</span>
-                </div>
-                <div className="flex justify-between border-b border-slate-100 pb-1">
-                  <span className="text-slate-400">Đã thanh toán trước:</span>
-                  <span className="font-semibold text-emerald-700">
-                    {formatMoney(payments.find((p) => p.ticketCode === activeSession.ticketCode && p.status === 'Paid')?.totalAmount ?? 0)}
-                  </span>
-                </div>
-                <div className="flex justify-between pt-1">
-                  <span className="font-bold text-slate-900">Phí quá giờ phát sinh:</span>
-                  <span className="font-black text-rose-600 text-sm">{formatMoney(overstayInfo.fee)}</span>
-                </div>
-              </div>
-              <p className="text-[11px] text-amber-700">
-                Bạn cần thanh toán thêm <strong>{formatMoney(overstayInfo.fee)}</strong> phí quá giờ trước khi mở barie.
+          <div className="flex flex-col items-center gap-3 py-2 text-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+              <CheckCircle className="h-8 w-8 text-emerald-600" />
+            </div>
+            <div>
+              <p className="text-base font-bold text-slate-800">Đã thanh toán trước</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Không cần thanh toán thêm. Xác nhận để hệ thống ghi nhận xe ra và mở barie.
               </p>
             </div>
-          ) : (
-            <div className="flex flex-col items-center gap-3 py-2 text-center">
-              <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
-                <CheckCircle className="h-8 w-8 text-emerald-600" />
-              </div>
-              <div>
-                <p className="text-base font-bold text-slate-800">Đã thanh toán trước</p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Không cần thanh toán thêm. Xác nhận để hệ thống ghi nhận xe ra và mở barie.
-                </p>
-              </div>
-            </div>
-          )}
+          </div>
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 space-y-1.5 text-xs">
             {[
               { label: 'Mã vé', value: activeSession.ticketCode },
@@ -928,12 +851,10 @@ export default function CurrentSession({
               </div>
             ))}
           </div>
-          {!overstayInfo && (
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs font-semibold text-emerald-800 flex items-center gap-2">
-              <CheckCircle className="h-4 w-4 shrink-0 text-emerald-600" />
-              Phí đã được thanh toán đầy đủ. Barie sẽ mở ngay khi xác nhận.
-            </div>
-          )}
+          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs font-semibold text-emerald-800 flex items-center gap-2">
+            <CheckCircle className="h-4 w-4 shrink-0 text-emerald-600" />
+            Phí đã được thanh toán đầy đủ. Barie sẽ mở ngay khi xác nhận.
+          </div>
           <div className="flex gap-2 pt-1">
             <button
               type="button"
@@ -942,41 +863,24 @@ export default function CurrentSession({
             >
               Hủy
             </button>
-            {overstayInfo ? (
-              <button
-                type="button"
-                onClick={() => {
-                  const success = onCheckOutSession(activeSession.ticketCode, 'Cash', overstayInfo.fee);
-                  if (success) {
-                    setBarrierStatus('Opened');
-                    setTimeout(() => setShowCheckoutModal(false), 1000);
-                  }
-                }}
-                className="flex w-1/2 cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-amber-600 py-3 text-xs font-bold text-white transition hover:bg-amber-500"
-              >
-                <Unlock className="h-3.5 w-3.5" />
-                Trả phí & Mở barie →
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  const paidRecord = payments.find(
-                    (p) => p.ticketCode === activeSession.ticketCode && p.status === 'Paid',
-                  );
-                  const paidAmt = paidRecord?.totalAmount ?? checkoutFee;
-                  const success = onCheckOutSession(activeSession.ticketCode, 'QR Banking', paidAmt);
-                  if (success) {
-                    setBarrierStatus('Opened');
-                    setTimeout(() => setShowCheckoutModal(false), 1000);
-                  }
-                }}
-                className="flex w-1/2 cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-emerald-600 py-3 text-xs font-bold text-white transition hover:bg-emerald-500"
-              >
-                <Unlock className="h-3.5 w-3.5" />
-                Mở barie →
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                const paidRecord = payments.find(
+                  (p) => p.ticketCode === activeSession.ticketCode && p.status === 'Paid',
+                );
+                const paidAmt = paidRecord?.totalAmount ?? checkoutFee;
+                const success = onCheckOutSession(activeSession.ticketCode, 'QR Banking', paidAmt);
+                if (success) {
+                  setBarrierStatus('Opened');
+                  setTimeout(() => setShowCheckoutModal(false), 1000);
+                }
+              }}
+              className="flex w-1/2 cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-emerald-600 py-3 text-xs font-bold text-white transition hover:bg-emerald-500"
+            >
+              <Unlock className="h-3.5 w-3.5" />
+              Mở barie →
+            </button>
           </div>
         </Modal>
       )}

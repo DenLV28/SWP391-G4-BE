@@ -136,7 +136,7 @@ export function subscribeToRfidTaps(onTap: (e: RfidTapEvent) => void): () => voi
   return () => { cancelled = true; clearTimeout(retryTimer); };
 }
 
-/** Staff từ chối lượt quét → xóa hẳn bản ghi (kèm ảnh) khỏi DB. */
+/** Xóa hẳn bản ghi (kèm ảnh) khỏi DB — tác vụ dọn dữ liệu thủ công, không dùng cho luồng "Từ chối" ở Gate Control nữa (xem rejectRfidScan). */
 export async function deleteRfidScan(id: string | number): Promise<boolean> {
   try {
     const res = await fetch(buildApiUrl(`/api/rfid-scans/${encodeURIComponent(String(id))}`), {
@@ -149,6 +149,25 @@ export async function deleteRfidScan(id: string | number): Promise<boolean> {
   }
 }
 
+/**
+ * Staff từ chối lượt quét → đánh dấu status='Rejected' thay vì xóa hẳn, để bản
+ * ghi vẫn còn trên server và tính được vào "Cảnh báo" của đúng bãi trên MỌI
+ * máy (trước đây xóa hẳn nên số cảnh báo chỉ tồn tại cục bộ, mỗi máy một số).
+ */
+export async function rejectRfidScan(id: string | number): Promise<RfidScan | null> {
+  try {
+    const res = await fetch(buildApiUrl(`/api/rfid-scans/${encodeURIComponent(String(id))}`), {
+      method: 'PATCH',
+      headers: defaultHeaders(),
+      body: JSON.stringify({ status: 'Rejected' }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as RfidScan;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchRfidScans(limit = 20, rfidUid?: string): Promise<RfidScan[]> {
   try {
     const query = `limit=${limit}${rfidUid ? `&rfidUid=${encodeURIComponent(rfidUid)}` : ''}`;
@@ -158,5 +177,27 @@ export async function fetchRfidScans(limit = 20, rfidUid?: string): Promise<Rfid
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * Số lượt quét bị từ chối HÔM NAY của một bãi cụ thể — dùng để tính "Cảnh báo".
+ * Tính thẳng trên server (join rfid_scans ↔ users theo scanned_by_id) thay vì
+ * để frontend tự khớp qua danh sách `users` cục bộ: danh sách đó giữ lại ID
+ * "mock" cũ cho vài tài khoản demo, khác với ID thật currentUser.id dùng khi
+ * ghi rfid_scans, nên khớp phía client dễ sai lệch cho đúng nhóm hay dùng để
+ * test nhất — DB mới là nguồn đáng tin duy nhất ở đây.
+ */
+export async function fetchRejectedScanCount(lot: string, date?: string): Promise<number> {
+  try {
+    const query = `lot=${encodeURIComponent(lot)}${date ? `&date=${encodeURIComponent(date)}` : ''}`;
+    const res = await fetch(buildApiUrl(`/api/rfid-scans/rejected-count?${query}`), {
+      headers: defaultHeaders(),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return Number(data?.count) || 0;
+  } catch {
+    return 0;
   }
 }

@@ -1,13 +1,12 @@
-import { useState } from 'react';
-import { MapPin, Plus, LayoutGrid, List, X, Building2, Car, BarChart3, UserCog } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { MapPin, LayoutGrid, List, X, Building2, Car, BarChart3, UserCog } from 'lucide-react';
 import { Floor, Area, Slot, User } from '../../data/mockData';
-import { sameLot } from '../../utils/parkingLots';
+import { sameLot, findLotStatus } from '../../utils/parkingLots';
+import type { ParkingLotStatus, LotStatus } from '../../services/parkingLotService';
 // Same real lot photos the public "Bãi xe nổi bật" list uses (per-lot match)
 import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
 import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
 import baiXeLongPhuocImg from '../../assets/images/bai-xe-long-phuoc.jpg';
-
-type LotStatus = 'Hoạt động' | 'Bảo trì' | 'Đóng cửa';
 
 interface ParkingLot {
   id: string;
@@ -28,8 +27,13 @@ interface ManagerParkingLotsProps {
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
   /** Bấm "Xem chi tiết" — báo cho ManagerDashboard biết bãi nào để trang chi tiết render đúng bãi. */
   onViewDetail?: (lot: { name: string; address: string; status: string }) => void;
+  /** Trạng thái vận hành thật của từng bãi (nguồn: dbo.parking_lots qua App.tsx) — ghi đè status tĩnh bên dưới. */
+  lotStatuses?: ParkingLotStatus[];
+  onUpdateLotStatus?: (name: string, status: LotStatus) => Promise<boolean>;
 }
 
+// Tên/địa chỉ/ảnh/sức chứa tĩnh — chỉ "status" là đổi được, và status thật
+// nằm ở dbo.parking_lots (xem lotStatuses prop), không phải giá trị tĩnh dưới đây.
 const INITIAL_LOTS: ParkingLot[] = [
   {
     id: 'lot-1',
@@ -72,22 +76,35 @@ const STATUS_DOT: Record<LotStatus, string> = {
   'Đóng cửa':  'bg-red-500',
 };
 
-const EMPTY_FORM = { name: '', address: '', totalSlots: '', status: 'Hoạt động' as LotStatus };
-
-export default function ManagerParkingLots({ setView, users = [], slots = [], onAssignStaff, onViewDetail }: ManagerParkingLotsProps) {
-  const [lots, setLots] = useState<ParkingLot[]>(INITIAL_LOTS);
+export default function ManagerParkingLots({ setView, users = [], slots = [], onAssignStaff, onViewDetail, lotStatuses = [], onUpdateLotStatus }: ManagerParkingLotsProps) {
+  // Status thật lấy từ dbo.parking_lots (lotStatuses); còn lotStatuses chưa
+  // tải xong (mảng rỗng lúc mới mount) thì tạm dùng giá trị tĩnh bên trên.
+  const lots = useMemo(
+    () =>
+      INITIAL_LOTS.map((l) => {
+        const dbStatus = findLotStatus(lotStatuses, l.name);
+        return dbStatus ? { ...l, status: dbStatus.status } : l;
+      }),
+    [lotStatuses],
+  );
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-  const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState(EMPTY_FORM);
-  const [errors, setErrors] = useState<Partial<typeof EMPTY_FORM>>({});
   const [assigningLot, setAssigningLot] = useState<string | null>(null);
   // "Chỉnh sửa" — switch a lot between "Hoạt động" and "Bảo trì".
   const [editingLot, setEditingLot] = useState<ParkingLot | null>(null);
   const [editStatus, setEditStatus] = useState<LotStatus>('Hoạt động');
+  const [savingStatus, setSavingStatus] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
-  const handleSaveStatus = () => {
+  const handleSaveStatus = async () => {
     if (!editingLot) return;
-    setLots((prev) => prev.map((l) => (l.id === editingLot.id ? { ...l, status: editStatus } : l)));
+    setSavingStatus(true);
+    setSaveError('');
+    const ok = await onUpdateLotStatus?.(editingLot.name, editStatus);
+    setSavingStatus(false);
+    if (ok === false) {
+      setSaveError('Không thể lưu trạng thái. Vui lòng thử lại.');
+      return;
+    }
     setEditingLot(null);
   };
 
@@ -132,45 +149,12 @@ export default function ManagerParkingLots({ setView, users = [], slots = [], on
     ? Math.round((activeLots.reduce((s, l) => s + lotStats(l).occupied, 0) / Math.max(1, activeLots.reduce((s, l) => s + lotStats(l).totalSlots, 0))) * 100)
     : 0;
 
-  const validate = () => {
-    const e: Partial<typeof EMPTY_FORM> = {};
-    if (!form.name.trim()) e.name = 'Bắt buộc';
-    if (!form.address.trim()) e.address = 'Bắt buộc';
-    if (!form.totalSlots || Number(form.totalSlots) <= 0) e.totalSlots = 'Nhập số > 0';
-    setErrors(e);
-    return Object.keys(e).length === 0;
-  };
-
-  const handleAdd = () => {
-    if (!validate()) return;
-    const newLot: ParkingLot = {
-      id: `lot-${Date.now()}`,
-      name: form.name.trim(),
-      address: form.address.trim(),
-      status: form.status,
-      totalSlots: Number(form.totalSlots),
-      occupied: 0,
-      imageUrl: 'https://picsum.photos/seed/parknew/400/240',
-    };
-    setLots((prev) => [...prev, newLot]);
-    setShowAdd(false);
-    setForm(EMPTY_FORM);
-    setErrors({});
-  };
-
   return (
     <div className="min-h-screen bg-slate-50/60 p-6 space-y-6">
 
       {/* Header */}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-slate-900">Quản lý Bãi đỗ xe</h1>
-        <button
-          onClick={() => setShowAdd(true)}
-          className="flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-blue-700 transition"
-        >
-          <Plus className="h-4 w-4" />
-          Thêm bãi đỗ mới
-        </button>
       </div>
 
       {/* 3 stat cards */}
@@ -298,6 +282,7 @@ export default function ManagerParkingLots({ setView, users = [], slots = [], on
                     onClick={() => {
                       setEditingLot(lot);
                       setEditStatus(lot.status === 'Bảo trì' ? 'Bảo trì' : 'Hoạt động');
+                      setSaveError('');
                     }}
                     className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 transition"
                   >
@@ -369,83 +354,21 @@ export default function ManagerParkingLots({ setView, users = [], slots = [], on
                   );
                 })}
               </div>
+              {saveError && <p className="text-[11px] font-medium text-red-500">{saveError}</p>}
               <div className="flex gap-3 pt-2">
                 <button
                   onClick={() => setEditingLot(null)}
-                  className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition"
+                  disabled={savingStatus}
+                  className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition disabled:opacity-50"
                 >
                   Hủy
                 </button>
                 <button
                   onClick={handleSaveStatus}
-                  className="flex-1 rounded-xl bg-blue-600 py-2.5 text-sm font-bold text-white hover:bg-blue-700 transition"
+                  disabled={savingStatus}
+                  className="flex-1 rounded-xl bg-blue-600 py-2.5 text-sm font-bold text-white hover:bg-blue-700 transition disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Lưu thay đổi
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Add Modal */}
-      {showAdd && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-100 px-6 py-5">
-              <div>
-                <h2 className="text-lg font-bold text-slate-900">Thêm bãi đỗ xe mới</h2>
-                <p className="mt-0.5 text-sm text-slate-500">Điền thông tin để thêm bãi vào hệ thống</p>
-              </div>
-              <button
-                onClick={() => { setShowAdd(false); setForm(EMPTY_FORM); setErrors({}); }}
-                className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <div className="px-6 py-5 space-y-4">
-              {[
-                { key: 'name' as const, label: 'Tên bãi đỗ xe', placeholder: 'VD: ParkFlow Bình Thạnh', type: 'text' },
-                { key: 'address' as const, label: 'Địa chỉ', placeholder: 'VD: 2 Hải Triều, Quận 1, TP.HCM', type: 'text' },
-                { key: 'totalSlots' as const, label: 'Tổng số chỗ', placeholder: '500', type: 'number' },
-              ].map((f) => (
-                <div key={f.key}>
-                  <label className="mb-1 block text-xs font-semibold text-slate-600">{f.label}</label>
-                  <input
-                    type={f.type}
-                    placeholder={f.placeholder}
-                    value={form[f.key]}
-                    onChange={(e) => { setForm((prev) => ({ ...prev, [f.key]: e.target.value })); setErrors((prev) => ({ ...prev, [f.key]: '' })); }}
-                    className={`w-full rounded-xl border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 ${errors[f.key] ? 'border-red-300' : 'border-slate-200'}`}
-                  />
-                  {errors[f.key] && <p className="mt-1 text-[11px] text-red-500">{errors[f.key]}</p>}
-                </div>
-              ))}
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-600">Trạng thái</label>
-                <select
-                  value={form.status}
-                  onChange={(e) => setForm((prev) => ({ ...prev, status: e.target.value as LotStatus }))}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-                >
-                  <option value="Hoạt động">Hoạt động</option>
-                  <option value="Bảo trì">Bảo trì</option>
-                  <option value="Đóng cửa">Đóng cửa</option>
-                </select>
-              </div>
-              <div className="flex gap-3 pt-2">
-                <button
-                  onClick={() => { setShowAdd(false); setForm(EMPTY_FORM); setErrors({}); }}
-                  className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition"
-                >
-                  Hủy
-                </button>
-                <button
-                  onClick={handleAdd}
-                  className="flex-1 rounded-xl bg-blue-600 py-2.5 text-sm font-bold text-white hover:bg-blue-700 transition"
-                >
-                  Thêm bãi
+                  {savingStatus ? 'Đang lưu...' : 'Lưu thay đổi'}
                 </button>
               </div>
             </div>

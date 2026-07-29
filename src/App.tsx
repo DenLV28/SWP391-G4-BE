@@ -63,6 +63,7 @@ import {
 import {
   fetchVehiclesByUser,
   createVehicle,
+  updateVehicle as apiUpdateVehicle,
   setDefaultVehicle as apiSetDefaultVehicle,
 } from "./services/vehicleService";
 import {
@@ -115,6 +116,7 @@ import { fixMojibake, nowLocalStr, localDateISO } from "./utils/helpers";
 import { minutesSinceCreated, SELF_CANCEL_WINDOW_MINUTES, perVisitOverstay, buildCheckedInVehicles, isPaymentVoided, addOneMonth, findActiveMonthlyReservation } from "./utils/reservationPricing";
 import { fetchSlotStatuses, updateSlotStatus, subscribeToSlotEvents, forceClearSlot } from "./services/slotService";
 import { fetchPricingRules } from "./services/pricingService";
+import { fetchParkingLotStatuses, updateParkingLotStatus, type ParkingLotStatus } from "./services/parkingLotService";
 import { fetchIssues, apiCreateIssue, apiUpdateIssue, subscribeToIssueEvents } from "./services/issueService";
 import NetworkSettings from "./components/NetworkSettings";
 import { loadSlots, saveSlots, subscribeSlots } from "./services/slotStore";
@@ -129,6 +131,7 @@ import {
   Payment,
   Feedback,
   SavedVehicle,
+  VehicleKey,
   SystemConfig,
   AdminActivity,
   ParkingSession,
@@ -426,9 +429,16 @@ export default function App() {
       const dbRules = await fetchPricingRules();
       if (dbRules.length) setPricingRules(dbRules);
     };
+    // Same for lot status (Hoạt động/Bảo trì) — Manager flips a lot to
+    // maintenance, User/Staff see it within 30s without reloading.
+    const syncLotStatuses = async () => {
+      const dbLots = await fetchParkingLotStatuses();
+      if (dbLots.length) setLotStatuses(dbLots);
+    };
     sync();
     syncPricing();
-    const id = setInterval(() => { sync(); syncPricing(); }, 30000);
+    syncLotStatuses();
+    const id = setInterval(() => { sync(); syncPricing(); syncLotStatuses(); }, 30000);
     return () => clearInterval(id);
   }, []);
 
@@ -604,6 +614,10 @@ export default function App() {
   // it. Starts from the mock table so the UI has numbers before the fetch
   // resolves, then gets replaced with the real DB values.
   const [pricingRules, setPricingRules] = useState<PricingRule[]>(mockPricingRules);
+  // Trạng thái vận hành (Hoạt động/Bảo trì/Đóng cửa) của 3 bãi — nguồn chân lý
+  // duy nhất cho việc chặn đặt chỗ (user) và khóa thao tác (staff) khi bãi
+  // đang bảo trì. Trước đây chỉ là state cục bộ trong ManagerParkingLots.tsx.
+  const [lotStatuses, setLotStatuses] = useState<ParkingLotStatus[]>([]);
   const [systemConfig, setSystemConfig] =
     useState<SystemConfig>(initialSystemConfig);
   const [adminActivities, setAdminActivities] = useState<AdminActivity[]>(
@@ -1801,6 +1815,25 @@ export default function App() {
     return true;
   };
 
+  const handleUpdateVehicle = async (
+    vehicleId: string,
+    updates: { licensePlate: string; vehicleType: VehicleKey; brand: string; model: string },
+  ): Promise<{ ok: boolean; error?: string }> => {
+    // Optimistic update — reflect the edit immediately.
+    setSavedVehicles((prev) =>
+      prev.map((v) => (v.id === vehicleId ? { ...v, ...updates } : v)),
+    );
+    try {
+      const saved = await apiUpdateVehicle(vehicleId, updates);
+      setSavedVehicles((prev) => prev.map((v) => (v.id === vehicleId ? saved : v)));
+      return { ok: true };
+    } catch (err) {
+      // API unavailable — keep the optimistic local update instead of reverting,
+      // matching handleAddVehicle's offline-friendly behavior.
+      return { ok: true };
+    }
+  };
+
   const handleSetDefaultVehicle = (vehicleId: string) => {
     setSavedVehicles((prev) =>
       prev.map((v) =>
@@ -1812,6 +1845,21 @@ export default function App() {
     apiSetDefaultVehicle(vehicleId).catch(() => {
       // API unavailable — local state is already updated.
     });
+  };
+
+  const handleUpdateLotStatus = async (name: string, status: ParkingLotStatus['status']): Promise<boolean> => {
+    const previous = lotStatuses;
+    setLotStatuses((prev) => {
+      const idx = prev.findIndex((l) => l.name === name);
+      if (idx === -1) return [...prev, { name, status, updatedAt: '' }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], status };
+      return next;
+    });
+    const saved = await updateParkingLotStatus(name, status);
+    if (!saved) { setLotStatuses(previous); return false; }
+    setLotStatuses((prev) => prev.map((l) => (l.name === name ? saved : l)));
+    return true;
   };
 
   const handleSubmitFeedback = (newFb: any) => {
@@ -2336,6 +2384,7 @@ export default function App() {
                   onDiscardReservation={handleDiscardReservation}
                   reservations={reservations}
                   pricingRules={pricingRules}
+                  lotStatuses={lotStatuses}
                 />
               )}
               {currentView === "pricing" && (
@@ -2472,6 +2521,8 @@ export default function App() {
             addToast={addToast}
             onUpdateUser={handleUpdateProfile}
             onAssignStaff={handleAssignStaffToLot}
+            lotStatuses={lotStatuses}
+            onUpdateLotStatus={handleUpdateLotStatus}
           />
         </div>
       );
@@ -2494,6 +2545,7 @@ export default function App() {
             onCheckOutSession={handleCheckOutSession}
             onForceClearSlot={handleForceClearSlot}
             onSetSlotStatus={handleSetSlotStatus}
+            lotStatuses={lotStatuses}
             onConfirmReservation={(id) => {
               const res = reservations.find((r) => r.id === id);
               setReservations((prev) =>
@@ -2619,6 +2671,7 @@ export default function App() {
                   onDiscardReservation={handleDiscardReservation}
                   reservations={reservations}
                   pricingRules={pricingRules}
+                  lotStatuses={lotStatuses}
                 />
               )}
               {currentView === "pricing" && (
@@ -2845,6 +2898,7 @@ export default function App() {
                         savedVehicles={savedVehicles}
                         onUpdateUser={handleUpdateProfile}
                         onAddVehicle={handleAddVehicle}
+                        onUpdateVehicle={handleUpdateVehicle}
                         onSetDefaultVehicle={handleSetDefaultVehicle}
                       />
                     )}

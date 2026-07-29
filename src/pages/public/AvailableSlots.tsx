@@ -6,7 +6,8 @@ import VietQRModal from '../../components/VietQRModal';
 import ParkingFloorMap, { MapSlot } from '../../components/ParkingFloorMap';
 import { createVNPayPayment } from '../../services/vnpayService';
 import { createPayment } from '../../services/paymentService';
-import { PARKING_LOTS, lotKeyOrDefault } from '../../utils/parkingLots';
+import { PARKING_LOTS, lotKeyOrDefault, isLotUnavailable } from '../../utils/parkingLots';
+import type { ParkingLotStatus } from '../../services/parkingLotService';
 import { nowLocalStr } from '../../utils/helpers';
 import { addOneMonth, findActiveMonthlyReservation } from '../../utils/reservationPricing';
 
@@ -22,6 +23,7 @@ interface Props {
   onDiscardReservation?: (id: string) => void;
   reservations: Reservation[];
   pricingRules: PricingRule[];
+  lotStatuses?: ParkingLotStatus[];
 }
 
 type PackageKey = 'hour' | 'overnight' | 'month';
@@ -99,6 +101,7 @@ export default function AvailableSlots({
   onDiscardReservation,
   reservations,
   pricingRules,
+  lotStatuses = [],
 }: Props) {
   // Hủy từ modal thành công: ưu tiên xóa hẳn; thiếu prop thì rơi về hủy thường.
   const discardBooking = (id: string) => (onDiscardReservation ?? onCancelReservation)?.(id);
@@ -204,6 +207,12 @@ export default function AvailableSlots({
     [lotSlots, vehicleType],
   );
 
+  // Bãi đang Bảo trì/Đóng cửa → chỉ cho xem sơ đồ, chặn hẳn việc đặt chỗ.
+  const isLotUnderMaintenance = useMemo(
+    () => isLotUnavailable(lotStatuses, selectedLot),
+    [lotStatuses, selectedLot],
+  );
+
   const reservationMeta = useMemo(() => {
     if (packageKey === 'overnight')
       // Overnight/multi-day: arrival is user-chosen; no fixed end (car may stay several days).
@@ -244,6 +253,12 @@ export default function AvailableSlots({
     // rapid double-click (or double Enter-key) can't fire onAddReservation twice.
     if (isSubmittingBooking) return;
     if (!isLoggedIn) { setView('login'); return; }
+    // Bãi đang bảo trì — chặn TRƯỚC mọi kiểm tra khác, không chỉ dựa vào nút
+    // đã bị vô hiệu hoá (trạng thái có thể vừa đổi ngay trước khi bấm).
+    if (isLotUnderMaintenance) {
+      alert('Bãi đỗ này đang tạm ngưng nhận xe để bảo trì. Vui lòng chọn bãi khác hoặc quay lại sau.');
+      return;
+    }
     // Kiểm tra lại lúc bấm (không chỉ dựa vào nút đã bị vô hiệu hoá) — sơ đồ
     // cập nhật theo thời gian thực nên ô vừa chọn có thể vừa bị người khác
     // đặt mất ngay trước khi bấm; luôn báo rõ ràng thay vì lỗi chung chung.
@@ -429,7 +444,9 @@ export default function AvailableSlots({
                       className="w-full appearance-none rounded-xl border border-slate-300 bg-white px-4 py-3 pr-10 text-[15px] text-slate-800 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-600/10"
                     >
                       {LOT_OPTIONS.map((opt) => (
-                        <option key={opt}>{opt}</option>
+                        <option key={opt}>
+                          {isLotUnavailable(lotStatuses, opt) ? `${opt} (Đang bảo trì)` : opt}
+                        </option>
                       ))}
                     </select>
                     <svg className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -652,7 +669,14 @@ export default function AvailableSlots({
                 )}
 
                 {/* Selected slot indicator */}
-                {isLotFull ? (
+                {isLotUnderMaintenance ? (
+                  <div className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-[13px] text-rose-700">
+                    <Triangle className="h-4 w-4 shrink-0" />
+                    <span>
+                      <strong>Bãi đang tạm ngưng để bảo trì</strong> — chưa thể đặt chỗ, vui lòng chọn bãi khác hoặc quay lại sau.
+                    </span>
+                  </div>
+                ) : isLotFull ? (
                   <div className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-[13px] text-rose-700">
                     <Triangle className="h-4 w-4 shrink-0" />
                     <span>
@@ -677,11 +701,13 @@ export default function AvailableSlots({
                 <button
                   type={isLoggedIn ? 'submit' : 'button'}
                   onClick={() => { if (!isLoggedIn) setView('login'); }}
-                  disabled={isLoggedIn && (isLotFull || !isSlotExplicitlySelected || isSubmittingBooking)}
+                  disabled={isLoggedIn && (isLotUnderMaintenance || isLotFull || !isSlotExplicitlySelected || isSubmittingBooking)}
                   className="flex h-14 w-full items-center justify-center gap-3 rounded-xl bg-blue-600 text-[15px] font-bold text-white shadow-[0_8px_20px_rgba(37,99,235,0.25)] transition hover:bg-blue-700 mt-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
                 >
                   {!isLoggedIn
                     ? 'Đăng nhập để đặt chỗ'
+                    : isLotUnderMaintenance
+                    ? 'Bãi đang bảo trì'
                     : isLotFull
                     ? 'Bãi đã hết chỗ'
                     : isSubmittingBooking

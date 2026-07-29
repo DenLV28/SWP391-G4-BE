@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Edit2, Trash2, Plus, X } from 'lucide-react';
+import { Edit2, Trash2, X } from 'lucide-react';
 import { buildApiUrl } from '../../services/apiConfig';
 
 interface VehiclePrice {
@@ -8,13 +8,15 @@ interface VehiclePrice {
   vehicleKey: string;
   icon: string;
   description: string;
-  prices: { hourly: number; nextHour: number; overnight: number; monthly: number };
+  prices: { hourly: number; overnight: number; monthly: number };
   lostTicketFee: number;
   extraServiceFee: number;
-  overtimeRate30Min: number;
   note: string;
   status: 'active' | 'inactive';
 }
+
+/** Giá tối thiểu cho mọi mức giá/phụ phí — chặn nhập nhầm 0 hay vài trăm đồng. */
+const MIN_PRICE = 1000;
 
 // Backend returns the nested { prices: {...} } shape (see toPricingRuleDto in
 // server.js) — this used to be misread as flat dto.hourlyPrice, which was always
@@ -28,13 +30,11 @@ function dtoToVehiclePrice(dto: Record<string, any>): VehiclePrice {
     description: dto.description ?? '',
     prices: {
       hourly: dto.prices?.hourly ?? 0,
-      nextHour: dto.prices?.nextHour ?? 0,
       overnight: dto.prices?.overnight ?? 0,
       monthly: dto.prices?.monthly ?? 0,
     },
     lostTicketFee: dto.lostTicketFee ?? 0,
     extraServiceFee: dto.extraServiceFee ?? 0,
-    overtimeRate30Min: dto.overtimeRate30Min ?? 0,
     note: dto.note ?? '',
     status: dto.status ?? 'active',
   };
@@ -50,13 +50,11 @@ function vehiclePriceToBody(v: VehiclePrice) {
     description: v.description,
     prices: {
       hourly: v.prices.hourly,
-      nextHour: v.prices.nextHour,
       overnight: v.prices.overnight,
       monthly: v.prices.monthly,
     },
     lostTicketFee: v.lostTicketFee,
     extraServiceFee: v.extraServiceFee,
-    overtimeRate30Min: v.overtimeRate30Min,
     note: v.note,
     status: v.status,
   };
@@ -77,6 +75,7 @@ export default function ManagerPricingVehicles({
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
   const [formData, setFormData] = useState<VehiclePrice | null>(null);
+  const [formError, setFormError] = useState('');
   const [page, setPage] = useState(1);
 
   const totalPages = Math.ceil(vehicles.length / PAGE_SIZE);
@@ -93,16 +92,7 @@ export default function ManagerPricingVehicles({
       .finally(() => setLoading(false));
   }, []);
 
-  const openEdit = (v: VehiclePrice) => { setFormData({ ...v }); setShowModal(true); };
-  const openAdd = () => {
-    setFormData({
-      id: '', name: '', vehicleKey: '', icon: '🚗', description: '',
-      prices: { hourly: 0, nextHour: 0, overnight: 0, monthly: 0 },
-      lostTicketFee: 0, extraServiceFee: 0, overtimeRate30Min: 0, note: '',
-      status: 'active',
-    });
-    setShowModal(true);
-  };
+  const openEdit = (v: VehiclePrice) => { setFormData({ ...v }); setFormError(''); setShowModal(true); };
 
   const handleDelete = async (id: string) => {
     try {
@@ -134,26 +124,27 @@ export default function ManagerPricingVehicles({
 
   const handleSave = async () => {
     if (!formData?.name) return;
-    const isEdit = vehicles.some((v) => v.id === formData.id);
+    const priceValues = [
+      formData.prices.hourly,
+      formData.prices.overnight,
+      formData.prices.monthly,
+      formData.lostTicketFee,
+      formData.extraServiceFee,
+    ];
+    if (priceValues.some((v) => v <= MIN_PRICE)) {
+      setFormError(`Mọi mức giá/phụ phí phải lớn hơn ${MIN_PRICE.toLocaleString('vi-VN')}đ.`);
+      return;
+    }
+    setFormError('');
     try {
-      if (isEdit) {
-        const res = await fetch(buildApiUrl(`/api/pricing-rules/${formData.id}`), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': '1' },
-          body: JSON.stringify(vehiclePriceToBody(formData)),
-        });
-        const data = await res.json();
-        const updated = dtoToVehiclePrice(data);
-        setVehicles((vs) => vs.map((v) => v.id === updated.id ? updated : v));
-      } else {
-        const res = await fetch(buildApiUrl('/api/pricing-rules'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': '1' },
-          body: JSON.stringify(vehiclePriceToBody(formData)),
-        });
-        const data = await res.json();
-        setVehicles((vs) => [...vs, dtoToVehiclePrice(data)]);
-      }
+      const res = await fetch(buildApiUrl(`/api/pricing-rules/${formData.id}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': '1' },
+        body: JSON.stringify(vehiclePriceToBody(formData)),
+      });
+      const data = await res.json();
+      const updated = dtoToVehiclePrice(data);
+      setVehicles((vs) => vs.map((v) => v.id === updated.id ? updated : v));
     } catch (err) {
       console.error(err);
     }
@@ -167,13 +158,6 @@ export default function ManagerPricingVehicles({
       {/* Page header */}
       <div className="flex items-end justify-between">
         <h1 className="text-2xl font-bold text-slate-900">Bảng giá &amp; Loại xe</h1>
-        <button
-          onClick={openAdd}
-          className="flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-blue-700 transition"
-        >
-          <Plus className="h-4 w-4" />
-          Thêm loại xe mới
-        </button>
       </div>
 
       {/* Table card */}
@@ -294,9 +278,7 @@ export default function ManagerPricingVehicles({
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6">
             <div className="flex items-center justify-between mb-5">
-              <h2 className="text-lg font-bold text-slate-900">
-                {vehicles.find((v) => v.id === formData.id) ? 'Chỉnh sửa loại xe' : 'Thêm loại xe mới'}
-              </h2>
+              <h2 className="text-lg font-bold text-slate-900">Chỉnh sửa loại xe</h2>
               <button
                 onClick={() => { setShowModal(false); setFormData(null); }}
                 className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400"
@@ -328,11 +310,10 @@ export default function ManagerPricingVehicles({
 
               <div className="border-t border-slate-100 pt-4">
                 <p className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Bảng giá</p>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-3 gap-3">
                   {(
                     [
-                      { label: 'Giá giờ đầu / lượt (VNĐ)', key: 'hourly' },
-                      { label: 'Giá giờ tiếp theo (VNĐ)',  key: 'nextHour' },
+                      { label: 'Giá theo lượt (VNĐ)',      key: 'hourly' },
                       { label: 'Giá qua đêm (VNĐ)',        key: 'overnight' },
                       { label: 'Giá theo tháng (VNĐ)',      key: 'monthly' },
                     ] as const
@@ -354,12 +335,11 @@ export default function ManagerPricingVehicles({
 
               <div className="border-t border-slate-100 pt-4">
                 <p className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Phụ phí</p>
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-2 gap-3">
                   {(
                     [
                       { label: 'Phí mất thẻ (VNĐ)', key: 'lostTicketFee' },
                       { label: 'Phí dịch vụ (VNĐ)', key: 'extraServiceFee' },
-                      { label: 'Phí quá giờ /30p (VNĐ)', key: 'overtimeRate30Min' },
                     ] as const
                   ).map((f) => (
                     <div key={f.key}>
@@ -399,9 +379,15 @@ export default function ManagerPricingVehicles({
               </div>
             </div>
 
+            {formError && (
+              <p className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-[13px] font-medium text-rose-700">
+                {formError}
+              </p>
+            )}
+
             <div className="flex gap-3 mt-6">
               <button
-                onClick={() => { setShowModal(false); setFormData(null); }}
+                onClick={() => { setShowModal(false); setFormData(null); setFormError(''); }}
                 className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition"
               >
                 Hủy

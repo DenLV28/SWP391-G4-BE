@@ -531,15 +531,10 @@ function estimateReservationCost(reservation: Reservation, rules: PricingRule[] 
   if (reservation.estimatedCost != null && reservation.estimatedCost > 0) {
     return reservation.estimatedCost;
   }
-  const durationMinutes = reservation.endTime ? Math.max(30, toMinutes(reservation.endTime) - toMinutes(reservation.startTime)) : 60;
-  const durationHours = Math.max(1, Math.ceil(durationMinutes / 60));
   const rule = rules.find((r) => r.vehicleType === reservation.vehicleType);
-  if (rule) {
-    const extraHours = Math.max(0, durationHours - 1);
-    return rule.firstHourPrice + extraHours * rule.nextHourPrice + rule.extraServiceFee;
-  }
+  if (rule) return rule.firstHourPrice + rule.extraServiceFee;
   const fallback: Record<string, number> = { car: 25000, motorbike: 10000, 'electric vehicle': 30000 };
-  return durationHours * (fallback[reservation.vehicleType] ?? 10000);
+  return fallback[reservation.vehicleType] ?? 10000;
 }
 
 function toMinutes(value: string) {

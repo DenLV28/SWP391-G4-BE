@@ -15,12 +15,17 @@ export default function Profile({
   savedVehicles,
   onUpdateUser,
   onAddVehicle,
+  onUpdateVehicle,
   onSetDefaultVehicle,
 }: {
   user: User;
   savedVehicles: SavedVehicle[];
   onUpdateUser: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
   onAddVehicle: (veh: any) => boolean;
+  onUpdateVehicle?: (
+    vehicleId: string,
+    updates: { licensePlate: string; vehicleType: VehicleKey; brand: string; model: string },
+  ) => Promise<{ ok: boolean; error?: string }>;
   onSetDefaultVehicle?: (vehicleId: string) => void;
 }) {
   const [isEditingProfile, setIsEditingProfile] = useState(false);
@@ -46,6 +51,14 @@ export default function Profile({
 
   const [profileErrors, setProfileErrors] = useState<Record<string, string>>({});
   const [vehicleErrors, setVehicleErrors] = useState<Record<string, string>>({});
+
+  const [editingVehicleId, setEditingVehicleId] = useState<string | null>(null);
+  const [editPlate, setEditPlate] = useState('');
+  const [editType, setEditType] = useState<VehicleKey>('car');
+  const [editBrand, setEditBrand] = useState('');
+  const [editModel, setEditModel] = useState('');
+  const [editErrors, setEditErrors] = useState<Record<string, string>>({});
+  const [savingVehicleId, setSavingVehicleId] = useState<string | null>(null);
 
   const userVehicles = useMemo(
     () => savedVehicles.filter((v) => v.userId === user.id),
@@ -131,6 +144,66 @@ export default function Profile({
       setModel('');
       setShowVehicleForm(false);
       alert('Đã thêm phương tiện mới.');
+    }
+  };
+
+  const startEditVehicle = (vehicle: SavedVehicle) => {
+    setEditingVehicleId(vehicle.id);
+    setEditPlate(vehicle.licensePlate);
+    setEditType(vehicle.vehicleType);
+    setEditBrand(vehicle.brand ?? '');
+    setEditModel(vehicle.model ?? '');
+    setEditErrors({});
+  };
+
+  const cancelEditVehicle = () => {
+    setEditingVehicleId(null);
+    setEditErrors({});
+  };
+
+  const handleSaveVehicle = async (e: React.FormEvent, vehicleId: string) => {
+    e.preventDefault();
+    const tempErrors: Record<string, string> = {};
+
+    const plateErr = validateLicensePlate(editPlate);
+    if (plateErr) {
+      tempErrors.licensePlate = plateErr;
+    } else if (
+      savedVehicles.some(
+        (vehicle) =>
+          vehicle.id !== vehicleId &&
+          vehicle.licensePlate.trim().toLowerCase() === editPlate.trim().toLowerCase(),
+      )
+    ) {
+      tempErrors.licensePlate = 'Biển số này đã được thêm vào danh sách xe của bạn.';
+    }
+
+    const brandErr = validateRequired(editBrand, 'Hãng xe');
+    if (brandErr) tempErrors.brand = brandErr;
+
+    const modelErr = validateRequired(editModel, 'Dòng xe');
+    if (modelErr) tempErrors.model = modelErr;
+
+    if (Object.keys(tempErrors).length > 0) {
+      setEditErrors(tempErrors);
+      return;
+    }
+
+    setEditErrors({});
+    setSavingVehicleId(vehicleId);
+    const result = await onUpdateVehicle?.(vehicleId, {
+      licensePlate: editPlate.trim().toUpperCase(),
+      vehicleType: editType,
+      brand: editBrand.trim(),
+      model: editModel.trim(),
+    });
+    setSavingVehicleId(null);
+
+    if (!result || result.ok) {
+      setEditingVehicleId(null);
+      alert('Đã cập nhật thông tin xe.');
+    } else {
+      setEditErrors({ general: result.error || 'Không thể cập nhật phương tiện. Vui lòng thử lại.' });
     }
   };
 
@@ -256,37 +329,118 @@ export default function Profile({
             </article>
           )}
 
-          {userVehicles.map((vehicle) => (
-            <article key={vehicle.id} className="rounded-[18px] border border-slate-200 bg-white p-5 shadow-[0_8px_18px_rgba(15,42,81,0.05)]">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[#eff5ff] text-[#1f67db]">
-                  <CarFront className="h-6 w-6" />
+          {userVehicles.map((vehicle) =>
+            editingVehicleId === vehicle.id ? (
+              <article key={vehicle.id} className="rounded-[18px] border-2 border-[#1f67db]/25 bg-[#f8fbff] p-5">
+                <form onSubmit={(e) => handleSaveVehicle(e, vehicle.id)} className="space-y-4">
+                  <h3 className="text-[18px] font-semibold text-slate-900">Chỉnh sửa phương tiện</h3>
+
+                  {editErrors.general && (
+                    <p className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-[13px] font-medium text-rose-700">
+                      {editErrors.general}
+                    </p>
+                  )}
+
+                  <ProfileField label="Biển số" error={editErrors.licensePlate}>
+                    <input
+                      type="text"
+                      value={editPlate}
+                      onChange={(e) => setEditPlate(e.target.value.toUpperCase())}
+                      className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-[15px] uppercase outline-none transition focus:border-blue-500"
+                    />
+                  </ProfileField>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <ProfileField label="Loại xe">
+                      <select
+                        value={editType}
+                        onChange={(e) => setEditType(e.target.value as VehicleKey)}
+                        className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-[15px] outline-none transition focus:border-blue-500"
+                      >
+                        <option value="car">Ô tô 4-7 chỗ (Xăng)</option>
+                        <option value="motorbike">Xe máy / Xe máy điện</option>
+                        <option value="electric vehicle">Ô tô 4-7 chỗ (Điện)</option>
+                      </select>
+                    </ProfileField>
+
+                    <ProfileField label="Hãng xe" error={editErrors.brand}>
+                      <input
+                        type="text"
+                        value={editBrand}
+                        onChange={(e) => setEditBrand(e.target.value)}
+                        className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-[15px] outline-none transition focus:border-blue-500"
+                      />
+                    </ProfileField>
+                  </div>
+
+                  <ProfileField label="Dòng xe" error={editErrors.model}>
+                    <input
+                      type="text"
+                      value={editModel}
+                      onChange={(e) => setEditModel(e.target.value)}
+                      className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-[15px] outline-none transition focus:border-blue-500"
+                    />
+                  </ProfileField>
+
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="submit"
+                      disabled={savingVehicleId === vehicle.id}
+                      className="rounded-[14px] bg-[#1f67db] px-5 py-3 text-[15px] font-semibold text-white transition hover:bg-[#1659bf] disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {savingVehicleId === vehicle.id ? 'Đang lưu...' : 'Lưu thay đổi'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelEditVehicle}
+                      className="rounded-[14px] border border-slate-200 px-5 py-3 text-[15px] font-medium text-slate-700 transition hover:bg-slate-50"
+                    >
+                      Hủy
+                    </button>
+                  </div>
+                </form>
+              </article>
+            ) : (
+              <article key={vehicle.id} className="rounded-[18px] border border-slate-200 bg-white p-5 shadow-[0_8px_18px_rgba(15,42,81,0.05)]">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[#eff5ff] text-[#1f67db]">
+                    <CarFront className="h-6 w-6" />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {vehicle.isDefault ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-3 py-1 text-[12px] font-medium text-emerald-700">
+                        <Star className="h-3 w-3 fill-emerald-600 text-emerald-600" /> Mặc định
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onSetDefaultVehicle?.(vehicle.id)}
+                        className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1 text-[12px] font-medium text-slate-500 transition hover:border-blue-300 hover:text-[#1f67db]"
+                      >
+                        <Star className="h-3 w-3" /> Đặt mặc định
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => startEditVehicle(vehicle)}
+                      className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1 text-[12px] font-medium text-slate-500 transition hover:border-blue-300 hover:text-[#1f67db]"
+                    >
+                      <Pencil className="h-3 w-3" /> Sửa
+                    </button>
+                  </div>
                 </div>
-                {vehicle.isDefault ? (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-3 py-1 text-[12px] font-medium text-emerald-700">
-                    <Star className="h-3 w-3 fill-emerald-600 text-emerald-600" /> Mặc định
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => onSetDefaultVehicle?.(vehicle.id)}
-                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1 text-[12px] font-medium text-slate-500 transition hover:border-blue-300 hover:text-[#1f67db]"
-                  >
-                    <Star className="h-3 w-3" /> Đặt mặc định
-                  </button>
-                )}
-              </div>
 
-              <h3 className="mt-5 text-[18px] font-semibold text-slate-900">{vehicleTitle(vehicle.vehicleType)}</h3>
+                <h3 className="mt-5 text-[18px] font-semibold text-slate-900">{vehicleTitle(vehicle.vehicleType)}</h3>
 
-              <div className="mt-5 grid gap-3 text-[15px] text-slate-700 sm:grid-cols-2">
-                <VehicleMeta label="Biển số" value={vehicle.licensePlate} />
-                <VehicleMeta label="Dòng xe" value={[vehicle.brand, vehicle.model].filter(Boolean).join(' ') || 'Chưa cập nhật'} />
-                <VehicleMeta label="Loại xe" value={vehicleTypeLabel(vehicle.vehicleType)} />
-                <VehicleMeta label="Trạng thái" value="Kích hoạt" />
-              </div>
-            </article>
-          ))}
+                <div className="mt-5 grid gap-3 text-[15px] text-slate-700 sm:grid-cols-2">
+                  <VehicleMeta label="Biển số" value={vehicle.licensePlate} />
+                  <VehicleMeta label="Dòng xe" value={[vehicle.brand, vehicle.model].filter(Boolean).join(' ') || 'Chưa cập nhật'} />
+                  <VehicleMeta label="Loại xe" value={vehicleTypeLabel(vehicle.vehicleType)} />
+                  <VehicleMeta label="Trạng thái" value="Kích hoạt" />
+                </div>
+              </article>
+            ),
+          )}
 
           <div className={`rounded-[18px] border-2 border-dashed ${showVehicleForm ? 'border-[#1f67db]/25 bg-[#f8fbff]' : 'border-slate-200 bg-white'} p-5`}>
             {showVehicleForm ? (

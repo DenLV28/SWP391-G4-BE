@@ -8,6 +8,7 @@ import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
 import { formatCurrency, localDateISO } from '../../utils/helpers';
 import { PARKING_LOTS, lotKeyOrDefault, type LotKey } from '../../utils/parkingLots';
+import type { ParkingLotStatus, LotStatus } from '../../services/parkingLotService';
 import ManagerParkingLots from './ManagerParkingLots';
 import ManagerParkingLotDetail, { type LotDetailInfo } from './ManagerParkingLotDetail';
 import ManagerPricingVehicles from './ManagerPricingVehicles';
@@ -39,6 +40,8 @@ interface ManagerDashboardProps {
   addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
+  lotStatuses?: ParkingLotStatus[];
+  onUpdateLotStatus?: (name: string, status: LotStatus) => Promise<boolean>;
 }
 
 export default function ManagerDashboard({
@@ -64,19 +67,14 @@ export default function ManagerDashboard({
   addToast,
   onUpdateUser,
   onAssignStaff,
+  lotStatuses = [],
+  onUpdateLotStatus,
 }: ManagerDashboardProps) {
-  // ── Bộ chọn bãi đỗ ──────────────────────────────────────────────────────────
-  // Manager có quyền toàn cục: mặc định xem gộp cả 3 bãi, hoặc chọn một bãi
-  // để xem dữ liệu (ô đỗ, đặt chỗ, thống kê) của riêng bãi đó.
-  const [lotFilter, setLotFilter] = useState<'all' | LotKey>('all');
-  const slots = useMemo(
-    () => (lotFilter === 'all' ? allSlots : allSlots.filter((s) => lotKeyOrDefault(s.parkingLot) === lotFilter)),
-    [allSlots, lotFilter],
-  );
-  const reservations = useMemo(
-    () => (lotFilter === 'all' ? allReservations : allReservations.filter((r) => lotKeyOrDefault(r.parkingLot) === lotFilter)),
-    [allReservations, lotFilter],
-  );
+  // Không còn bộ chọn bãi ở header — Tổng quan luôn gộp dữ liệu cả 3 bãi;
+  // sơ đồ bãi đỗ (không gộp được, mỗi bãi trùng mã ô A01...) có bộ chọn riêng
+  // của chính nó bên trong DashboardContent.
+  const slots = allSlots;
+  const reservations = allReservations;
 
   // Bãi đang mở trang "Xem chi tiết" — do ManagerParkingLots đặt khi bấm nút
   const [detailLot, setDetailLot] = useState<LotDetailInfo | null>(null);
@@ -146,7 +144,7 @@ export default function ManagerDashboard({
     switch (currentView) {
       case 'parkinglots':
         // Trang danh sách bãi hiển thị cả 3 bãi → dùng allSlots (không theo bộ lọc bãi)
-        return <ManagerParkingLots floors={floors} areas={areas} slots={allSlots} users={users} setView={setView} onAssignStaff={onAssignStaff} onViewDetail={setDetailLot} />;
+        return <ManagerParkingLots floors={floors} areas={areas} slots={allSlots} users={users} setView={setView} onAssignStaff={onAssignStaff} onViewDetail={setDetailLot} lotStatuses={lotStatuses} onUpdateLotStatus={onUpdateLotStatus} />;
       case 'parkinglotdetail':
         return <ManagerParkingLotDetail setView={setView} lot={detailLot} slots={allSlots} />;
       case 'pricing-vehicles':
@@ -193,7 +191,6 @@ export default function ManagerDashboard({
             users={users}
             pricingRules={pricingRules}
             allSlots={allSlots}
-            activeLotFilter={lotFilter}
           />
         );
     }
@@ -270,25 +267,10 @@ export default function ManagerDashboard({
               <input placeholder="Tìm kiếm ngoại lệ, biển số..." className="w-full rounded-xl bg-slate-100/70 py-2 pl-9 pr-3 text-sm focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-300" />
             </div>
             <div className="flex items-center gap-3">
-              {/* Parking-lot selector — switch which lot's data is shown */}
-              <div className="relative">
-                <select
-                  value={lotFilter}
-                  onChange={(e) => setLotFilter(e.target.value as 'all' | LotKey)}
-                  title="Chọn bãi đỗ để xem dữ liệu"
-                  className="appearance-none rounded-xl border border-slate-200 bg-slate-50 py-2 pl-3 pr-8 text-sm font-semibold text-slate-700 transition hover:bg-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-300"
-                >
-                  <option value="all">Tất cả bãi đỗ</option>
-                  {PARKING_LOTS.map((lot) => (
-                    <option key={lot.key} value={lot.key}>{lot.name}</option>
-                  ))}
-                </select>
-                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              </div>
               {/* Notification Bell */}
               {(() => {
                 const newFeedbacks = feedbacks.filter((f) => f.status === 'New');
-                const pendingRes = reservations.filter((r) => r.status === 'Pending');
+                const pendingRes = allReservations.filter((r) => r.status === 'Pending');
                 const bellCount = newFeedbacks.length + pendingRes.length + pendingIssueCount;
                 return (
                   <div className="relative" ref={bellRef}>
@@ -515,7 +497,6 @@ function DashboardContent({
   users: _users,
   pricingRules,
   allSlots,
-  activeLotFilter = 'all',
 }: {
   slots: Slot[];
   payments: Payment[];
@@ -524,20 +505,15 @@ function DashboardContent({
   pricingRules: PricingRule[];
   /** Toàn bộ ô đỗ của cả 3 bãi — cho bộ chọn bãi riêng của sơ đồ. */
   allSlots?: Slot[];
-  /** Bãi đang chọn trên topbar — sơ đồ đồng bộ theo khi chọn một bãi cụ thể. */
-  activeLotFilter?: 'all' | LotKey;
 }) {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [areaMode, setAreaMode] = useState<'all' | 'car' | 'motorbike'>('all');
 
   // ── Chọn bãi đỗ cho sơ đồ (giống form Đặt chỗ của user) ─────────────────────
   // Sơ đồ luôn hiển thị MỘT bãi cụ thể (mỗi bãi có kho ô riêng trùng mã A01...,
-  // gộp chung sẽ chồng ô lên nhau). Chọn bãi ở đây → nhảy sang xem tình trạng
-  // bãi đó; chọn bãi trên topbar cũng tự đồng bộ xuống sơ đồ.
-  const [mapLot, setMapLot] = useState<LotKey>(activeLotFilter === 'all' ? 'quan9' : activeLotFilter);
-  useEffect(() => {
-    if (activeLotFilter !== 'all') setMapLot(activeLotFilter);
-  }, [activeLotFilter]);
+  // gộp chung sẽ chồng ô lên nhau) — không còn đồng bộ theo bộ chọn ở header
+  // (đã bỏ), tự quản lý bãi đang xem bằng dropdown riêng bên dưới.
+  const [mapLot, setMapLot] = useState<LotKey>(PARKING_LOTS[0].key);
   const mapSlots = useMemo(
     () => (allSlots ?? slots).filter((s) => lotKeyOrDefault(s.parkingLot) === mapLot),
     [allSlots, slots, mapLot],
@@ -675,8 +651,7 @@ function DashboardContent({
             <thead>
               <tr className="border-b border-slate-100">
                 <th className="pb-2 text-left font-medium text-slate-400">Loại xe</th>
-                <th className="pb-2 text-right font-medium text-slate-400">Giá TĐ</th>
-                <th className="pb-2 text-right font-medium text-slate-400">Tiếp theo</th>
+                <th className="pb-2 text-right font-medium text-slate-400">Theo lượt</th>
                 <th className="pb-2 text-right font-medium text-blue-500">Vé tháng</th>
               </tr>
             </thead>
@@ -691,7 +666,6 @@ function DashboardContent({
                       <span className="font-medium text-slate-700">{MANAGER_VEHICLE_LABEL[vt]}</span>
                     </td>
                     <td className="py-2.5 text-right text-slate-600">{formatVnd(rule.firstHourPrice)}</td>
-                    <td className="py-2.5 text-right font-semibold text-blue-600">{formatVnd(rule.nextHourPrice)}</td>
                     <td className="py-2.5 text-right font-semibold text-blue-600">{formatVnd(rule.monthlyPrice)}</td>
                   </tr>
                 );

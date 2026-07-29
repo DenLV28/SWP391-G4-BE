@@ -28,6 +28,8 @@ interface StaffOverviewProps {
   assignedLot?: string;
   /** id của nhân viên đang đăng nhập — backend dùng để xác thực thao tác chuyển ô đỗ. */
   actorId?: string;
+  /** Bãi đang Bảo trì/Đóng cửa — khóa mọi nút thao tác, chỉ cho xem. */
+  isUnderMaintenance?: boolean;
 }
 
 const vehicleLabel: Record<string, string> = {
@@ -62,6 +64,7 @@ export default function StaffOverview({
   onSetSlotStatus,
   assignedLot,
   actorId,
+  isUnderMaintenance = false,
 }: StaffOverviewProps) {
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [cancelTarget, setCancelTarget] = useState<Reservation | null>(null);
@@ -69,7 +72,7 @@ export default function StaffOverview({
   // Số xe đang thật sự đỗ trong bãi (đặt trước đã check-in + khách vãng lai) —
   // lấy trực tiếp từ dữ liệu server, không dùng accessLogs (chỉ tồn tại tạm
   // trong bộ nhớ trình duyệt, mất khi tải lại trang nên dễ đếm thiếu).
-  const processedToday = buildCheckedInVehicles(reservations, sessions).length;
+  const parkedNow = buildCheckedInVehicles(reservations, sessions).length;
   const zoneAFree  = slots.filter((s) => s.areaName?.includes('A') && s.status === 'Available').length;
   const zoneATotal = slots.filter((s) => s.areaName?.includes('A')).length || 150;
   // Cảnh báo = lượt quét bị từ chối + số ô đang gặp sự cố/bảo trì thực tế
@@ -90,14 +93,14 @@ export default function StaffOverview({
 
       {/* 4 Stat cards */}
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
-        {/* Lượt xử lý */}
+        {/* Xe đang đỗ */}
         <div className="flex items-center gap-4 rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
           <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
             <Car className="h-6 w-6" />
           </div>
           <div>
-            <p className="text-xs font-medium text-slate-400">Lượt xử lý</p>
-            <p className="text-2xl font-bold text-slate-800">{processedToday} xe</p>
+            <p className="text-xs font-medium text-slate-400">Xe đang đỗ</p>
+            <p className="text-2xl font-bold text-slate-800">{parkedNow} xe</p>
           </div>
         </div>
 
@@ -127,15 +130,27 @@ export default function StaffOverview({
 
         {/* Trạng thái bãi xe */}
         <div className="flex items-center gap-4 rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
-          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-blue-600">
+          <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ${isUnderMaintenance ? 'bg-amber-100 text-amber-600' : 'bg-blue-100 text-blue-600'}`}>
             <Monitor className="h-6 w-6" />
           </div>
           <div>
             <p className="text-xs font-medium text-slate-400">Trạng thái bãi xe</p>
-            <p className="text-2xl font-bold text-emerald-600">Hoạt động</p>
+            <p className={`text-2xl font-bold ${isUnderMaintenance ? 'text-amber-600' : 'text-emerald-600'}`}>
+              {isUnderMaintenance ? 'Bảo trì' : 'Hoạt động'}
+            </p>
           </div>
         </div>
       </div>
+
+      {isUnderMaintenance && (
+        <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] text-amber-800">
+          <AlertTriangle className="h-5 w-5 shrink-0" />
+          <span>
+            <strong>Bãi đang tạm ngưng để bảo trì.</strong> Bạn chỉ có thể xem — mọi thao tác (quét thẻ, mở cổng,
+            xác nhận/hủy đặt chỗ, đổi trạng thái ô đỗ) đều bị khóa cho đến khi quản lý mở lại hoạt động.
+          </span>
+        </div>
+      )}
 
       {/* Sự cố Khẩn cấp — replaces the old read-only "Sơ đồ bãi đỗ — Trực tiếp"
           panel (the live map now lives inside this panel, clickable to pick the
@@ -212,14 +227,16 @@ export default function StaffOverview({
                           {isPending && (
                             <button
                               onClick={() => onConfirmReservation(r.id)}
-                              className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold text-white hover:bg-blue-700"
+                              disabled={isUnderMaintenance}
+                              className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               XÁC NHẬN
                             </button>
                           )}
                           <button
                             onClick={() => setCancelTarget(r)}
-                            className="rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50"
+                            disabled={isUnderMaintenance}
+                            className="rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             HỦY
                           </button>

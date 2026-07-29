@@ -44,13 +44,12 @@ export type VehicleType = {
 export type PricingRule = {
   id: number;
   vehicleType: VehicleKey;
+  /** Giá cố định mỗi lượt gửi xe (không tính theo giờ). */
   firstHourPrice: number;
-  nextHourPrice: number;
   overnightPrice: number;
   monthlyPrice: number;
   lostTicketFee: number;
   extraServiceFee: number;
-  overtimeRatePer30Minutes: number;
   note: string;
 };
 
@@ -267,9 +266,9 @@ export const vehicleTypes = [
 
 
 export const mockPricingRules: PricingRule[] = [
-  { id: 1, vehicleType: 'car', firstHourPrice: 25000, nextHourPrice: 15000, overnightPrice: 150000, monthlyPrice: 1200000, lostTicketFee: 200000, extraServiceFee: 10000, overtimeRatePer30Minutes: 5000, note: 'Daily maximum capped at 180,000 VND.' },
-  { id: 2, vehicleType: 'motorbike', firstHourPrice: 10000, nextHourPrice: 5000, overnightPrice: 30000, monthlyPrice: 150000, lostTicketFee: 100000, extraServiceFee: 0, overtimeRatePer30Minutes: 2000, note: 'Safe overnight lockers near exit booths.' },
-  { id: 4, vehicleType: 'electric vehicle', firstHourPrice: 30000, nextHourPrice: 20000, overnightPrice: 180000, monthlyPrice: 1800000, lostTicketFee: 200000, extraServiceFee: 15000, overtimeRatePer30Minutes: 6000, note: 'Charger connection fee of 15,000 VND included.' }
+  { id: 1, vehicleType: 'car', firstHourPrice: 25000, overnightPrice: 150000, monthlyPrice: 1200000, lostTicketFee: 200000, extraServiceFee: 10000, note: 'Daily maximum capped at 180,000 VND.' },
+  { id: 2, vehicleType: 'motorbike', firstHourPrice: 10000, overnightPrice: 30000, monthlyPrice: 150000, lostTicketFee: 100000, extraServiceFee: 0, note: 'Safe overnight lockers near exit booths.' },
+  { id: 4, vehicleType: 'electric vehicle', firstHourPrice: 30000, overnightPrice: 180000, monthlyPrice: 1800000, lostTicketFee: 200000, extraServiceFee: 15000, note: 'Charger connection fee of 15,000 VND included.' }
 ];
 
 export const mockParkingRules = [

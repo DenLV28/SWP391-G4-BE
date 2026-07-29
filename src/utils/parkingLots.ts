@@ -48,3 +48,22 @@ export function sameLot(a?: string | null, b?: string | null): boolean {
 export function lotKeyOrDefault(value?: string | null): LotKey {
   return lotKeyOf(value) ?? 'quan9';
 }
+
+/** Tra trạng thái (Hoạt động/Bảo trì/Đóng cửa) của bãi khớp `nameOrLabel` (biến thể tên bất kỳ). */
+export function findLotStatus<T extends { name: string; status: string }>(
+  lotStatuses: T[],
+  nameOrLabel?: string | null,
+): T | undefined {
+  const key = lotKeyOf(nameOrLabel);
+  if (!key) return undefined;
+  return lotStatuses.find((l) => lotKeyOf(l.name) === key);
+}
+
+/** Bãi đang Bảo trì hoặc Đóng cửa → không cho đặt chỗ / thao tác, chỉ xem. */
+export function isLotUnavailable<T extends { name: string; status: string }>(
+  lotStatuses: T[],
+  nameOrLabel?: string | null,
+): boolean {
+  const lot = findLotStatus(lotStatuses, nameOrLabel);
+  return lot ? lot.status !== 'Hoạt động' : false;
+}

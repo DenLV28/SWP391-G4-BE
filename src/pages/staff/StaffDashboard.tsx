@@ -19,7 +19,7 @@ import {
   manualVehicleOptions,
 } from '../../types/staff';
 import { connectIot, iotTransport, type GateCommand } from '../../services/iotService';
-import { deleteRfidScan } from '../../services/rfidScanService';
+import { rejectRfidScan, fetchRejectedScanCount } from '../../services/rfidScanService';
 import { fetchActiveSessions } from '../../services/sessionService';
 import { loadAccessLogs, saveAccessLogs } from '../../services/accessLogStore';
 import StaffOverview from './StaffOverview';
@@ -30,8 +30,9 @@ import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
 import CurrentSessionPage from '../driver/CurrentSession';
 import { perVisitOverstay, overstayDue, isReservationPaid } from '../../utils/reservationPricing';
-import { formatCurrency } from '../../utils/helpers';
-import { lotKeyOf, lotKeyOrDefault } from '../../utils/parkingLots';
+import { formatCurrency, localDateISO } from '../../utils/helpers';
+import { lotKeyOf, lotKeyOrDefault, isLotUnavailable } from '../../utils/parkingLots';
+import type { ParkingLotStatus } from '../../services/parkingLotService';
 
 interface StaffDashboardProps {
   currentUser: User;
@@ -51,6 +52,7 @@ interface StaffDashboardProps {
   onForceClearSlot?: (slotCode: string, reason: string) => Promise<boolean>;
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
+  lotStatuses?: ParkingLotStatus[];
   /** Trả xe/thu phí một lượt gửi — dùng cho trang "Theo dõi bãi xe". */
   onCheckOutSession?: (
     ticketCode: string,
@@ -117,6 +119,7 @@ export default function StaffDashboard({
   onSetSlotStatus,
   onUpdateUser,
   onCheckOutSession,
+  lotStatuses = [],
 }: StaffDashboardProps) {
   // ── Phân quyền theo bãi ─────────────────────────────────────────────────────
   // Staff chỉ thấy và xử lý dữ liệu (ô đỗ, đặt chỗ, thông báo...) của bãi mình
@@ -132,6 +135,18 @@ export default function StaffDashboard({
     () => (staffLotKey ? allReservations.filter((r) => lotKeyOrDefault(r.parkingLot) === staffLotKey) : []),
     [allReservations, staffLotKey],
   );
+
+  // Bãi đang Bảo trì/Đóng cửa → staff chỉ được xem, mọi thao tác vận hành
+  // (quét thẻ, mở cổng, nhập tay, xác nhận/hủy đặt chỗ) đều bị chặn ở đây —
+  // chặn tại 1 điểm duy nhất thay vì rải rác nhiều nút bấm để không sót.
+  const lotUnderMaintenance = isLotUnavailable(lotStatuses, currentUser.assignedParkingLot);
+  const guardMaintenance = () => {
+    if (lotUnderMaintenance) {
+      addToast('Bãi đang tạm ngưng để bảo trì — không thể thao tác, chỉ có thể xem.', 'error');
+      return true;
+    }
+    return false;
+  };
 
   const [gates] = useState<Gate[]>(initialGates);
   // Khôi phục nhật ký từ localStorage khi mở lại trang — trước đây accessLogs
@@ -312,6 +327,7 @@ export default function StaffDashboard({
   };
 
   const handleConfirmScan = (scan: ScanEvent, vehicleType: VehicleKey, status: 'GRANTED' | 'OVERRIDE') => {
+    if (guardMaintenance()) return;
     const pricing = pricingRules.find((p) => p.vehicleType === vehicleType);
     const fee =
       scan.direction === 'exit' && scan.recognition !== 'subscriber'
@@ -341,6 +357,7 @@ export default function StaffDashboard({
   };
 
   const handleDenyScan = (scan: ScanEvent) => {
+    if (guardMaintenance()) return;
     setAccessLogs((prev) => [
       {
         id: newLogId(),
@@ -359,8 +376,8 @@ export default function StaffDashboard({
     // Lượt quét đến từ DB (id dạng "RFID-<scan_id>") → xóa hẳn bản ghi + ảnh
     // để nó không quay lại hàng đợi hay lịch sử lượt quét.
     const dbId = /^RFID-(\d+)$/.exec(scan.id)?.[1];
-    if (dbId) deleteRfidScan(dbId);
-    addToast('Đã từ chối & xóa lượt quét.', 'info');
+    if (dbId) rejectRfidScan(dbId).then(() => setRejectedScanCount((c) => c + 1));
+    addToast('Đã từ chối lượt quét.', 'info');
   };
 
   const handleManualEntry = (
@@ -369,6 +386,7 @@ export default function StaffDashboard({
     vehicleType: VehicleKey,
     direction: 'entry' | 'exit',
   ) => {
+    if (guardMaintenance()) return;
     const pricing = pricingRules.find((p) => p.vehicleType === vehicleType);
     setAccessLogs((prev) => [
       {
@@ -399,6 +417,7 @@ export default function StaffDashboard({
     rfidUid: string,
     collectedFee?: number,
   ) => {
+    if (guardMaintenance()) return;
     const pricing = pricingRules.find((p) => p.vehicleType === vehicleType);
     setAccessLogs((prev) => [
       {
@@ -422,6 +441,7 @@ export default function StaffDashboard({
   };
 
   const handleConfirmReservation = (id: string) => {
+    if (guardMaintenance()) return;
     const res = reservations.find((r) => r.id === id);
     setConfirmedReservations((prev) => new Set(prev).add(id));
     onConfirmReservation?.(id);
@@ -446,6 +466,7 @@ export default function StaffDashboard({
   };
 
   const handleCancelReservation = (id: string) => {
+    if (guardMaintenance()) return;
     const res = reservations.find((r) => r.id === id);
     onCancelReservation?.(id);
     // Ghi nhận hành động hủy đặt chỗ vào nhật ký hoạt động
@@ -485,7 +506,29 @@ export default function StaffDashboard({
     addToast('Đã gửi cảnh báo khẩn cấp tới quản lý & an ninh.', 'success');
   };
 
-  const alertsCount = accessLogs.filter((l) => l.status === 'DENIED').length;
+  // "Cảnh báo" phải ra CÙNG một số trên mọi máy đang xem bãi này — trước đây
+  // đếm accessLogs (localStorage riêng từng trình duyệt) nên mỗi máy một số.
+  // Giờ dùng 2 nguồn đã đồng bộ qua server, scope trong HÔM NAY (giống
+  // processedToday) để "Cảnh báo" phản ánh ca làm hiện tại, không cộng dồn
+  // toàn bộ lịch sử: đặt chỗ bị hủy hôm nay (reservations, SSE) và lượt quét
+  // bị từ chối tại cổng hôm nay (rfid_scans.status='Rejected', poll theo bãi).
+  const todayStr = localDateISO();
+  const [rejectedScanCount, setRejectedScanCount] = useState(0);
+  useEffect(() => {
+    if (!staffLotKey || !currentUser.assignedParkingLot) { setRejectedScanCount(0); return; }
+    let cancelled = false;
+    const load = () =>
+      fetchRejectedScanCount(currentUser.assignedParkingLot!, todayStr)
+        .then((count) => { if (!cancelled) setRejectedScanCount(count); })
+        .catch(() => {});
+    load();
+    const t = setInterval(load, 10000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [staffLotKey, currentUser.assignedParkingLot, todayStr]);
+  const cancelledReservationsCount = reservations.filter(
+    (r) => r.status === 'Cancelled' && (r.cancelledAt || '').startsWith(todayStr),
+  ).length;
+  const alertsCount = cancelledReservationsCount + rejectedScanCount;
   const pendingReservationsCount = reservations.filter((r) => r.status === 'Pending').length;
 
   // Xe còn trong bãi đã qua 00:00 (phát sinh phí qua đêm) — chuông báo kèm
@@ -550,9 +593,10 @@ export default function StaffDashboard({
             onDenyScan={handleDenyScan}
             onManualEntry={handleManualEntry}
             onRfidVerified={handleRfidVerified}
-            onGateCommand={(gateId, command) => Boolean(sendCommand(gateId, command))}
+            onGateCommand={(gateId, command) => (guardMaintenance() ? false : Boolean(sendCommand(gateId, command)))}
             onAlarm={(description) => handleSubmitEmergency('Other', description)}
             addToast={addToast}
+            isUnderMaintenance={lotUnderMaintenance}
           />
         );
       case 'parkingmonitor':
@@ -564,7 +608,9 @@ export default function StaffDashboard({
             subtitle="Theo dõi & quản lý toàn bộ lượt gửi hiện tại của khách — giờ vào, ô đỗ, phí tạm tính và trả xe"
             currentSession={EMPTY_SESSION}
             setView={setView}
-            onCheckOutSession={onCheckOutSession ?? (() => false)}
+            onCheckOutSession={(ticketCode, method, amount) =>
+              guardMaintenance() ? false : (onCheckOutSession ?? (() => false))(ticketCode, method, amount)
+            }
             pricingRules={pricingRules}
             currentUser={currentUser}
             slots={slots}
@@ -592,8 +638,8 @@ export default function StaffDashboard({
             currentUser={currentUser}
             addToast={addToast}
             onCreateIssue={onCreateIssue}
-            onForceClearSlot={onForceClearSlot}
-            onSetSlotStatus={onSetSlotStatus}
+            onForceClearSlot={async (slotCode, reason) => (guardMaintenance() ? false : (await onForceClearSlot?.(slotCode, reason)) ?? false)}
+            onSetSlotStatus={async (slotCode, status) => (guardMaintenance() ? false : (await onSetSlotStatus?.(slotCode, status)) ?? false)}
           />
         );
       default:
@@ -612,7 +658,8 @@ export default function StaffDashboard({
             emergencyLogs={emergencyLogs}
             onSubmitEmergency={handleSubmitEmergency}
             addToast={addToast}
-            onSetSlotStatus={onSetSlotStatus}
+            onSetSlotStatus={async (slotCode, status) => (guardMaintenance() ? false : (await onSetSlotStatus?.(slotCode, status)) ?? false)}
+            isUnderMaintenance={lotUnderMaintenance}
             assignedLot={currentUser.assignedParkingLot}
             actorId={currentUser.id}
           />

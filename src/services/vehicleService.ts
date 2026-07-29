@@ -59,6 +59,22 @@ export async function createVehicle(payload: {
   return toSavedVehicle(record);
 }
 
+/** Update a vehicle's license plate, type, brand and model. */
+export async function updateVehicle(
+  vehicleId: string,
+  payload: { licensePlate: string; vehicleType: string; brand: string; model: string },
+): Promise<SavedVehicle> {
+  const res = await fetch(buildUrl(`/api/vehicles/${vehicleId}`), {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Vehicle API ${res.status}`);
+  const data = await res.json();
+  const record: VehicleRecord = data.vehicle ?? data;
+  return toSavedVehicle(record);
+}
+
 /** Mark a vehicle as default (unset others for the same user). */
 export async function setDefaultVehicle(vehicleId: string): Promise<void> {
   const res = await fetch(buildUrl(`/api/vehicles/${vehicleId}/default`), {

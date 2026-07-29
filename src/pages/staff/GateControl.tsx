@@ -57,6 +57,9 @@ interface GateControlProps {
   /** Báo động khẩn cấp — ghi vào nhật ký sự cố & báo quản lý. */
   onAlarm?: (description: string) => void;
   addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
+  /** Bãi đang Bảo trì/Đóng cửa — chỉ hiển thị banner cảnh báo; các thao tác thật
+   * sự bị chặn ở StaffDashboard (nơi truyền các handler xuống đây). */
+  isUnderMaintenance?: boolean;
 }
 
 const recognitionPill: Record<string, { label: string; cls: string }> = {
@@ -140,6 +143,7 @@ export default function GateControl({
   onGateCommand,
   onAlarm,
   addToast,
+  isUnderMaintenance = false,
 }: GateControlProps) {
   // Which OCR screen is active — Entry gate or Exit gate.
   const [activeDirection, setActiveDirection] = useState<ScanDirection>('entry');
@@ -960,6 +964,16 @@ export default function GateControl({
 
   return (
     <div className="space-y-6">
+
+      {isUnderMaintenance && (
+        <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] text-amber-800">
+          <AlertCircle className="h-5 w-5 shrink-0" />
+          <span>
+            <strong>Bãi đang tạm ngưng để bảo trì.</strong> Quét thẻ, mở cổng và nhập tay đều bị khóa cho đến khi
+            quản lý mở lại hoạt động — bạn chỉ có thể xem màn hình này.
+          </span>
+        </div>
+      )}
 
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-4">

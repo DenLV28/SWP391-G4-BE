@@ -489,6 +489,28 @@ async function createTables() {
     END
   `);
 
+  // parking_lots — trạng thái vận hành (Hoạt động/Bảo trì/Đóng cửa) của 3 bãi
+  // cố định trong hệ thống (xem src/utils/parkingLots.ts — nguồn tên bãi duy
+  // nhất). Trước đây trạng thái chỉ là state cục bộ trong ManagerParkingLots.tsx
+  // nên đổi xong mất ngay khi tải lại trang và không nơi nào khác (booking của
+  // user, dashboard của staff) biết bãi đang bảo trì.
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'parking_lots' AND schema_id = SCHEMA_ID('dbo'))
+    BEGIN
+      CREATE TABLE dbo.parking_lots (
+        lot_id     INT IDENTITY(1,1) PRIMARY KEY,
+        name       NVARCHAR(200) NOT NULL UNIQUE,
+        status     NVARCHAR(20)  NOT NULL DEFAULT N'Hoạt động'
+                   CHECK (status IN (N'Hoạt động', N'Bảo trì', N'Đóng cửa')),
+        updated_at DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+      );
+      INSERT INTO dbo.parking_lots (name, status) VALUES
+        (N'ParkFlow Long Phước', N'Hoạt động'),
+        (N'ParkFlow Thủ Đức',    N'Hoạt động'),
+        (N'ParkFlow Quận 9',     N'Bảo trì');
+    END
+  `);
+
   // feedbacks
   await pool.request().query(`
     IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'feedbacks' AND schema_id = SCHEMA_ID('dbo'))
@@ -1413,6 +1435,32 @@ app.post('/api/vehicles', async (req, res) => {
   }
 });
 
+app.put('/api/vehicles/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { licensePlate, vehicleType, brand, model } = req.body;
+    if (!licensePlate || !vehicleType) return res.status(400).json({ error: 'Thiếu thông tin bắt buộc.' });
+
+    const upd = await pool.request()
+      .input('id', sql.Int, id)
+      .input('license_plate', sql.NVarChar, licensePlate.trim())
+      .input('vehicle_type', sql.NVarChar, normalizeVehicleTypeLabel(vehicleType))
+      .input('brand', sql.NVarChar, (brand || '').trim())
+      .input('model', sql.NVarChar, (model || '').trim())
+      .query(`
+        UPDATE dbo.vehicles
+        SET license_plate = @license_plate, vehicle_type = @vehicle_type, brand = @brand, model = @model
+        OUTPUT inserted.*
+        WHERE vehicle_id = @id
+      `);
+    if (!upd.recordset.length) return res.status(404).json({ error: 'Không tìm thấy phương tiện.' });
+    return res.json({ vehicle: toVehicleDto(upd.recordset[0]) });
+  } catch (err) {
+    console.error('PUT /api/vehicles/:id', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật phương tiện.' });
+  }
+});
+
 app.put('/api/vehicles/:id/default', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -1662,17 +1710,53 @@ app.patch('/api/rfid-scans/:id', async (req, res) => {
   }
 });
 
+// Đếm lượt quét bị từ chối HÔM NAY của đúng bãi — join thẳng tới
+// dbo.users.assigned_parking_lot theo scanned_by_id (đều là ID thật trong DB)
+// thay vì để frontend tự khớp qua mảng `users` cục bộ: mảng đó giữ ID "mock"
+// cũ cho 4 tài khoản demo (DEMO-STF...) khác với ID thật currentUser.id dùng
+// khi ghi rfid_scans, nên khớp phía client sẽ sai lệch cho đúng nhóm tài
+// khoản hay dùng để test nhất. Nguồn duy nhất đáng tin ở đây là chính DB.
+app.get('/api/rfid-scans/rejected-count', async (req, res) => {
+  try {
+    const lot = req.query.lot ? String(req.query.lot) : '';
+    if (!lot) return res.status(400).json({ error: 'Thiếu tham số lot.' });
+    const date = req.query.date ? String(req.query.date) : nowStr().slice(0, 10);
+
+    // rfid_scans.created_at là UTC (SYSUTCDATETIME) — cộng +7h trước khi lấy
+    // ngày để so đúng "ngày hôm nay" theo giờ VN như toVnStr() dùng để hiển thị.
+    const r = await pool.request()
+      .input('lot', sql.NVarChar, lot)
+      .input('date', sql.Date, date)
+      .query(`
+        SELECT COUNT(*) AS cnt
+        FROM dbo.rfid_scans rs
+        JOIN dbo.users u ON TRY_CAST(rs.scanned_by_id AS INT) = u.user_id
+        WHERE rs.status = 'Rejected'
+          AND CAST(DATEADD(HOUR, 7, rs.created_at) AS DATE) = @date
+          AND u.assigned_parking_lot = @lot
+      `);
+    return res.json({ count: r.recordset[0]?.cnt ?? 0 });
+  } catch (err) {
+    console.error('GET /api/rfid-scans/rejected-count', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi đếm lượt quét bị từ chối.' });
+  }
+});
+
 app.get('/api/rfid-scans', async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 20, 200);
     const uidFilter = req.query.rfidUid ? String(req.query.rfidUid) : null;
-    const r = uidFilter
-      ? await pool.request().input('uid', sql.NVarChar, uidFilter).query(
-          `SELECT TOP ${limit} * FROM dbo.rfid_scans WHERE rfid_uid = @uid ORDER BY created_at DESC`,
-        )
-      : await pool.request().query(
-          `SELECT TOP ${limit} * FROM dbo.rfid_scans ORDER BY created_at DESC`,
-        );
+    const statusFilter = req.query.status ? String(req.query.status) : null;
+
+    const conditions = [];
+    const request = pool.request();
+    if (uidFilter) { conditions.push('rfid_uid = @uid'); request.input('uid', sql.NVarChar, uidFilter); }
+    if (statusFilter) { conditions.push('status = @status'); request.input('status', sql.NVarChar, statusFilter); }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const r = await request.query(
+      `SELECT TOP ${limit} * FROM dbo.rfid_scans ${where} ORDER BY created_at DESC`,
+    );
     return res.json(r.recordset.map(toRfidScanDto));
   } catch (err) {
     console.error('GET /api/rfid-scans', err);
@@ -1680,8 +1764,10 @@ app.get('/api/rfid-scans', async (req, res) => {
   }
 });
 
-// Staff bấm "Từ chối" một lượt quét đang chờ → xóa hẳn bản ghi (kèm ảnh chụp)
-// khỏi DB để nó không xuất hiện lại trong hàng đợi hay lịch sử.
+// Xóa hẳn bản ghi (kèm ảnh chụp) khỏi DB. Từ chối lượt quét ở Gate Control
+// giờ dùng PATCH status='Rejected' (giữ lại để tính "Cảnh báo" theo bãi thay
+// vì chỉ đếm accessLogs cục bộ trên từng trình duyệt) — route này chỉ còn
+// dùng cho tác vụ dọn dữ liệu thủ công nếu cần.
 app.delete('/api/rfid-scans/:id', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -3286,6 +3372,49 @@ app.patch('/api/issues/:id', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/issues/:id', err);
     return res.status(500).json({ error: 'Lỗi máy chủ.' });
+  }
+});
+
+// ─── parking lots ────────────────────────────────────────────────────────────
+
+function toParkingLotDto(r) {
+  return {
+    name: r.name,
+    status: r.status,
+    updatedAt: r.updated_at ? toVnStr(new Date(r.updated_at)) : '',
+  };
+}
+
+app.get('/api/parking-lots', async (_req, res) => {
+  try {
+    const r = await pool.request().query(`SELECT * FROM dbo.parking_lots ORDER BY lot_id ASC`);
+    return res.json(r.recordset.map(toParkingLotDto));
+  } catch (err) {
+    console.error('GET /api/parking-lots', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi tải danh sách bãi đỗ.' });
+  }
+});
+
+app.put('/api/parking-lots/:name', async (req, res) => {
+  try {
+    const name = req.params.name;
+    const { status } = req.body;
+    if (!['Hoạt động', 'Bảo trì', 'Đóng cửa'].includes(status)) {
+      return res.status(400).json({ error: 'Trạng thái không hợp lệ.' });
+    }
+    const upd = await pool.request()
+      .input('name', sql.NVarChar, name)
+      .input('status', sql.NVarChar, status)
+      .query(`
+        UPDATE dbo.parking_lots SET status = @status, updated_at = SYSUTCDATETIME()
+        OUTPUT inserted.*
+        WHERE name = @name
+      `);
+    if (!upd.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
+    return res.json(toParkingLotDto(upd.recordset[0]));
+  } catch (err) {
+    console.error('PUT /api/parking-lots/:name', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật trạng thái bãi đỗ.' });
   }
 });
 
