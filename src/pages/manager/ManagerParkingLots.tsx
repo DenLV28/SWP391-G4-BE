@@ -7,6 +7,8 @@ import type { ParkingLotStatus, LotStatus } from '../../services/parkingLotServi
 import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
 import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
 import baiXeLongPhuocImg from '../../assets/images/bai-xe-long-phuoc.jpg';
+// Nhà Văn Hóa chưa có ảnh chụp thật — dùng ảnh chi nhánh ParkFlow chung làm placeholder.
+import baiXeNhaVanHoaImg from '../../assets/images/xe-trong.jpg';
 
 interface ParkingLot {
   id: string;
@@ -61,6 +63,15 @@ const INITIAL_LOTS: ParkingLot[] = [
     totalSlots: 500,
     occupied: 0,
     imageUrl: baiXeQuan9Img,
+  },
+  {
+    id: 'lot-4',
+    name: 'ParkFlow Nhà Văn Hóa',
+    address: 'Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam',
+    status: 'Hoạt động',
+    totalSlots: 250,
+    occupied: 90,
+    imageUrl: baiXeNhaVanHoaImg,
   },
 ];
 

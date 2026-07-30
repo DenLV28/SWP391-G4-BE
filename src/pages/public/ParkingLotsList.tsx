@@ -5,10 +5,12 @@ import {
 } from 'lucide-react';
 import parkflowBg from '../../assets/images/parkflow_bg_1779336618673.png';
 import type { PricingRule, VehicleKey } from '../../data/mockData';
-// Real photos of the three lots (see "Bãi xe nổi bật")
+// Real photos of the lots (see "Bãi xe nổi bật")
 import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
 import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
 import baiXeLongPhuocImg from '../../assets/images/bai-xe-long-phuoc.jpg';
+// Nhà Văn Hóa chưa có ảnh chụp thật — dùng ảnh chi nhánh ParkFlow chung làm placeholder.
+import baiXeNhaVanHoaImg from '../../assets/images/xe-trong.jpg';
 
 interface Lot {
   id: string;
@@ -70,6 +72,23 @@ const lots: Lot[] = [
     badgeColor: 'bg-blue-600 text-white',
     features: [
       { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Mái che tôn' },
+      { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
+      { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
+      { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
+    ],
+    priceFrom: '200.000đ',
+    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
+  },
+  {
+    id: '4',
+    name: 'Bãi đỗ xe ParkFlow Nhà Văn Hóa',
+    address: 'Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam',
+    googleMapsUrl: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent('Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam'),
+    image: baiXeNhaVanHoaImg,
+    badge: 'Còn chỗ',
+    badgeColor: 'bg-blue-600 text-white',
+    features: [
+      { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Tòa nhà' },
       { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
       { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
       { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },

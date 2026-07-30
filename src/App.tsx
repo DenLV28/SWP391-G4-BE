@@ -33,6 +33,9 @@ import AdminDashboard from "./pages/admin/AdminDashboard";
 import UserManagement from "./pages/admin/UserManagement";
 import RoleManagement from "./pages/admin/RoleManagement";
 import SystemConfiguration from "./pages/admin/SystemConfiguration";
+import ParkingLotManagement from "./pages/admin/ParkingLotManagement";
+import ParkingLayoutEditor from "./pages/admin/ParkingLayoutEditor";
+import type { AdminParkingLot } from "./services/adminParkingLotService";
 
 // Manager pages
 import ManagerDashboard from "./pages/manager/ManagerDashboard";
@@ -285,6 +288,9 @@ export default function App() {
   const [interfaceMode, setInterfaceMode] = useState<"light" | "dark">(
     initialSystemConfig.interfaceMode ?? "light",
   );
+  // Which admin-designed parking lot the layout editor is currently open for
+  // (mirrors the onViewDetail/lot pattern ManagerParkingLotDetail already uses).
+  const [adminLayoutLot, setAdminLayoutLot] = useState<AdminParkingLot | null>(null);
 
   const setView = (view: string) => {
     window.location.hash = `#/${view}`;
@@ -299,6 +305,7 @@ export default function App() {
         "terms", "privacy", "help",
         "myparking", "reservations", "payments", "feedback", "profile", "vnpay-return",
         "admindashboard", "usermanagement", "rolemanagement", "systemconfig",
+        "parkinglotmanagement", "parkinglayouteditor",
         "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "monthlycards", "exceptions",
         "staffdashboard", "gatecontrol", "parkingmonitor", "activitylog", "emergency",
       ];
@@ -315,6 +322,7 @@ export default function App() {
         const isProtectedRoute = [
           "myparking", "reservations", "payments", "feedback", "profile",
           "admindashboard", "usermanagement", "rolemanagement", "systemconfig",
+          "parkinglotmanagement", "parkinglayouteditor",
           "managerdashboard", "parkinglots", "parkinglotdetail", "pricing-vehicles", "reports", "monthlycards", "exceptions",
           "staffdashboard", "gatecontrol", "parkingmonitor", "activitylog", "emergency",
         ].includes(targetView);
@@ -2474,6 +2482,18 @@ export default function App() {
                   viewerRole={currentUser.role}
                   viewerId={currentUser.id}
                 />
+              )}
+              {currentView === "parkinglotmanagement" && (
+                <ParkingLotManagement
+                  setView={setView}
+                  onOpenLayout={(lot) => {
+                    setAdminLayoutLot(lot);
+                    setView("parkinglayouteditor");
+                  }}
+                />
+              )}
+              {currentView === "parkinglayouteditor" && (
+                <ParkingLayoutEditor lot={adminLayoutLot} setView={setView} />
               )}
               {currentView === "systemconfig" && (
                 <SystemConfiguration

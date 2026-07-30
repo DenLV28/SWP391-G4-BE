@@ -139,7 +139,7 @@ export const ROLE_POLICY: Record<Role, RolePolicy> = {
   'System Administrator': {
     label: 'System Administrator',
     home: 'admindashboard',
-    routes: ['admindashboard', 'usermanagement', 'rolemanagement', 'systemconfig'],
+    routes: ['admindashboard', 'usermanagement', 'rolemanagement', 'systemconfig', 'parkinglotmanagement', 'parkinglayouteditor'],
     permissions: permissionsFor('System Administrator'),
   },
   'Parking Manager': {

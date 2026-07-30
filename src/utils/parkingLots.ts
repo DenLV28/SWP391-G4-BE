@@ -8,7 +8,7 @@
  * mọi biến thể về một key để so sánh, nên đừng so sánh chuỗi tên trực tiếp.
  */
 
-export type LotKey = 'quan9' | 'thuduc' | 'longphuoc';
+export type LotKey = 'quan9' | 'thuduc' | 'longphuoc' | 'nhavanhoa';
 
 export type ParkingLotInfo = {
   key: LotKey;
@@ -22,6 +22,7 @@ export const PARKING_LOTS: ParkingLotInfo[] = [
   { key: 'quan9',     name: 'ParkFlow Quận 9',     bookingLabel: 'ParkFlow Quận 9 - Lò Lu' },
   { key: 'thuduc',    name: 'ParkFlow Thủ Đức',    bookingLabel: 'ParkFlow Thủ Đức - Linh Xuân' },
   { key: 'longphuoc', name: 'ParkFlow Long Phước', bookingLabel: 'ParkFlow Long Phước' },
+  { key: 'nhavanhoa', name: 'ParkFlow Nhà Văn Hóa', bookingLabel: 'ParkFlow Nhà Văn Hóa' },
 ];
 
 /** Chuẩn hóa mọi biến thể tên bãi về LotKey; null nếu không nhận ra / rỗng. */
@@ -32,6 +33,7 @@ export function lotKeyOf(value?: string | null): LotKey | null {
   if (v.includes('long phước') || v.includes('long phuoc')) return 'longphuoc';
   if (v.includes('quận 9') || v.includes('quan 9')) return 'quan9';
   if (v.includes('thủ đức') || v.includes('thu duc')) return 'thuduc';
+  if (v.includes('nhà văn hóa') || v.includes('nha van hoa')) return 'nhavanhoa';
   return null;
 }
 

@@ -534,7 +534,11 @@ export default function GateControl({
       );
       if (matchedBooking) {
         setAutoPipelineNote(`Biển số ${ocrPlate} khớp đặt chỗ ${matchedBooking.reservationCode} — đang liên kết thẻ...`);
-        const link = await linkRfidCard(uid, matchedBooking.licensePlate);
+        const link = await linkRfidCard(
+          uid,
+          matchedBooking.licensePlate,
+          manualVehicleOptions.find((o) => o.key === matchedBooking.vehicleType)?.label,
+        );
         if (link.ok) {
           const relook = await fetchRfidInfo(uid);
           if (relook.ok === true) {
@@ -674,9 +678,16 @@ export default function GateControl({
     const plateErr = validateLicensePlate(linkPlate);
     if (plateErr) { setRfidError(plateErr); return; }
     setLinking(true);
-    const result = await linkRfidCard(uid, linkPlate.trim().toUpperCase());
+    const result = await linkRfidCard(
+      uid,
+      linkPlate.trim().toUpperCase(),
+      manualVehicleOptions.find((o) => o.key === manualType)?.label,
+    );
     setLinking(false);
     if (result.ok) {
+      if (result.created) {
+        addToast?.(`Chưa có hồ sơ cho biển số này — đã tạo hồ sơ xe vãng lai & liên kết thẻ.`, 'success');
+      }
       await runRfidPipeline(uid);
     } else {
       setRfidError(result.error ?? 'Không thể liên kết thẻ.');

@@ -7,9 +7,10 @@ import SectionTitle from '../../components/SectionTitle';
 import StatusBadge from '../../components/StatusBadge';
 import { Role, User, validateEmail, validatePhone, validateRequired } from '../../data/mockData';
 import { assignableRoles, canManageUserRole } from '../../services/authService';
+import { PARKING_LOTS } from '../../utils/parkingLots';
 
-// The 3 real ParkFlow parking lots — staff can only be assigned to one of these.
-const PARKING_LOT_OPTIONS = ['ParkFlow Quận 9', 'ParkFlow Thủ Đức', 'ParkFlow Long Phước'];
+// The real ParkFlow parking lots — staff can only be assigned to one of these.
+const PARKING_LOT_OPTIONS = PARKING_LOTS.map((l) => l.name);
 
 export default function UserManagement({
   users,

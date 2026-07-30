@@ -3,6 +3,7 @@ import {
   CalendarClock,
   CreditCard,
   LayoutDashboard,
+  LayoutGrid,
   LogOut,
   MessageSquareWarning,
   ParkingCircle,
@@ -29,6 +30,7 @@ export function AdminSidebar({
     { key: 'admindashboard', label: 'Tổng quan', icon: LayoutDashboard },
     { key: 'usermanagement', label: 'Quản lý người dùng', icon: Users },
     { key: 'rolemanagement', label: 'Quyền và vai trò', icon: ShieldCheck },
+    { key: 'parkinglotmanagement', label: 'Quản lý bãi đỗ', icon: LayoutGrid },
     { key: 'systemconfig', label: 'Cấu hình hệ thống', icon: Settings },
   ];
 

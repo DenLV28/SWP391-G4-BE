@@ -53,19 +53,23 @@ export async function unlinkRfidCard(uid: string): Promise<boolean> {
   }
 }
 
-export async function linkRfidCard(uid: string, licensePlate: string): Promise<{ ok: boolean; error?: string }> {
+export async function linkRfidCard(
+  uid: string,
+  licensePlate: string,
+  vehicleType?: string,
+): Promise<{ ok: boolean; error?: string; created?: boolean }> {
   try {
     const res = await fetch(buildApiUrl('/api/rfid/link'), {
       method: 'POST',
       headers: defaultHeaders(),
-      body: JSON.stringify({ uid, licensePlate }),
+      body: JSON.stringify({ uid, licensePlate, vehicleType }),
     });
-    const body: { error?: string } = await res.json().catch(() => ({}));
+    const body: { error?: string; created?: boolean } = await res.json().catch(() => ({}));
     if (!res.ok) {
       const message: string = body.error || 'Không thể liên kết thẻ.';
       return { ok: false, error: message };
     }
-    return { ok: true };
+    return { ok: true, created: body.created };
   } catch {
     return { ok: false, error: 'Không kết nối được tới máy chủ.' };
   }
