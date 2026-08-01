@@ -7,10 +7,7 @@ import SectionTitle from '../../components/SectionTitle';
 import StatusBadge from '../../components/StatusBadge';
 import { Role, User, validateEmail, validatePhone, validateRequired } from '../../data/mockData';
 import { assignableRoles, canManageUserRole } from '../../services/authService';
-import { PARKING_LOTS } from '../../utils/parkingLots';
-
-// The real ParkFlow parking lots — staff can only be assigned to one of these.
-const PARKING_LOT_OPTIONS = PARKING_LOTS.map((l) => l.name);
+import type { ParkingLotInfo } from '../../utils/parkingLots';
 
 export default function UserManagement({
   users,
@@ -20,6 +17,7 @@ export default function UserManagement({
   onToggleLockUser,
   activeAdminEmail,
   viewerRole,
+  parkingLots = [],
 }: {
   users: User[];
   onCreateUser: (u: any) => boolean | Promise<boolean>;
@@ -29,7 +27,10 @@ export default function UserManagement({
   activeAdminEmail: string;
   /** Role of the account currently viewing this page — governs which rows can be edited/locked/deleted vs. view-only. */
   viewerRole: Role;
+  /** Danh mục bãi từ backend — staff chỉ được gán vào một trong các bãi này. */
+  parkingLots?: ParkingLotInfo[];
 }) {
+  const PARKING_LOT_OPTIONS = parkingLots.map((l) => l.name);
   const editableRoles = assignableRoles(viewerRole);
   // Always allow editing your own row (profile-style edits) even if your role
   // wouldn't normally manage accounts of your own role bucket (e.g. an Admin

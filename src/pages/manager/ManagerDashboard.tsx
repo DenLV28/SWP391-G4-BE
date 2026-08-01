@@ -7,8 +7,8 @@ import PaymentWalletCard from '../../components/PaymentWalletCard';
 import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
 import { formatCurrency, localDateISO } from '../../utils/helpers';
-import { PARKING_LOTS, lotKeyOrDefault, type LotKey } from '../../utils/parkingLots';
-import type { ParkingLotStatus, LotStatus } from '../../services/parkingLotService';
+import { lotKeyOrDefault, type LotKey, type ParkingLotInfo } from '../../utils/parkingLots';
+import type { LotStatus } from '../../services/parkingLotService';
 import ManagerParkingLots from './ManagerParkingLots';
 import ManagerParkingLotDetail, { type LotDetailInfo } from './ManagerParkingLotDetail';
 import ManagerPricingVehicles from './ManagerPricingVehicles';
@@ -40,7 +40,7 @@ interface ManagerDashboardProps {
   addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
-  lotStatuses?: ParkingLotStatus[];
+  lotStatuses?: ParkingLotInfo[];
   onUpdateLotStatus?: (name: string, status: LotStatus) => Promise<boolean>;
 }
 
@@ -151,7 +151,7 @@ export default function ManagerDashboard({
         return <ManagerPricingVehicles setView={setView} />;
       case 'reports':
         // Báo cáo có bộ lọc bãi + thời gian riêng — nhận dữ liệu toàn hệ thống
-        return <ManagerReports payments={payments} reservations={allReservations} />;
+        return <ManagerReports payments={payments} reservations={allReservations} parkingLots={lotStatuses} />;
       case 'monthlycards':
         return <ManagerMonthlyCards reservations={reservations} users={users} />;
       case 'exceptions':
@@ -191,6 +191,7 @@ export default function ManagerDashboard({
             users={users}
             pricingRules={pricingRules}
             allSlots={allSlots}
+            parkingLots={lotStatuses}
           />
         );
     }
@@ -497,14 +498,17 @@ function DashboardContent({
   users: _users,
   pricingRules,
   allSlots,
+  parkingLots = [],
 }: {
   slots: Slot[];
   payments: Payment[];
   reservations: Reservation[];
   users: User[];
   pricingRules: PricingRule[];
-  /** Toàn bộ ô đỗ của cả 3 bãi — cho bộ chọn bãi riêng của sơ đồ. */
+  /** Toàn bộ ô đỗ của mọi bãi — cho bộ chọn bãi riêng của sơ đồ. */
   allSlots?: Slot[];
+  /** Danh mục bãi từ backend. */
+  parkingLots?: ParkingLotInfo[];
 }) {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [areaMode, setAreaMode] = useState<'all' | 'car' | 'motorbike'>('all');
@@ -513,7 +517,14 @@ function DashboardContent({
   // Sơ đồ luôn hiển thị MỘT bãi cụ thể (mỗi bãi có kho ô riêng trùng mã A01...,
   // gộp chung sẽ chồng ô lên nhau) — không còn đồng bộ theo bộ chọn ở header
   // (đã bỏ), tự quản lý bãi đang xem bằng dropdown riêng bên dưới.
-  const [mapLot, setMapLot] = useState<LotKey>(PARKING_LOTS[0].key);
+  const [mapLot, setMapLot] = useState<LotKey>('');
+  // Danh mục tải bất đồng bộ → chọn bãi đầu tiên khi có, đổi bãi nếu bãi đang
+  // xem bị Admin xóa.
+  useEffect(() => {
+    if (!parkingLots.length) return;
+    if (!mapLot || !parkingLots.some((l) => l.key === mapLot)) setMapLot(parkingLots[0].key);
+  }, [parkingLots, mapLot]);
+  const selectedLot = parkingLots.find((l) => l.key === mapLot);
   const mapSlots = useMemo(
     () => (allSlots ?? slots).filter((s) => lotKeyOrDefault(s.parkingLot) === mapLot),
     [allSlots, slots, mapLot],
@@ -728,7 +739,7 @@ function DashboardContent({
               onChange={(e) => setMapLot(e.target.value as LotKey)}
               className="w-full appearance-none rounded-xl border border-slate-300 bg-white px-4 py-2.5 pr-10 text-sm font-semibold text-slate-800 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-600/10"
             >
-              {PARKING_LOTS.map((lot) => (
+              {parkingLots.map((lot) => (
                 <option key={lot.key} value={lot.key}>{lot.bookingLabel}</option>
               ))}
             </select>
@@ -742,6 +753,7 @@ function DashboardContent({
               code: s.slotCode.split('-').pop() ?? s.slotCode,
               status: s.status,
             } as MapSlot))}
+            gates={selectedLot?.gates}
             interactive={false}
             areaMode={areaMode}
           />

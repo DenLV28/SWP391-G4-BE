@@ -32,7 +32,7 @@ import CurrentSessionPage from '../driver/CurrentSession';
 import { perVisitOverstay, overstayDue, isReservationPaid } from '../../utils/reservationPricing';
 import { formatCurrency, localDateISO } from '../../utils/helpers';
 import { lotKeyOf, lotKeyOrDefault, isLotUnavailable } from '../../utils/parkingLots';
-import type { ParkingLotStatus } from '../../services/parkingLotService';
+import type { ParkingLotInfo } from '../../utils/parkingLots';
 
 interface StaffDashboardProps {
   currentUser: User;
@@ -52,7 +52,7 @@ interface StaffDashboardProps {
   onForceClearSlot?: (slotCode: string, reason: string) => Promise<boolean>;
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
   onUpdateUser?: (up: Partial<User>) => Promise<{ ok: boolean; error?: string }>;
-  lotStatuses?: ParkingLotStatus[];
+  lotStatuses?: ParkingLotInfo[];
   /** Trả xe/thu phí một lượt gửi — dùng cho trang "Theo dõi bãi xe". */
   onCheckOutSession?: (
     ticketCode: string,

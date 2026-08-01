@@ -14,6 +14,13 @@ export function slotRowType(code: string): 'car' | 'motorbike' | 'ev' {
   return 'car'; // A, D
 }
 
+/** Cổng vào/ra do Admin đặt cho từng bãi (dbo.parking_lot_gates). */
+export interface MapGate {
+  kind: 'entry' | 'exit';
+  label: string;
+  position: 'left' | 'center' | 'right';
+}
+
 interface Props {
   slots?: MapSlot[];
   selectedId?: string | null;
@@ -26,6 +33,17 @@ interface Props {
   areaMode?: 'all' | 'car' | 'motorbike';
   /** Issue-report mode: ALL slots are clickable (not just Available); selected slot is orange */
   issueMode?: boolean;
+  /**
+   * Cổng vào/ra của bãi. Bỏ trống → giữ nguyên hình cũ (1 entry + 1 exit ở đầu
+   * trái hai làn), nên mọi trang đang gọi component này không đổi gì.
+   */
+  gates?: MapGate[];
+  /**
+   * Chế độ thiết kế của Admin: vẽ ĐỦ 36 vị trí mặt bằng mẫu, ô đã có vẽ đậm,
+   * ô chưa có vẽ nét đứt mờ; bấm bất kỳ ô nào để bật/tắt qua `onToggleSlot`.
+   */
+  designMode?: boolean;
+  onToggleSlot?: (code: string) => void;
 }
 
 // ── Layout constants — generously spaced so slots never crowd each other ──
@@ -159,6 +177,19 @@ function SlotCard({ sp, c, clickable }: {
   );
 }
 
+/** Vị trí cổng trên làn → toạ độ x của thẻ cổng (thẻ rộng 92, làn dài ~494). */
+function gateX(position: MapGate['position']): number {
+  const laneW = LANE_X1 - LANE_X0;
+  if (position === 'center') return LANE_X0 + (laneW - 92) / 2;
+  if (position === 'right') return LANE_X1 - 92 - 6;
+  return LANE_X0 + 6;
+}
+
+const DEFAULT_GATES: MapGate[] = [
+  { kind: 'entry', label: 'Vào', position: 'left' },
+  { kind: 'exit', label: 'Ra', position: 'left' },
+];
+
 export default function ParkingFloorMap({
   slots,
   selectedId,
@@ -168,8 +199,12 @@ export default function ParkingFloorMap({
   filterVehicleType,
   areaMode = 'all',
   issueMode = false,
+  gates,
+  designMode = false,
+  onToggleSlot,
 }: Props) {
   const spaceDefs = useMemo(() => buildSpaces(level), [level]);
+  const gateList = gates && gates.length ? gates : DEFAULT_GATES;
 
   const enriched = useMemo(() => {
     const byCode = new Map(slots?.map((s) => [s.code, s]) ?? []);
@@ -256,15 +291,27 @@ export default function ParkingFloorMap({
       <line x1={LANE_X0} y1={LANE_TOP_Y} x2={LANE_X0} y2={LANE_BOTTOM_Y + LANE_H} stroke="#e2e8f0" strokeWidth="1.5" strokeDasharray="6,5" />
       <line x1={LANE_X1} y1={LANE_TOP_Y} x2={LANE_X1} y2={LANE_BOTTOM_Y + LANE_H} stroke="#e2e8f0" strokeWidth="1.5" strokeDasharray="6,5" />
 
-      {/* ── ENTRY marker — sits inside the top lane, well clear of column B ── */}
-      <rect x={LANE_X0 + 6} y={LANE_TOP_Y + 6} width="92" height="40" rx="8" fill="#ecfdf5" stroke="#10b981" strokeWidth="1.6" />
-      <text x={LANE_X0 + 52} y={LANE_TOP_Y + 26} textAnchor="middle" fill="#047857" fontSize="10.5" fontWeight="900" letterSpacing="1">ENTRY</text>
-      <text x={LANE_X0 + 52} y={LANE_TOP_Y + 39} textAnchor="middle" fill="#059669" fontSize="9" fontWeight="bold">▶ Vào</text>
-
-      {/* ── EXIT marker — sits inside the bottom lane, well clear of column B ── */}
-      <rect x={LANE_X0 + 6} y={LANE_BOTTOM_Y + 6} width="92" height="40" rx="8" fill="#fef2f2" stroke="#ef4444" strokeWidth="1.6" />
-      <text x={LANE_X0 + 52} y={LANE_BOTTOM_Y + 26} textAnchor="middle" fill="#b91c1c" fontSize="10.5" fontWeight="900" letterSpacing="1">EXIT</text>
-      <text x={LANE_X0 + 52} y={LANE_BOTTOM_Y + 39} textAnchor="middle" fill="#dc2626" fontSize="9" fontWeight="bold">◀ Ra</text>
+      {/* ── Cổng vào/ra — nằm trong làn trên (entry) / làn dưới (exit), vị trí
+             trái/giữa/phải do Admin đặt cho từng bãi ── */}
+      {gateList.map((g, i) => {
+        const isEntry = g.kind === 'entry';
+        const x = gateX(g.position);
+        const y = isEntry ? LANE_TOP_Y + 6 : LANE_BOTTOM_Y + 6;
+        const c = isEntry
+          ? { fill: '#ecfdf5', stroke: '#10b981', title: '#047857', sub: '#059669' }
+          : { fill: '#fef2f2', stroke: '#ef4444', title: '#b91c1c', sub: '#dc2626' };
+        return (
+          <g key={`${g.kind}-${g.position}-${i}`}>
+            <rect x={x} y={y} width="92" height="40" rx="8" fill={c.fill} stroke={c.stroke} strokeWidth="1.6" />
+            <text x={x + 46} y={y + 20} textAnchor="middle" fill={c.title} fontSize="10.5" fontWeight="900" letterSpacing="1">
+              {isEntry ? 'ENTRY' : 'EXIT'}
+            </text>
+            <text x={x + 46} y={y + 33} textAnchor="middle" fill={c.sub} fontSize="9" fontWeight="bold">
+              {isEntry ? `▶ ${g.label || 'Vào'}` : `◀ ${g.label || 'Ra'}`}
+            </text>
+          </g>
+        );
+      })}
 
       {/* ── STAFF BOOTH ── */}
       <rect x="243" y="222" width="118" height="108" rx="10" fill="#0f172a" opacity="0.05" />
@@ -286,6 +333,20 @@ export default function ParkingFloorMap({
       {/* ── Parking spaces ── */}
       {enriched.map((sp) => {
         if (sp.hiddenByArea) return null;
+
+        // Chế độ thiết kế: vẽ ĐỦ mặt bằng mẫu, ô chưa thêm để nét đứt mờ, bấm
+        // vào bất kỳ ô nào cũng bật/tắt được — đây là cách Admin "thêm ô đỗ".
+        if (designMode) {
+          const c: SlotColors = sp.isReal
+            ? slotColors('Available', selectedId === sp.code)
+            : { fill: '#ffffff', stroke: '#cbd5e1', text: '#94a3b8', dashArray: '4,3' };
+          return (
+            <g key={sp.code} onClick={() => onToggleSlot?.(sp.code)}>
+              <SlotCard sp={{ ...sp, status: 'Available' }} c={c} clickable />
+            </g>
+          );
+        }
+
         // Có kho ô đỗ thật (mỗi bãi sức chứa khác nhau) → vị trí không tồn tại
         // trong bãi thì không vẽ. Không truyền slots (trang demo công khai) →
         // vẫn vẽ đủ mặt bằng như cũ.
@@ -313,9 +374,16 @@ export default function ParkingFloorMap({
       {/* ── Legend strip ── */}
       <rect x="0" y={BH} width={VW} height={VH - BH} fill="#ffffff" />
       <line x1="0" y1={BH} x2={VW} y2={BH} stroke="#e2e8f0" strokeWidth="1" />
-      <text x="14" y={BH + 20} fill="#64748b" fontSize="9" fontWeight="800" letterSpacing="1.5">TRẠNG THÁI Ô ĐỖ</text>
+      <text x="14" y={BH + 20} fill="#64748b" fontSize="9" fontWeight="800" letterSpacing="1.5">
+        {designMode ? 'BẤM VÀO Ô ĐỂ THÊM / BỎ' : 'TRẠNG THÁI Ô ĐỖ'}
+      </text>
 
-      {[
+      {(designMode
+        ? [
+            { color: '#ffffff', stroke: '#3b82f6', label: 'Đã thêm vào bãi', tx: 14 },
+            { color: '#ffffff', stroke: '#cbd5e1', label: 'Chưa thêm',       tx: 160, dash: '4,3' },
+          ]
+        : [
         { color: '#ffffff', stroke: '#3b82f6', label: 'Trống',      tx: 14 },
         { color: '#ecfdf5', stroke: '#10b981', label: 'Đang đỗ',    tx: 106 },
         { color: '#fffbeb', stroke: '#fbbf24', label: 'Chờ duyệt',  tx: 210, dash: '4,3' },
@@ -325,7 +393,7 @@ export default function ParkingFloorMap({
         ...(interactive
           ? [{ color: issueMode ? '#f97316' : '#2563eb', stroke: issueMode ? '#c2410c' : '#1d4ed8', label: 'Đã chọn', tx: 628 }]
           : []),
-      ].map((item) => (
+      ]).map((item) => (
         <g key={item.tx}>
           <rect
             x={item.tx}

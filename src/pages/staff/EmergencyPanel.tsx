@@ -5,7 +5,7 @@ import {
 import type { EmergencyLog, IncidentType, EmergencyStatus } from '../../types/staff';
 import type { Slot, Reservation, ParkingSession, VehicleKey } from '../../data/mockData';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
-import { PARKING_LOTS, lotKeyOf } from '../../utils/parkingLots';
+import { findLot } from '../../utils/parkingLots';
 import { relocateSlot } from '../../services/slotService';
 
 const VEHICLE_TYPE_LABEL: Record<string, string> = {
@@ -102,10 +102,10 @@ export default function EmergencyPanel({
   // ── Bãi phụ trách ───────────────────────────────────────────────────────────
   // Staff chỉ làm việc trên đúng bãi được Quản lý phân công — không còn dropdown
   // chọn bãi. Nhãn đầy đủ lấy từ danh mục bãi (vd. "ParkFlow Quận 9 - Lò Lu").
-  const assignedLotLabel = useMemo(() => {
-    const key = lotKeyOf(assignedLot);
-    return PARKING_LOTS.find((l) => l.key === key)?.bookingLabel ?? assignedLot ?? '';
-  }, [assignedLot]);
+  const assignedLotLabel = useMemo(
+    () => findLot(assignedLot)?.bookingLabel ?? assignedLot ?? '',
+    [assignedLot],
+  );
   const lotSlots = slots;
   // Bị phân công lại bãi khác giữa phiên → ô đang chọn (bãi cũ) không còn hợp lệ
   React.useEffect(() => {
@@ -264,6 +264,7 @@ export default function EmergencyPanel({
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
             <ParkingFloorMap
               slots={mapSlotData}
+              gates={findLot(assignedLot)?.gates}
               selectedId={selectedSlot}
               onSelect={(id) => setSelectedSlot(id === selectedSlot ? null : id)}
               interactive={true}

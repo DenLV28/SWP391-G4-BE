@@ -1,354 +1,288 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Plus, RotateCcw, RotateCw, Save, Trash2 } from 'lucide-react';
-import {
-  type AdminParkingLot,
-  type AdminParkingSlot,
-  type AdminSlotStatus,
-  type AdminVehicleType,
-  createAdminParkingSlot,
-  deleteAdminParkingSlot,
-  fetchAdminParkingSlots,
-  saveAdminParkingLayout,
-  updateAdminParkingSlot,
-} from '../../services/adminParkingLotService';
+import { useEffect, useMemo, useState } from 'react';
+import { ArrowLeft, LogIn, LogOut, Plus, Save, Trash2 } from 'lucide-react';
+import ParkingFloorMap, { type MapGate, type MapSlot } from '../../components/ParkingFloorMap';
+import type { LotGate, LotGridSlot, ParkingLotInfo } from '../../utils/parkingLots';
+import { updateParkingLot } from '../../services/parkingLotService';
 
-const VEHICLE_LABEL: Record<AdminVehicleType, string> = {
-  car: 'Ô tô',
+/**
+ * Trình thiết kế sơ đồ của Admin. Dùng lại đúng mặt bằng mẫu mà mọi role đang
+ * xem (ParkingFloorMap ở designMode) thay vì một canvas kéo-thả riêng, nên bãi
+ * mới trông y hệt các bãi cũ — Admin chỉ cần bấm chọn ô đỗ và đặt cổng.
+ */
+
+type VehicleKey = LotGridSlot['vehicleType'];
+
+const VEHICLE_LABEL: Record<VehicleKey, string> = {
+  car: 'Ô tô (xăng)',
   motorbike: 'Xe máy',
-  bicycle: 'Xe đạp',
+  'electric vehicle': 'Ô tô điện (EV)',
 };
 
-const STATUS_COLOR: Record<AdminSlotStatus, { fill: string; border: string; text: string }> = {
-  Available: { fill: '#ffffff', border: '#3b82f6', text: '#1d4ed8' },
-  Occupied: { fill: '#ecfdf5', border: '#10b981', text: '#047857' },
-  Maintenance: { fill: '#fef2f2', border: '#ef4444', text: '#b91c1c' },
+// Loại xe mặc định của từng dãy — khớp ROW_DEFAULTS bên backend.
+const ROW_VEHICLE: Record<string, VehicleKey> = {
+  A: 'car', B: 'motorbike', C: 'electric vehicle', D: 'car', E: 'motorbike',
 };
 
-const CANVAS_W = 1400;
-const CANVAS_H = 800;
-
-type DragState = { id: number; startX: number; startY: number; slotX: number; slotY: number };
+const GATE_POSITIONS: { value: LotGate['position']; label: string }[] = [
+  { value: 'left', label: 'Trái' },
+  { value: 'center', label: 'Giữa' },
+  { value: 'right', label: 'Phải' },
+];
 
 export default function ParkingLayoutEditor({
   lot,
   setView,
+  onSaved,
 }: {
-  lot: AdminParkingLot | null;
+  lot: ParkingLotInfo | null;
   setView: (view: string) => void;
+  onSaved: () => Promise<void>;
 }) {
-  const [slots, setSlots] = useState<AdminParkingSlot[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [slots, setSlots] = useState<LotGridSlot[]>([]);
+  const [gates, setGates] = useState<LotGate[]>([]);
+  const [selectedCode, setSelectedCode] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [saveMessage, setSaveMessage] = useState('');
-  const [panelError, setPanelError] = useState('');
-  const dragState = useRef<DragState | null>(null);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (!lot) {
       setView('parkinglotmanagement');
       return;
     }
-    (async () => {
-      setLoading(true);
-      const data = await fetchAdminParkingSlots(lot.id);
-      setSlots(data);
-      setLoading(false);
-    })();
+    setSlots(lot.slots.map((s) => ({ ...s })));
+    setGates(lot.gates.map((g) => ({ ...g })));
+    setSelectedCode(null);
+    setMessage('');
+    setError('');
   }, [lot, setView]);
+
+  // ParkingFloorMap khớp ô theo `code`; ở designMode chỉ cần biết ô nào tồn tại.
+  const mapSlots: MapSlot[] = useMemo(
+    () => slots.map((s) => ({ id: s.code, code: s.code, status: 'Available' as MapSlot['status'] })),
+    [slots],
+  );
+  const mapGates: MapGate[] = useMemo(
+    () => gates.map((g) => ({ kind: g.kind, label: g.label, position: g.position })),
+    [gates],
+  );
 
   if (!lot) return null;
 
-  const selected = slots.find((s) => s.id === selectedId) || null;
+  const selected = selectedCode ? slots.find((s) => s.code === selectedCode) : null;
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>, slot: AdminParkingSlot) => {
-    // Capture on the slot element itself, not e.target — a press that lands on
-    // the inner code/type label would otherwise capture the <span>.
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setSelectedId(slot.id);
-    dragState.current = { id: slot.id, startX: e.clientX, startY: e.clientY, slotX: slot.x, slotY: slot.y };
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = dragState.current;
-    if (!d) return;
-    const dx = e.clientX - d.startX;
-    const dy = e.clientY - d.startY;
-    const nextX = Math.min(Math.max(0, d.slotX + dx), CANVAS_W - 20);
-    const nextY = Math.min(Math.max(0, d.slotY + dy), CANVAS_H - 20);
-    setSlots((prev) => prev.map((s) => (s.id === d.id ? { ...s, x: nextX, y: nextY } : s)));
-  };
-
-  const handlePointerUp = () => {
-    dragState.current = null;
-  };
-
-  const handleAddSlot = async () => {
-    // Both the code and the drop position are derived from what's actually in
-    // the lot, not from slots.length — otherwise adding a slot after codes have
-    // been renamed collides (409) and the new slot lands on top of one the
-    // admin already dragged somewhere.
-    const usedCodes = new Set(slots.map((s) => s.code));
-    let n = 1;
-    while (usedCodes.has(`A${String(n).padStart(2, '0')}`)) n += 1;
-    const code = `A${String(n).padStart(2, '0')}`;
-
-    const NEW_W = 60;
-    const NEW_H = 40;
-    const overlaps = (x: number, y: number) =>
-      slots.some((s) => x < s.x + s.width && x + NEW_W > s.x && y < s.y + s.height && y + NEW_H > s.y);
-    let pos = { x: 40, y: 40 };
-    outer: for (let row = 0; row < 10; row += 1) {
-      for (let col = 0; col < 14; col += 1) {
-        const x = 40 + col * 90;
-        const y = 40 + row * 70;
-        if (x + NEW_W <= CANVAS_W && y + NEW_H <= CANVAS_H && !overlaps(x, y)) {
-          pos = { x, y };
-          break outer;
-        }
+  const handleToggleSlot = (code: string) => {
+    setMessage('');
+    setSlots((prev) => {
+      const exists = prev.some((s) => s.code === code);
+      if (exists) {
+        setSelectedCode(null);
+        return prev.filter((s) => s.code !== code);
       }
-    }
-
-    const result = await createAdminParkingSlot({
-      lotId: lot.id,
-      code,
-      vehicleType: 'car',
-      status: 'Available',
-      x: pos.x,
-      y: pos.y,
-      rotation: 0,
-      width: NEW_W,
-      height: NEW_H,
+      setSelectedCode(code);
+      return [...prev, { code, vehicleType: ROW_VEHICLE[code[0]] ?? 'car' }];
     });
-    if (!result.ok || !result.slot) {
-      setPanelError(result.error || 'Không thể tạo ô đỗ.');
-    } else {
-      const created = result.slot;
-      setSlots((prev) => [...prev, created]);
-      setSelectedId(created.id);
-    }
   };
 
-  const handleDeleteSlot = async (id: number) => {
-    await deleteAdminParkingSlot(id);
-    setSlots((prev) => prev.filter((s) => s.id !== id));
-    if (selectedId === id) setSelectedId(null);
+  const handleChangeVehicleType = (vehicleType: VehicleKey) => {
+    if (!selectedCode) return;
+    setSlots((prev) => prev.map((s) => (s.code === selectedCode ? { ...s, vehicleType } : s)));
   };
 
-  const patchSelected = (patch: Partial<AdminParkingSlot>) => {
-    if (!selectedId) return;
-    setSlots((prev) => prev.map((s) => (s.id === selectedId ? { ...s, ...patch } : s)));
+  const handleAddGate = (kind: LotGate['kind']) => {
+    setGates((prev) => [
+      ...prev,
+      { kind, label: kind === 'entry' ? 'Cổng vào' : 'Cổng ra', position: 'left' },
+    ]);
   };
 
-  const handleSaveSlotDetails = async () => {
-    if (!selected) return;
-    setPanelError('');
-    const result = await updateAdminParkingSlot(selected.id, {
-      code: selected.code,
-      vehicleType: selected.vehicleType,
-      status: selected.status,
-      width: selected.width,
-      height: selected.height,
-      rotation: selected.rotation,
+  const handleUpdateGate = (index: number, patch: Partial<LotGate>) => {
+    setGates((prev) => prev.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMessage('');
+    setError('');
+    const result = await updateParkingLot(lot.id, {
+      name: lot.name,
+      bookingLabel: lot.bookingLabel,
+      address: lot.address,
+      description: lot.description,
+      imageData: lot.imageData,
+      mapsUrl: lot.mapsUrl,
+      status: lot.status,
+      slots,
+      gates,
     });
-    if (!result.ok || !result.slot) {
-      setPanelError(result.error || 'Không thể cập nhật ô đỗ.');
+    setSaving(false);
+    await onSaved();
+    if (!result.ok) {
+      // 409 = có ô đang có xe/đặt chỗ nên không bỏ được; phần còn lại đã lưu.
+      setError(result.error || 'Không thể lưu sơ đồ.');
+      if (result.lot) setSlots(result.lot.slots.map((s) => ({ ...s })));
       return;
     }
-    const updated = result.slot;
-    setSlots((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+    setMessage('Đã lưu sơ đồ bãi đỗ.');
   };
 
-  const handleSaveLayout = async () => {
-    setSaving(true);
-    setSaveMessage('');
-    const result = await saveAdminParkingLayout(
-      lot.id,
-      slots.map((s) => ({ slotId: s.id, x: s.x, y: s.y, rotation: s.rotation })),
-    );
-    setSaving(false);
-    setSaveMessage(result.ok ? 'Đã lưu sơ đồ.' : result.error || 'Không thể lưu sơ đồ.');
-  };
+  const countByType = (t: VehicleKey) => slots.filter((s) => s.vehicleType === t).length;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
           <button
             onClick={() => setView('parkinglotmanagement')}
-            className="flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-indigo-600"
+            className="rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+            title="Quay lại danh sách bãi đỗ"
           >
-            <ArrowLeft className="h-4 w-4" /> Quay lại danh sách bãi đỗ
+            <ArrowLeft className="h-4 w-4" />
           </button>
-          <h2 className="mt-1 text-lg font-bold text-slate-800">Sơ đồ bãi đỗ: {lot.name}</h2>
+          <div>
+            <h1 className="text-lg font-bold text-slate-900">Thiết kế sơ đồ: {lot.name}</h1>
+            <p className="text-xs text-slate-500">
+              Bấm vào ô trên sơ đồ để thêm hoặc bỏ ô đỗ. Ô nét đứt là chưa có trong bãi.
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleAddSlot}
-            className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 shadow-sm hover:bg-slate-50"
-          >
-            <Plus className="h-4 w-4" /> Thêm ô đỗ
-          </button>
-          <button
-            onClick={handleSaveLayout}
-            disabled={saving}
-            className="flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-60"
-          >
-            <Save className="h-4 w-4" /> {saving ? 'Đang lưu...' : 'Lưu sơ đồ'}
-          </button>
-        </div>
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-60"
+        >
+          <Save className="h-4 w-4" />
+          {saving ? 'Đang lưu...' : 'Lưu sơ đồ'}
+        </button>
       </div>
 
-      {saveMessage && <p className="text-xs font-semibold text-emerald-600">{saveMessage}</p>}
+      {message && (
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-semibold text-emerald-700">
+          {message}
+        </div>
+      )}
+      {error && (
+        <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700">
+          {error}
+        </div>
+      )}
 
-      <div className="flex gap-4">
-        <div className="flex-1 overflow-auto rounded-2xl border border-slate-200 bg-slate-50" style={{ maxHeight: 640 }}>
-          {loading ? (
-            <div className="py-16 text-center text-xs text-slate-400">Đang tải sơ đồ...</div>
-          ) : (
-            <div
-              className="relative"
-              style={{
-                width: CANVAS_W,
-                height: CANVAS_H,
-                backgroundImage: lot.imageData ? `url(${lot.imageData})` : undefined,
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
-              }}
-              onClick={() => setSelectedId(null)}
-            >
-              {lot.imageData && <div className="absolute inset-0 bg-white/70" />}
-              {slots.map((slot) => {
-                const c = STATUS_COLOR[slot.status];
-                const isSelected = slot.id === selectedId;
-                return (
-                  <div
-                    key={slot.id}
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      handlePointerDown(e, slot);
-                    }}
-                    onPointerMove={handlePointerMove}
-                    onPointerUp={handlePointerUp}
-                    // The canvas's onClick clears the selection — without this a
-                    // click on a slot would select it on pointerdown, then bubble
-                    // up and immediately deselect it again.
-                    onClick={(e) => e.stopPropagation()}
-                    className="absolute flex cursor-grab select-none flex-col items-center justify-center rounded-lg border-2 text-[10px] font-bold shadow-sm active:cursor-grabbing"
-                    style={{
-                      left: slot.x,
-                      top: slot.y,
-                      width: slot.width,
-                      height: slot.height,
-                      transform: `rotate(${slot.rotation}deg)`,
-                      background: c.fill,
-                      borderColor: isSelected ? '#4f46e5' : c.border,
-                      color: c.text,
-                      boxShadow: isSelected ? '0 0 0 2px #4f46e5' : undefined,
-                    }}
-                  >
-                    <span>{slot.code}</span>
-                    <span className="text-[8px] font-semibold opacity-70">{VEHICLE_LABEL[slot.vehicleType]}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_300px]">
+        <div className="rounded-2xl border border-slate-100 bg-white p-3 shadow-sm">
+          <ParkingFloorMap
+            slots={mapSlots}
+            gates={mapGates}
+            designMode
+            onToggleSlot={handleToggleSlot}
+            selectedId={selectedCode}
+            level={1}
+          />
         </div>
 
-        <div className="w-72 shrink-0 space-y-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Chi tiết ô đỗ</h3>
-          {!selected ? (
-            <p className="text-xs text-slate-400">Chọn một ô đỗ trên sơ đồ để xem và chỉnh sửa.</p>
-          ) : (
-            <div className="space-y-3">
-              {panelError && <p className="text-[11px] font-semibold text-rose-500">{panelError}</p>}
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase text-slate-400">Mã ô đỗ</label>
-                <input
-                  value={selected.code}
-                  onChange={(e) => patchSelected({ code: e.target.value })}
-                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:ring-1 focus:ring-indigo-600"
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase text-slate-400">Loại phương tiện</label>
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Sức chứa</h3>
+            <p className="mt-2 text-2xl font-black text-slate-900">{slots.length} <span className="text-sm font-bold text-slate-400">ô đỗ</span></p>
+            <div className="mt-2 space-y-1 text-xs text-slate-600">
+              {(Object.keys(VEHICLE_LABEL) as VehicleKey[]).map((t) => (
+                <div key={t} className="flex justify-between">
+                  <span>{VEHICLE_LABEL[t]}</span>
+                  <span className="font-bold text-slate-800">{countByType(t)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Ô đang chọn</h3>
+            {selected ? (
+              <div className="mt-2 space-y-2">
+                <p className="font-mono text-sm font-black text-slate-900">{selected.code}</p>
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500">Loại xe</label>
                 <select
                   value={selected.vehicleType}
-                  onChange={(e) => patchSelected({ vehicleType: e.target.value as AdminVehicleType })}
-                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none"
+                  onChange={(e) => handleChangeVehicleType(e.target.value as VehicleKey)}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                 >
-                  <option value="car">Ô tô</option>
-                  <option value="motorbike">Xe máy</option>
-                  <option value="bicycle">Xe đạp</option>
+                  {(Object.keys(VEHICLE_LABEL) as VehicleKey[]).map((t) => (
+                    <option key={t} value={t}>{VEHICLE_LABEL[t]}</option>
+                  ))}
                 </select>
-              </div>
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase text-slate-400">Trạng thái</label>
-                <select
-                  value={selected.status}
-                  onChange={(e) => patchSelected({ status: e.target.value as AdminSlotStatus })}
-                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none"
-                >
-                  <option value="Available">Trống</option>
-                  <option value="Occupied">Đang đỗ</option>
-                  <option value="Maintenance">Bảo trì</option>
-                </select>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
-                  <label className="block text-[11px] font-bold uppercase text-slate-400">Rộng</label>
-                  <input
-                    type="number"
-                    value={selected.width}
-                    onChange={(e) => patchSelected({ width: Number(e.target.value) || 0 })}
-                    className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <label className="block text-[11px] font-bold uppercase text-slate-400">Cao</label>
-                  <input
-                    type="number"
-                    value={selected.height}
-                    onChange={(e) => patchSelected({ height: Number(e.target.value) || 0 })}
-                    className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none"
-                  />
-                </div>
-              </div>
-              <div className="space-y-1">
-                <label className="block text-[11px] font-bold uppercase text-slate-400">Xoay ({selected.rotation}°)</label>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => patchSelected({ rotation: (selected.rotation - 15 + 360) % 360 })}
-                    className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-slate-200 py-1.5 text-xs hover:bg-slate-50"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" /> -15°
-                  </button>
-                  <button
-                    onClick={() => patchSelected({ rotation: (selected.rotation + 15) % 360 })}
-                    className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-slate-200 py-1.5 text-xs hover:bg-slate-50"
-                  >
-                    <RotateCw className="h-3.5 w-3.5" /> +15°
-                  </button>
-                </div>
-              </div>
-              <div className="flex gap-2 pt-2">
                 <button
-                  onClick={handleSaveSlotDetails}
-                  className="flex-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-bold text-white hover:bg-indigo-500"
+                  onClick={() => handleToggleSlot(selected.code)}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100"
                 >
-                  Lưu thông tin ô
-                </button>
-                <button
-                  onClick={() => handleDeleteSlot(selected.id)}
-                  className="rounded-lg border border-rose-200 p-2 text-rose-500 hover:bg-rose-50"
-                  title="Xóa ô đỗ"
-                >
-                  <Trash2 className="h-4 w-4" />
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Bỏ ô này khỏi bãi
                 </button>
               </div>
+            ) : (
+              <p className="mt-2 text-xs text-slate-400">Bấm một ô trên sơ đồ để chỉnh loại xe.</p>
+            )}
+          </div>
+
+          <div className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Cổng vào / ra</h3>
+            <div className="mt-2 space-y-2">
+              {gates.length === 0 && (
+                <p className="text-xs text-slate-400">Chưa có cổng nào. Thêm ít nhất 1 cổng vào và 1 cổng ra.</p>
+              )}
+              {gates.map((g, i) => (
+                <div key={i} className="space-y-1.5 rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+                  <div className="flex items-center justify-between">
+                    <span
+                      className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                        g.kind === 'entry'
+                          ? 'bg-emerald-100 text-emerald-700'
+                          : 'bg-rose-100 text-rose-700'
+                      }`}
+                    >
+                      {g.kind === 'entry' ? <LogIn className="h-3 w-3" /> : <LogOut className="h-3 w-3" />}
+                      {g.kind === 'entry' ? 'Vào' : 'Ra'}
+                    </span>
+                    <button
+                      onClick={() => setGates((prev) => prev.filter((_, idx) => idx !== i))}
+                      className="text-slate-400 hover:text-rose-600"
+                      title="Xóa cổng"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <input
+                    value={g.label}
+                    onChange={(e) => handleUpdateGate(i, { label: e.target.value })}
+                    placeholder="Tên cổng"
+                    className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-blue-600"
+                  />
+                  <select
+                    value={g.position}
+                    onChange={(e) => handleUpdateGate(i, { position: e.target.value as LotGate['position'] })}
+                    className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-blue-600"
+                  >
+                    {GATE_POSITIONS.map((p) => (
+                      <option key={p.value} value={p.value}>Vị trí: {p.label}</option>
+                    ))}
+                  </select>
+                </div>
+              ))}
             </div>
-          )}
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={() => handleAddGate('entry')}
+                className="flex flex-1 items-center justify-center gap-1 rounded-xl bg-emerald-50 px-2 py-2 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Cổng vào
+              </button>
+              <button
+                onClick={() => handleAddGate('exit')}
+                className="flex flex-1 items-center justify-center gap-1 rounded-xl bg-rose-50 px-2 py-2 text-[11px] font-bold text-rose-700 hover:bg-rose-100"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Cổng ra
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

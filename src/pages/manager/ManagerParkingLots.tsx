@@ -1,14 +1,9 @@
 import { useMemo, useState } from 'react';
 import { MapPin, LayoutGrid, List, X, Building2, Car, BarChart3, UserCog } from 'lucide-react';
 import { Floor, Area, Slot, User } from '../../data/mockData';
-import { sameLot, findLotStatus } from '../../utils/parkingLots';
-import type { ParkingLotStatus, LotStatus } from '../../services/parkingLotService';
-// Same real lot photos the public "Bãi xe nổi bật" list uses (per-lot match)
-import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
-import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
-import baiXeLongPhuocImg from '../../assets/images/bai-xe-long-phuoc.jpg';
-// Nhà Văn Hóa chưa có ảnh chụp thật — dùng ảnh chi nhánh ParkFlow chung làm placeholder.
-import baiXeNhaVanHoaImg from '../../assets/images/xe-trong.jpg';
+import { sameLot, type ParkingLotInfo } from '../../utils/parkingLots';
+import { lotImageOf } from '../../utils/lotImages';
+import type { LotStatus } from '../../services/parkingLotService';
 
 interface ParkingLot {
   id: string;
@@ -29,51 +24,10 @@ interface ManagerParkingLotsProps {
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
   /** Bấm "Xem chi tiết" — báo cho ManagerDashboard biết bãi nào để trang chi tiết render đúng bãi. */
   onViewDetail?: (lot: { name: string; address: string; status: string }) => void;
-  /** Trạng thái vận hành thật của từng bãi (nguồn: dbo.parking_lots qua App.tsx) — ghi đè status tĩnh bên dưới. */
-  lotStatuses?: ParkingLotStatus[];
+  /** Danh mục bãi thật (nguồn: dbo.parking_lots qua App.tsx). */
+  lotStatuses?: ParkingLotInfo[];
   onUpdateLotStatus?: (name: string, status: LotStatus) => Promise<boolean>;
 }
-
-// Tên/địa chỉ/ảnh/sức chứa tĩnh — chỉ "status" là đổi được, và status thật
-// nằm ở dbo.parking_lots (xem lotStatuses prop), không phải giá trị tĩnh dưới đây.
-const INITIAL_LOTS: ParkingLot[] = [
-  {
-    id: 'lot-1',
-    name: 'ParkFlow Long Phước',
-    address: 'Tp, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam',
-    status: 'Hoạt động',
-    totalSlots: 600,
-    occupied: 450,
-    imageUrl: baiXeLongPhuocImg,
-  },
-  {
-    id: 'lot-2',
-    name: 'ParkFlow Thủ Đức',
-    address: '86/33 Đ. Số 5, khu phố 3, Linh Xuân, Hồ Chí Minh, Việt Nam',
-    status: 'Hoạt động',
-    totalSlots: 400,
-    occupied: 180,
-    imageUrl: baiXeThuDucImg,
-  },
-  {
-    id: 'lot-3',
-    name: 'ParkFlow Quận 9',
-    address: '5A Đường Lò Lu, KP. Phước Hiệp, P, Long Phước, Hồ Chí Minh 700000, Việt Nam',
-    status: 'Bảo trì',
-    totalSlots: 500,
-    occupied: 0,
-    imageUrl: baiXeQuan9Img,
-  },
-  {
-    id: 'lot-4',
-    name: 'ParkFlow Nhà Văn Hóa',
-    address: 'Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam',
-    status: 'Hoạt động',
-    totalSlots: 250,
-    occupied: 90,
-    imageUrl: baiXeNhaVanHoaImg,
-  },
-];
 
 const STATUS_STYLE: Record<LotStatus, string> = {
   'Hoạt động': 'bg-green-100 text-green-700 border border-green-200',
@@ -88,14 +42,20 @@ const STATUS_DOT: Record<LotStatus, string> = {
 };
 
 export default function ManagerParkingLots({ setView, users = [], slots = [], onAssignStaff, onViewDetail, lotStatuses = [], onUpdateLotStatus }: ManagerParkingLotsProps) {
-  // Status thật lấy từ dbo.parking_lots (lotStatuses); còn lotStatuses chưa
-  // tải xong (mảng rỗng lúc mới mount) thì tạm dùng giá trị tĩnh bên trên.
-  const lots = useMemo(
+  // Toàn bộ danh sách bãi đến từ dbo.parking_lots — Admin thêm/xóa bãi là trang
+  // này đổi theo, không còn mảng tĩnh nào ở frontend. Sức chứa/lấp đầy tính từ
+  // kho ô đỗ thật trong lotStats() bên dưới.
+  const lots: ParkingLot[] = useMemo(
     () =>
-      INITIAL_LOTS.map((l) => {
-        const dbStatus = findLotStatus(lotStatuses, l.name);
-        return dbStatus ? { ...l, status: dbStatus.status } : l;
-      }),
+      lotStatuses.map((l) => ({
+        id: String(l.id),
+        name: l.name,
+        address: l.address,
+        status: l.status,
+        totalSlots: l.slotCount,
+        occupied: 0,
+        imageUrl: lotImageOf(l),
+      })),
     [lotStatuses],
   );
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');

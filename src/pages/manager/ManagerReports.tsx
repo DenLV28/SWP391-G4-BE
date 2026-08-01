@@ -1,7 +1,7 @@
 import { useState, useMemo, type ReactNode } from 'react';
 import { Calendar, Download, FileText, ChevronLeft, ChevronRight, TrendingUp, TrendingDown, Minus, ChevronDown, Building2, PieChart } from 'lucide-react';
 import type { Payment, Reservation } from '../../data/mockData';
-import { PARKING_LOTS, lotKeyOrDefault, type LotKey } from '../../utils/parkingLots';
+import { lotKeyOrDefault, type LotKey, type ParkingLotInfo } from '../../utils/parkingLots';
 
 type TimeTab = '7days' | 'month' | 'custom';
 
@@ -82,9 +82,12 @@ const SOURCE_META: Record<string, { label: string; cls: string }> = {
 export default function ManagerReports({
   payments = [],
   reservations = [],
+  parkingLots = [],
 }: {
   payments?: Payment[];
   reservations?: Reservation[];
+  /** Danh mục bãi từ backend — nguồn cho cột "doanh thu theo bãi" và bộ lọc bãi. */
+  parkingLots?: ParkingLotInfo[];
 }) {
   const [activeTab, setActiveTab]         = useState<TimeTab>('7days');
   const [page, setPage]                   = useState(1);
@@ -166,12 +169,12 @@ export default function ManagerReports({
         (!filterVehicle || e.vehicle === filterVehicle) &&
         (!filterPayment || e.method === filterPayment),
     );
-    const rows = PARKING_LOTS.map((lot) => {
+    const rows = parkingLots.map((lot) => {
       const items = scoped.filter((e) => e.lotKey === lot.key);
       return { key: lot.key as LotKey, name: lot.name, revenue: items.reduce((s, e) => s + e.amount, 0), count: items.length };
     });
     return { rows, total: scoped.reduce((s, e) => s + e.amount, 0), count: scoped.length };
-  }, [enriched, range, filterVehicle, filterPayment]);
+  }, [enriched, range, filterVehicle, filterPayment, parkingLots]);
 
   // ── Nguồn doanh thu (theo loại giao dịch & phương thức thanh toán) ──────────
   const bySource = useMemo(() => {
@@ -393,7 +396,7 @@ export default function ManagerReports({
       <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
         {[
           { value: filterLot,     setter: setFilterLot,     label: 'Tất cả bãi đỗ',
-            opts: PARKING_LOTS.map((l) => [l.key, l.name] as [string, string]) },
+            opts: parkingLots.map((l) => [l.key, l.name] as [string, string]) },
           { value: filterVehicle, setter: setFilterVehicle, label: 'Tất cả loại xe',
             opts: [['motorbike', 'Xe máy / Xe máy điện'], ['car', 'Ô tô 4-7 chỗ (Xăng)'], ['electric vehicle', 'Ô tô Điện / EV']] as [string, string][] },
           { value: filterPayment, setter: setFilterPayment, label: 'Tất cả thanh toán',

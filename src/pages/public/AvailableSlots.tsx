@@ -6,8 +6,7 @@ import VietQRModal from '../../components/VietQRModal';
 import ParkingFloorMap, { MapSlot } from '../../components/ParkingFloorMap';
 import { createVNPayPayment } from '../../services/vnpayService';
 import { createPayment } from '../../services/paymentService';
-import { PARKING_LOTS, lotKeyOrDefault, isLotUnavailable } from '../../utils/parkingLots';
-import type { ParkingLotStatus } from '../../services/parkingLotService';
+import { findLot, lotKeyOrDefault, isLotUnavailable, type ParkingLotInfo } from '../../utils/parkingLots';
 import { nowLocalStr } from '../../utils/helpers';
 import { addOneMonth, findActiveMonthlyReservation } from '../../utils/reservationPricing';
 
@@ -23,7 +22,7 @@ interface Props {
   onDiscardReservation?: (id: string) => void;
   reservations: Reservation[];
   pricingRules: PricingRule[];
-  lotStatuses?: ParkingLotStatus[];
+  lotStatuses?: ParkingLotInfo[];
 }
 
 type PackageKey = 'hour' | 'overnight' | 'month';
@@ -79,9 +78,6 @@ const PRICING_ROW_META: Record<VehicleKey, { sub: string; unit: string }> = {
   'electric vehicle': { sub: 'EV + trạm sạc kèm theo', unit: '/giờ' },
 };
 
-// Danh sách bãi lấy từ nguồn chung — nhãn giữ nguyên như dữ liệu đặt chỗ cũ.
-const LOT_OPTIONS = PARKING_LOTS.map((l) => l.bookingLabel);
-
 // Legend items
 
 const vehicleLabelMap: Record<string, string> = {
@@ -105,7 +101,18 @@ export default function AvailableSlots({
 }: Props) {
   // Hủy từ modal thành công: ưu tiên xóa hẳn; thiếu prop thì rơi về hủy thường.
   const discardBooking = (id: string) => (onDiscardReservation ?? onCancelReservation)?.(id);
-  const [selectedLot, setSelectedLot] = useState(LOT_OPTIONS[0]);
+  // Danh sách bãi lấy từ danh mục backend — nhãn giữ nguyên như dữ liệu đặt chỗ cũ.
+  const LOT_OPTIONS = useMemo(
+    () => lotStatuses.map((l) => l.bookingLabel || l.name),
+    [lotStatuses],
+  );
+  // Danh mục tải bất đồng bộ nên lúc mount còn rỗng: chọn bãi đầu tiên ngay khi
+  // có, và chuyển bãi khác nếu bãi đang chọn bị Admin xóa/đổi tên.
+  const [selectedLot, setSelectedLot] = useState('');
+  useEffect(() => {
+    if (!LOT_OPTIONS.length) return;
+    if (!selectedLot || !LOT_OPTIONS.includes(selectedLot)) setSelectedLot(LOT_OPTIONS[0]);
+  }, [LOT_OPTIONS, selectedLot]);
   const [fullName, setFullName] = useState(currentUser?.fullName ?? 'Nguyễn Văn A');
   const [phone, setPhone] = useState(currentUser?.phone ?? '090 123 4567');
   const [licensePlate, setLicensePlate] = useState('');
@@ -566,6 +573,7 @@ export default function AvailableSlots({
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-2 overflow-hidden">
                     <ParkingFloorMap
                       slots={lotSlots.map((s) => ({ id: s.id, code: s.slotCode.split('-').pop() ?? s.slotCode, status: s.status } as MapSlot))}
+                      gates={findLot(selectedLot)?.gates}
                       selectedId={selectedSlotId}
                       onSelect={(id) => setSelectedSlotId((prev) => (prev === id ? null : id))}
                       interactive={true}

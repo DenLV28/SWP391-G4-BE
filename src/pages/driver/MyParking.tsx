@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Ticket, Receipt, Car, Clock, MapPin, CreditCard, Hash, DoorOpen, Trash2, Building2 } from 'lucide-react';
 import { User, ParkingSession, Reservation, Feedback, SavedVehicle, PricingRule, Slot } from '../../data/mockData';
-import { PARKING_LOTS } from '../../utils/parkingLots';
+import { getLotCatalog } from '../../utils/parkingLots';
 import StatCard from '../../components/StatCard';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
@@ -26,7 +26,10 @@ function formatDateTime(v: string) {
 function lotLabelFor(res: Reservation, slots: Slot[]): string {
   if (res.parkingLot) return res.parkingLot;
   const slot = slots.find((s) => s.slotCode === res.slotCode);
-  return slot?.parkingLot || PARKING_LOTS.find((l) => l.key === 'quan9')!.name;
+  if (slot?.parkingLot) return slot.parkingLot;
+  // Dữ liệu cũ không ghi bãi → thuộc bãi gốc (bãi có mã ô không mang tiền tố).
+  const catalog = getLotCatalog();
+  return (catalog.find((l) => l.codePrefix === '') ?? catalog[0])?.name ?? '';
 }
 
 /** Đã gửi bao lâu, chạy real-time (HH:MM:SS) từ mốc check-in tới `nowMs`. */

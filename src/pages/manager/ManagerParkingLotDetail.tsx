@@ -5,7 +5,7 @@ import {
 } from 'lucide-react';
 import type { Slot } from '../../data/mockData';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
-import { sameLot } from '../../utils/parkingLots';
+import { findLot, sameLot } from '../../utils/parkingLots';
 
 /** Bãi đang xem chi tiết — do ManagerParkingLots truyền qua khi bấm "Xem chi tiết". */
 export interface LotDetailInfo {
@@ -50,6 +50,8 @@ export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: Ma
     code: s.slotCode.split('-').pop() ?? s.slotCode,
     status: s.status as MapSlot['status'],
   }));
+  // Cổng vào/ra do Admin đặt riêng cho bãi này.
+  const lotGates = findLot(lot.name)?.gates;
 
   const occupied    = lotSlots.filter((s) => s.status === 'Occupied').length;
   const reserved    = lotSlots.filter((s) => s.status === 'Reserved' || s.status === 'Pending').length;
@@ -117,7 +119,7 @@ export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: Ma
         </div>
 
         {lotSlots.length > 0 ? (
-          <ParkingFloorMap slots={mapSlots} level={1} />
+          <ParkingFloorMap slots={mapSlots} gates={lotGates} level={1} />
         ) : (
           <p className="py-10 text-center text-sm text-slate-400">
             Bãi này chưa có dữ liệu ô đỗ trong hệ thống.

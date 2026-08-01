@@ -5,12 +5,8 @@ import {
 } from 'lucide-react';
 import parkflowBg from '../../assets/images/parkflow_bg_1779336618673.png';
 import type { PricingRule, VehicleKey } from '../../data/mockData';
-// Real photos of the lots (see "Bãi xe nổi bật")
-import baiXeQuan9Img from '../../assets/images/bai-xe-quan-9.jpg';
-import baiXeThuDucImg from '../../assets/images/bai-xe-thu-duc.jpg';
-import baiXeLongPhuocImg from '../../assets/images/bai-xe-long-phuoc.jpg';
-// Nhà Văn Hóa chưa có ảnh chụp thật — dùng ảnh chi nhánh ParkFlow chung làm placeholder.
-import baiXeNhaVanHoaImg from '../../assets/images/xe-trong.jpg';
+import type { LotGate, LotGridSlot, ParkingLotInfo } from '../../utils/parkingLots';
+import { lotImageOf } from '../../utils/lotImages';
 
 interface Lot {
   id: string;
@@ -23,80 +19,41 @@ interface Lot {
   features: { icon: React.ReactNode; label: string }[];
   priceFrom: string;
   floor: { name: string; items: string[] };
+  slots: LotGridSlot[];
+  gates: LotGate[];
 }
 
-const lots: Lot[] = [
-  {
-    id: '1',
-    name: 'Bãi đỗ xe ParkFlow Quận 9',
-    address: '5A Đường Lò Lu, KP. Phước Hiệp, P, Long Phước, Hồ Chí Minh 700000, Việt Nam',
-    googleMapsUrl: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent('5A Đường Lò Lu, KP. Phước Hiệp, P, Long Phước, Hồ Chí Minh 700000, Việt Nam'),
-    image: baiXeQuan9Img,
-    badge: 'Còn chỗ',
-    badgeColor: 'bg-blue-600 text-white',
-    features: [
-      { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Tòa nhà' },
-      { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
-      { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
-      { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
-    ],
-    priceFrom: '200.000đ',
-    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
-  },
-  {
-    id: '2',
-    name: 'Bãi đỗ xe ParkFlow Thủ Đức',
-    address: '86/33 Đ. Số 5, khu phố 3, Linh Xuân, Hồ Chí Minh, Việt Nam',
-    googleMapsUrl: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent('86/33 Đ. Số 5, khu phố 3, Linh Xuân, Hồ Chí Minh, Việt Nam'),
-    image: baiXeThuDucImg,
-    badge: 'Phổ biến',
-    badgeColor: 'bg-emerald-600 text-white',
-    features: [
-      { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Mái che tôn' },
-      { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
-      { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
-      { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
-    ],
-    priceFrom: '200.000đ',
-    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
-  },
-  {
-    id: '3',
-    name: 'Bãi đỗ xe ParkFlow Long Phước',
-    address: 'Tp, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam',
-    // The query includes the Google Maps place name ("Bãi Giữ xe ô tô Thủ Đức")
-    // so Maps snaps to the exact business pin instead of a street-level guess.
-    googleMapsUrl: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent('Bãi Giữ xe ô tô Thủ Đức, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam'),
-    image: baiXeLongPhuocImg,
-    badge: 'Còn chỗ',
-    badgeColor: 'bg-blue-600 text-white',
-    features: [
-      { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Mái che tôn' },
-      { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
-      { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
-      { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
-    ],
-    priceFrom: '200.000đ',
-    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
-  },
-  {
-    id: '4',
-    name: 'Bãi đỗ xe ParkFlow Nhà Văn Hóa',
-    address: 'Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam',
-    googleMapsUrl: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent('Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam'),
-    image: baiXeNhaVanHoaImg,
-    badge: 'Còn chỗ',
-    badgeColor: 'bg-blue-600 text-white',
-    features: [
-      { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Tòa nhà' },
-      { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
-      { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
-      { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
-    ],
-    priceFrom: '200.000đ',
-    floor: { name: 'Tầng 1', items: ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'] },
-  },
+// Tiện ích/nhãn giá là phần trình bày chung của mọi chi nhánh ParkFlow — giữ
+// tĩnh ở frontend. Còn tên/địa chỉ/ảnh/sơ đồ đến từ danh mục bãi ở backend.
+const DEFAULT_FEATURES = [
+  { icon: <Home className="h-4 w-4 text-blue-600" />, label: 'Tòa nhà' },
+  { icon: <Camera className="h-4 w-4 text-blue-600" />, label: 'Camera 24/7' },
+  { icon: <Shield className="h-4 w-4 text-blue-600" />, label: 'Bảo vệ' },
+  { icon: <Zap className="h-4 w-4 text-blue-600" />, label: 'Trạm sạc điện' },
 ];
+
+const FLOOR_ITEMS = ['Ô tô 4-7 chỗ (Xăng)', 'Ô tô 4-7 chỗ (Điện/EV)', 'Trạm sạc EV', 'Staff Booth'];
+
+/** Bãi trong danh mục backend → thẻ hiển thị trên trang công khai. */
+function toPublicLot(lot: ParkingLotInfo): Lot {
+  const available = lot.status === 'Hoạt động';
+  return {
+    id: String(lot.id),
+    name: `Bãi đỗ xe ${lot.name}`,
+    address: lot.address,
+    googleMapsUrl:
+      lot.mapsUrl ||
+      'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(lot.address || lot.name),
+    image: lotImageOf(lot),
+    badge: available ? 'Còn chỗ' : lot.status,
+    badgeColor: available ? 'bg-blue-600 text-white' : 'bg-slate-500 text-white',
+    features: DEFAULT_FEATURES,
+    priceFrom: '200.000đ',
+    floor: { name: 'Tầng 1', items: FLOOR_ITEMS },
+    slots: lot.slots,
+    gates: lot.gates,
+  };
+}
 
 function formatVnd(value: number) {
   return `${value.toLocaleString('vi-VN')}đ`;
@@ -207,7 +164,14 @@ function LotCard({ lot, onBook }: { lot: Lot; onBook: (lotId: string) => void })
             <div className="bg-white">
               {/* Floor plan — same schematic map as the booking page (view-only) */}
               <div className="relative bg-slate-50 p-2">
-                <ParkingFloorMap level={1} interactive={false} />
+                {/* Sơ đồ thật của chính bãi này: chỉ vẽ những ô Admin đã thêm,
+                    cùng vị trí cổng vào/ra do Admin đặt. */}
+                <ParkingFloorMap
+                  level={1}
+                  interactive={false}
+                  slots={lot.slots.map((s) => ({ id: s.code, code: s.code, status: 'Available' as const }))}
+                  gates={lot.gates}
+                />
                 <div className="absolute top-4 left-4 bg-blue-700/90 text-white text-[11px] font-bold px-3 py-1 rounded-full backdrop-blur-sm border border-blue-400/40">
                   {lot.floor.name}
                 </div>
@@ -257,10 +221,14 @@ function LotCard({ lot, onBook }: { lot: Lot; onBook: (lotId: string) => void })
 export default function ParkingLotsList({
   setView,
   pricingRules = [],
+  parkingLots = [],
 }: {
   setView: (v: string) => void;
   pricingRules?: PricingRule[];
+  /** Danh mục bãi từ backend — Admin thêm bãi là trang này có ngay thẻ mới. */
+  parkingLots?: ParkingLotInfo[];
 }) {
+  const lots = parkingLots.map(toPublicLot);
   const [search, setSearch] = useState('');
   const featuredRef = useRef<HTMLElement>(null);
   const pricingRows = buildPricingRows(pricingRules);

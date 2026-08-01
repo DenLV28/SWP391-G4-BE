@@ -4,30 +4,45 @@ import bcrypt from 'bcryptjs';
 import sql from 'mssql';
 import crypto from 'crypto';
 import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Nạp backend/.env (bí mật VNPay, thông tin SQL) nếu có. Dùng process.loadEnvFile
+// của Node ≥20.12 nên không cần thêm phụ thuộc dotenv. Thiếu file thì bỏ qua —
+// mọi biến đều có giá trị mặc định chạy được trên máy dev.
+try {
+  process.loadEnvFile(path.join(path.dirname(fileURLToPath(import.meta.url)), '.env'));
+} catch {
+  // Không có .env — chạy bằng giá trị mặc định.
+}
 
 const PORT = process.env.PORT || 4000;
 
 // ── VNPay Config ─────────────────────────────────────────────────────────────
 // Đăng ký sandbox tại: https://sandbox.vnpayment.vn/devreg/
-// Thay tmnCode và hashSecret bằng thông tin từ tài khoản sandbox của bạn
+// tmnCode/hashSecret là thông tin bí mật của tài khoản merchant — KHÔNG ghi
+// thẳng vào file này (repo công khai). Đặt trong backend/.env (xem .env.example),
+// file đó đã nằm trong .gitignore.
 const VNPAY_CONFIG = {
-  tmnCode:    'WHAC49QH',
-  hashSecret: '3KA9IQPZ7ZYH73FJXBV9J650S4YQHLDK',
-  paymentUrl: 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
-  returnUrl:  'http://localhost:4000/api/vnpay/return',
-  frontendUrl:'http://localhost:5173',
+  tmnCode:    process.env.VNPAY_TMN_CODE    || '',
+  hashSecret: process.env.VNPAY_HASH_SECRET || '',
+  paymentUrl: process.env.VNPAY_PAYMENT_URL || 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
+  returnUrl:  process.env.VNPAY_RETURN_URL  || 'http://localhost:4000/api/vnpay/return',
+  frontendUrl:process.env.FRONTEND_URL      || 'http://localhost:5173',
 };
+// SQL Server local: giữ giá trị mặc định để `npm run dev` chạy được ngay trên
+// máy dev, nhưng cho phép ghi đè qua .env khi deploy.
 const SQL_CONFIG = {
   authentication: {
     type: 'default',
     options: {
-      userName: 'sa',
-      password: '12345',
+      userName: process.env.DB_USER     || 'sa',
+      password: process.env.DB_PASSWORD || '12345',
     },
   },
-  server: 'localhost',
+  server: process.env.DB_SERVER || 'localhost',
   options: {
-    database: 'parking_management',
+    database: process.env.DB_NAME || 'parking_management',
     encrypt: true,
     trustServerCertificate: true,
   },
@@ -594,46 +609,129 @@ async function createTables() {
     END
   `);
 
-  // admin_parking_lots / admin_parking_slots — standalone lot-design tool for
-  // the Admin "Quản lý bãi đỗ" feature. Deliberately separate from
-  // dbo.parking_lots/dbo.parking_slots (the live tables reservations/staff/
-  // manager read from a hardcoded 4-lot allow-list): admins can freely
-  // create/delete lots and slots here without touching booking/session
-  // behavior. Slots are free-form (pos_x/pos_y/rotation), unlike the fixed
-  // row/column formula used by ParkingFloorMap.
+  // parking_lots giờ là danh mục bãi đầy đủ (không chỉ trạng thái) — Admin tạo
+  // /sửa/xóa bãi ở đây và mọi role đọc từ đó. Trước kia tên/địa chỉ/ảnh/prefix
+  // mã ô nằm rải rác hardcode ở frontend (ParkingLotsList, ManagerParkingLots,
+  // utils/parkingLots.ts) và ở SLOT_LOTS bên dưới, nên bãi mới không thể thêm.
+  // Thêm cột theo kiểu ALTER idempotent (giống parking_slots.parking_lot ở trên)
+  // để DB đang chạy nâng cấp được mà không mất dữ liệu.
+  for (const [col, ddl] of [
+    ['code_prefix',   `NVARCHAR(10)   NOT NULL DEFAULT ''`],
+    ['booking_label', `NVARCHAR(200)  NOT NULL DEFAULT ''`],
+    ['address',       `NVARCHAR(400)  NOT NULL DEFAULT ''`],
+    ['description',   `NVARCHAR(1000) NOT NULL DEFAULT ''`],
+    ['image_key',     `NVARCHAR(50)   NOT NULL DEFAULT ''`],
+    ['image_data',    `NVARCHAR(MAX)  NOT NULL DEFAULT ''`],
+    ['maps_url',      `NVARCHAR(500)  NOT NULL DEFAULT ''`],
+    ['created_at',    `DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()`],
+  ]) {
+    await pool.request().query(`
+      IF COL_LENGTH('dbo.parking_lots', '${col}') IS NULL
+        ALTER TABLE dbo.parking_lots ADD ${col} ${ddl};
+    `);
+  }
+
+  // parking_lot_gates — cổng vào/ra của từng bãi. Trước đây ENTRY/EXIT được vẽ
+  // cứng ở góc trái trên/dưới trong ParkingFloorMap.tsx; giờ Admin đặt được vị
+  // trí (trái/giữa/phải trên làn) và tên cổng cho mỗi bãi.
   await pool.request().query(`
-    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'admin_parking_lots' AND schema_id = SCHEMA_ID('dbo'))
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'parking_lot_gates' AND schema_id = SCHEMA_ID('dbo'))
     BEGIN
-      CREATE TABLE dbo.admin_parking_lots (
-        lot_id      INT IDENTITY(1,1) PRIMARY KEY,
-        name        NVARCHAR(200)  NOT NULL UNIQUE,
-        description NVARCHAR(1000) NOT NULL DEFAULT '',
-        image_data  NVARCHAR(MAX)  NOT NULL DEFAULT '',
-        created_at  DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
-        updated_at  DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+      CREATE TABLE dbo.parking_lot_gates (
+        gate_id  INT IDENTITY(1,1) PRIMARY KEY,
+        lot_id   INT           NOT NULL REFERENCES dbo.parking_lots(lot_id) ON DELETE CASCADE,
+        kind     NVARCHAR(10)  NOT NULL CHECK (kind IN ('entry', 'exit')),
+        label    NVARCHAR(100) NOT NULL DEFAULT '',
+        position NVARCHAR(10)  NOT NULL DEFAULT 'left'
+                 CHECK (position IN ('left', 'center', 'right'))
       );
+      CREATE INDEX IX_parking_lot_gates_lot_id ON dbo.parking_lot_gates(lot_id);
     END
   `);
+
+  await backfillLotCatalog();
+
+  // Bảng của công cụ thiết kế cũ (admin_parking_lots/admin_parking_slots) đã bị
+  // gộp vào dbo.parking_lots/parking_slots — bỏ đi để chỉ còn một nguồn chân lý.
   await pool.request().query(`
-    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'admin_parking_slots' AND schema_id = SCHEMA_ID('dbo'))
-    BEGIN
-      CREATE TABLE dbo.admin_parking_slots (
-        slot_id      INT IDENTITY(1,1) PRIMARY KEY,
-        lot_id       INT           NOT NULL REFERENCES dbo.admin_parking_lots(lot_id) ON DELETE CASCADE,
-        slot_code    NVARCHAR(20)  NOT NULL,
-        vehicle_type NVARCHAR(20)  NOT NULL DEFAULT 'car' CHECK (vehicle_type IN ('car', 'motorbike', 'bicycle')),
-        status       NVARCHAR(20)  NOT NULL DEFAULT 'Available' CHECK (status IN ('Available', 'Occupied', 'Maintenance')),
-        pos_x        FLOAT         NOT NULL DEFAULT 0,
-        pos_y        FLOAT         NOT NULL DEFAULT 0,
-        rotation     FLOAT         NOT NULL DEFAULT 0,
-        width        FLOAT         NOT NULL DEFAULT 60,
-        height       FLOAT         NOT NULL DEFAULT 40,
-        created_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-        updated_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT UX_admin_parking_slots_lot_code UNIQUE (lot_id, slot_code)
-      );
-      CREATE INDEX IX_admin_parking_slots_lot_id ON dbo.admin_parking_slots(lot_id);
-    END
+    IF EXISTS (SELECT * FROM sys.tables WHERE name = 'admin_parking_slots' AND schema_id = SCHEMA_ID('dbo'))
+      DROP TABLE dbo.admin_parking_slots;
+    IF EXISTS (SELECT * FROM sys.tables WHERE name = 'admin_parking_lots' AND schema_id = SCHEMA_ID('dbo'))
+      DROP TABLE dbo.admin_parking_lots;
+  `);
+}
+
+// Metadata của 4 bãi gốc — trước đây hardcode ở frontend. Chỉ dùng để rót vào
+// DB một lần; sau đó DB là nguồn chân lý và Admin sửa được qua UI.
+const LEGACY_LOT_METADATA = [
+  {
+    name: 'ParkFlow Quận 9',
+    codePrefix: '',
+    bookingLabel: 'ParkFlow Quận 9 - Lò Lu',
+    address: '5A Đường Lò Lu, KP. Phước Hiệp, P, Long Phước, Hồ Chí Minh 700000, Việt Nam',
+    imageKey: 'quan9',
+  },
+  {
+    name: 'ParkFlow Thủ Đức',
+    codePrefix: 'TD-',
+    bookingLabel: 'ParkFlow Thủ Đức - Linh Xuân',
+    address: '86/33 Đ. Số 5, khu phố 3, Linh Xuân, Hồ Chí Minh, Việt Nam',
+    imageKey: 'thuduc',
+  },
+  {
+    name: 'ParkFlow Long Phước',
+    codePrefix: 'LP-',
+    bookingLabel: 'ParkFlow Long Phước',
+    // Query gồm cả tên địa điểm trên Google Maps để Maps ghim đúng cửa hàng
+    // thay vì đoán theo tên đường.
+    address: 'Tp, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam',
+    mapsQuery: 'Bãi Giữ xe ô tô Thủ Đức, 15/3 Đ. Số 3, Thủ Đức, Hồ Chí Minh 720300, Việt Nam',
+    imageKey: 'longphuoc',
+  },
+  {
+    name: 'ParkFlow Nhà Văn Hóa',
+    codePrefix: 'NVH-',
+    bookingLabel: 'ParkFlow Nhà Văn Hóa',
+    address: 'Nhà Văn Hóa Sinh Viên, Đông Hòa, Dĩ An, Bình Dương, Việt Nam',
+    imageKey: 'nhavanhoa',
+  },
+];
+
+function mapsUrlFor(query) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+}
+
+/**
+ * Rót metadata của 4 bãi gốc vào các cột vừa thêm. Chỉ ghi đè khi cột còn rỗng
+ * nên chạy lại mỗi lần khởi động cũng không đè lên chỉnh sửa của Admin.
+ */
+async function backfillLotCatalog() {
+  for (const lot of LEGACY_LOT_METADATA) {
+    await pool.request()
+      .input('name',          sql.NVarChar, lot.name)
+      .input('code_prefix',   sql.NVarChar, lot.codePrefix)
+      .input('booking_label', sql.NVarChar, lot.bookingLabel)
+      .input('address',       sql.NVarChar, lot.address)
+      .input('image_key',     sql.NVarChar, lot.imageKey)
+      .input('maps_url',      sql.NVarChar, mapsUrlFor(lot.mapsQuery || lot.address))
+      .query(`
+        UPDATE dbo.parking_lots SET
+          code_prefix   = CASE WHEN code_prefix   = '' THEN @code_prefix   ELSE code_prefix   END,
+          booking_label = CASE WHEN booking_label = '' THEN @booking_label ELSE booking_label END,
+          address       = CASE WHEN address       = '' THEN @address       ELSE address       END,
+          image_key     = CASE WHEN image_key     = '' THEN @image_key     ELSE image_key     END,
+          maps_url      = CASE WHEN maps_url      = '' THEN @maps_url      ELSE maps_url      END
+        WHERE name = @name
+      `);
+  }
+  // Bãi gốc chưa có cổng nào → tạo entry/exit khớp đúng hình đang vẽ cố định
+  // trong ParkingFloorMap (cả hai ở đầu trái làn trên/dưới).
+  await pool.request().query(`
+    INSERT INTO dbo.parking_lot_gates (lot_id, kind, label, position)
+    SELECT l.lot_id, g.kind, g.label, 'left'
+    FROM dbo.parking_lots l
+    CROSS JOIN (VALUES ('entry', N'Cổng chính'), ('exit', N'Cổng ra')) AS g(kind, label)
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.parking_lot_gates x WHERE x.lot_id = l.lot_id)
   `);
 }
 
@@ -709,43 +807,35 @@ function slotsForLot(lot) {
 }
 
 async function seedSlots() {
-  // INSERT-IF-NOT-EXISTS for every slot so missing rows are added on each server start.
-  // Existing rows keep their current status (not overwritten).
+  // CHỈ seed khi kho ô đỗ hoàn toàn rỗng (DB mới tinh). Trước đây hàm này chạy
+  // INSERT-IF-NOT-EXISTS + DELETE trên mỗi lần khởi động, nên ô nào Admin xóa
+  // qua UI sẽ mọc lại và ô nào Admin thêm ngoài layout cứng sẽ bị xóa mất —
+  // không thể để vậy khi dbo.parking_lots đã thành danh mục bãi sửa được.
+  const existing = await pool.request().query(`SELECT COUNT(*) AS n FROM dbo.parking_slots`);
+  if (existing.recordset[0].n > 0) {
+    // Hàng cũ tạo trước khi có cột parking_lot → gán về bãi Quận 9
+    await pool.request().query(`
+      UPDATE dbo.parking_slots SET parking_lot = N'ParkFlow Quận 9' WHERE parking_lot = ''
+    `);
+    return;
+  }
+
   for (const lot of SLOT_LOTS) {
-    const wanted = slotsForLot(lot);
-    for (const s of wanted) {
+    for (const s of slotsForLot(lot)) {
       await pool.request()
         .input('slot_code',    sql.NVarChar, `${lot.prefix}${s.slotCode}`)
         .input('floor',        sql.Int,      s.floor)
         .input('zone',         sql.NVarChar, s.zone)
         .input('vehicle_type', sql.NVarChar, s.vehicleType)
-        // Bãi gốc giữ status demo; 2 bãi mới khởi tạo toàn ô trống
+        // Bãi gốc giữ status demo; các bãi khác khởi tạo toàn ô trống
         .input('status',       sql.NVarChar, lot.prefix ? 'Available' : s.status)
         .input('parking_lot',  sql.NVarChar, lot.name)
         .query(`
-          IF NOT EXISTS (SELECT 1 FROM dbo.parking_slots WHERE slot_code = @slot_code)
-            INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status, parking_lot)
-            VALUES (@slot_code, @floor, @zone, @vehicle_type, @status, @parking_lot)
-        `);
-    }
-    // DB cũ từng seed đủ 36 ô cho mọi bãi — dọn các ô ngoài layout của 2 bãi
-    // mới để sức chứa thật sự khác nhau. Chỉ xóa ô còn 'Available' (không đụng
-    // ô đang có xe/đặt chỗ); bãi Quận 9 (prefix rỗng) giữ nguyên mọi hàng cũ.
-    if (lot.prefix) {
-      const keep = wanted.map((s) => `N'${lot.prefix}${s.slotCode}'`).join(',');
-      await pool.request()
-        .input('lot_name', sql.NVarChar, lot.name)
-        .query(`
-          DELETE FROM dbo.parking_slots
-          WHERE parking_lot = @lot_name AND status = 'Available'
-            AND slot_code NOT IN (${keep})
+          INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status, parking_lot)
+          VALUES (@slot_code, @floor, @zone, @vehicle_type, @status, @parking_lot)
         `);
     }
   }
-  // Hàng cũ tạo trước khi có cột parking_lot → gán về bãi Quận 9
-  await pool.request().query(`
-    UPDATE dbo.parking_slots SET parking_lot = N'ParkFlow Quận 9' WHERE parking_lot = ''
-  `);
 }
 
 async function migrateSlotAndRoles() {
@@ -3457,29 +3547,380 @@ app.patch('/api/issues/:id', async (req, res) => {
 
 // ─── parking lots ────────────────────────────────────────────────────────────
 
-function toParkingLotDto(r) {
+const LOT_STATUSES = ['Hoạt động', 'Bảo trì', 'Đóng cửa'];
+
+// Mặt bằng mẫu dùng chung cho mọi bãi (khớp buildSpaces() trong
+// ParkingFloorMap.tsx): số ô tối đa mỗi dãy, cùng loại xe/tầng/khu mặc định.
+// Admin chọn bật/tắt từng vị trí trong lưới này chứ không đặt toạ độ tự do.
+const GRID_ROWS = { A: 11, B: 5, C: 5, D: 4, E: 11 };
+const ROW_DEFAULTS = {
+  A: { floor:  2, zone: 'A', vehicleType: 'Ô tô 4-7 chỗ (Xăng)' },
+  B: { floor:  1, zone: 'A', vehicleType: 'Xe máy / Xe máy điện' },
+  C: { floor:  1, zone: 'C', vehicleType: 'Ô tô 4-7 chỗ (Điện / EV)' },
+  D: { floor: -1, zone: 'A', vehicleType: 'Ô tô 4-7 chỗ (Xăng)' },
+  E: { floor:  1, zone: 'B', vehicleType: 'Xe máy / Xe máy điện' },
+};
+// Khoá loại xe frontend gửi lên → nhãn lưu trong dbo.parking_slots.vehicle_type
+// (đảo ngược vtMap của GET /api/slots).
+const SLOT_VEHICLE_LABEL = {
+  car:                'Ô tô 4-7 chỗ (Xăng)',
+  motorbike:          'Xe máy / Xe máy điện',
+  'electric vehicle': 'Ô tô 4-7 chỗ (Điện / EV)',
+};
+
+/** 'A01' hợp lệ khi nằm trong lưới mẫu (A01-A11, B01-B05, C01-C05, D01-D04, E01-E11). */
+function isValidGridCode(code) {
+  const m = /^([A-E])(\d{2})$/.exec(String(code || ''));
+  if (!m) return false;
+  const num = Number(m[2]);
+  return num >= 1 && num <= GRID_ROWS[m[1]];
+}
+
+function stripDiacritics(s) {
+  // Lọc theo mã ký tự thay vì regex có dải ký tự tổ hợp viết thẳng — tránh phụ
+  // thuộc vào cách file được lưu/encode.
+  return [...String(s || '').normalize('NFD')]
+    .filter((ch) => {
+      const c = ch.codePointAt(0);
+      return c < 0x0300 || c > 0x036f;
+    })
+    .join('')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D');
+}
+
+/**
+ * Sinh prefix mã ô duy nhất cho bãi mới ('ParkFlow Nhà Văn Hóa' → 'NVH-').
+ * slot_code phải UNIQUE toàn cục nên mỗi bãi cần prefix riêng; prefix rỗng đã
+ * thuộc về bãi gốc Quận 9 nên bãi mới luôn có prefix khác rỗng.
+ */
+async function generateCodePrefix(name) {
+  const words = stripDiacritics(name).toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, ' ').split(/\s+/)
+    .filter(Boolean).filter((w) => w !== 'PARKFLOW');
+  const base = (words.map((w) => w[0]).join('').slice(0, 4)) || 'L';
+
+  const taken = await pool.request().query(`SELECT code_prefix FROM dbo.parking_lots`);
+  const used = new Set(taken.recordset.map((r) => r.code_prefix));
+  if (!used.has(`${base}-`)) return `${base}-`;
+  for (let i = 2; i < 1000; i++) {
+    if (!used.has(`${base}${i}-`)) return `${base}${i}-`;
+  }
+  return `L${Date.now().toString(36).toUpperCase()}-`;
+}
+
+function toGateDto(r) {
+  return { id: r.gate_id, kind: r.kind, label: r.label || '', position: r.position };
+}
+
+function toParkingLotDto(r, gates = [], slots = []) {
   return {
+    // `name`/`status`/`updatedAt` giữ nguyên tên trường — mọi caller cũ
+    // (ManagerParkingLots, StaffDashboard, AvailableSlots) đọc đúng 3 trường này.
     name: r.name,
     status: r.status,
     updatedAt: r.updated_at ? toVnStr(new Date(r.updated_at)) : '',
+    id: r.lot_id,
+    // Khoá ổn định để frontend so khớp bãi thay cho union LotKey cứng trước đây.
+    key: String(r.lot_id),
+    codePrefix: r.code_prefix || '',
+    bookingLabel: r.booking_label || r.name,
+    address: r.address || '',
+    description: r.description || '',
+    imageKey: r.image_key || '',
+    imageData: r.image_data || '',
+    mapsUrl: r.maps_url || '',
+    slotCount: slots.length,
+    slots,
+    gates: gates.map(toGateDto),
   };
+}
+
+/** Đọc gates + mã ô lưới của mọi bãi một lượt (tránh N+1 khi trả danh sách). */
+async function loadLotChildren() {
+  const [gates, slots] = await Promise.all([
+    pool.request().query(`SELECT * FROM dbo.parking_lot_gates ORDER BY gate_id ASC`),
+    pool.request().query(`SELECT parking_lot, slot_code, vehicle_type FROM dbo.parking_slots`),
+  ]);
+  const gatesByLot = new Map();
+  for (const g of gates.recordset) {
+    if (!gatesByLot.has(g.lot_id)) gatesByLot.set(g.lot_id, []);
+    gatesByLot.get(g.lot_id).push(g);
+  }
+  const vtKey = Object.fromEntries(Object.entries(SLOT_VEHICLE_LABEL).map(([k, v]) => [v, k]));
+  const slotsByLot = new Map();
+  for (const s of slots.recordset) {
+    // slot_code = <prefix>F1-A01 → mã lưới là đoạn cuối sau dấu '-'
+    const code = String(s.slot_code).split('-').pop();
+    if (!isValidGridCode(code)) continue;
+    if (!slotsByLot.has(s.parking_lot)) slotsByLot.set(s.parking_lot, []);
+    slotsByLot.get(s.parking_lot).push({ code, vehicleType: vtKey[s.vehicle_type] || 'car' });
+  }
+  return { gatesByLot, slotsByLot };
 }
 
 app.get('/api/parking-lots', async (_req, res) => {
   try {
     const r = await pool.request().query(`SELECT * FROM dbo.parking_lots ORDER BY lot_id ASC`);
-    return res.json(r.recordset.map(toParkingLotDto));
+    const { gatesByLot, slotsByLot } = await loadLotChildren();
+    return res.json(r.recordset.map((row) =>
+      toParkingLotDto(row, gatesByLot.get(row.lot_id) || [], slotsByLot.get(row.name) || [])));
   } catch (err) {
     console.error('GET /api/parking-lots', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi tải danh sách bãi đỗ.' });
   }
 });
 
-app.put('/api/parking-lots/:name', async (req, res) => {
+/** Trả về DTO đầy đủ của một bãi sau khi ghi (dùng chung cho POST/PUT). */
+async function readLotById(id) {
+  const r = await pool.request().input('id', sql.Int, id)
+    .query(`SELECT * FROM dbo.parking_lots WHERE lot_id = @id`);
+  if (!r.recordset.length) return null;
+  const row = r.recordset[0];
+  const { gatesByLot, slotsByLot } = await loadLotChildren();
+  return toParkingLotDto(row, gatesByLot.get(row.lot_id) || [], slotsByLot.get(row.name) || []);
+}
+
+/** Ghi lại toàn bộ cổng của một bãi (thay thế trọn bộ). */
+async function replaceGates(lotId, gates) {
+  await pool.request().input('lot_id', sql.Int, lotId)
+    .query(`DELETE FROM dbo.parking_lot_gates WHERE lot_id = @lot_id`);
+  for (const g of Array.isArray(gates) ? gates : []) {
+    if (!['entry', 'exit'].includes(g.kind)) continue;
+    await pool.request()
+      .input('lot_id',   sql.Int,      lotId)
+      .input('kind',     sql.NVarChar, g.kind)
+      .input('label',    sql.NVarChar, String(g.label || '').slice(0, 100))
+      .input('position', sql.NVarChar, ['left', 'center', 'right'].includes(g.position) ? g.position : 'left')
+      .query(`
+        INSERT INTO dbo.parking_lot_gates (lot_id, kind, label, position)
+        VALUES (@lot_id, @kind, @label, @position)
+      `);
+  }
+}
+
+/**
+ * Đồng bộ kho ô đỗ của một bãi về đúng danh sách `slots` Admin gửi lên.
+ * Trả về mảng mã ô không xóa được (đang có xe/đặt chỗ) để caller báo lỗi.
+ */
+async function syncLotSlots(lotName, codePrefix, slots) {
+  const wanted = new Map();
+  for (const s of Array.isArray(slots) ? slots : []) {
+    if (isValidGridCode(s.code)) wanted.set(s.code, s.vehicleType);
+  }
+
+  const cur = await pool.request().input('lot', sql.NVarChar, lotName)
+    .query(`SELECT slot_code, status FROM dbo.parking_slots WHERE parking_lot = @lot`);
+
+  // CHỈ những hàng có mã lưới hợp lệ mới thuộc quyền quản của trình thiết kế.
+  // DB còn các hàng cũ kiểu 'T1-A-01'/'B1-A-02' (đuôi '01', '02' — không phải mã
+  // lưới, không bao giờ vẽ lên sơ đồ): nếu gom cả vào đây thì (a) chúng sẽ bị
+  // xóa oan vì không nằm trong `wanted`, và (b) nhiều hàng cùng đuôi '01' sẽ đè
+  // lên nhau trong Map. Bỏ qua hẳn để dữ liệu cũ nguyên vẹn.
+  const existing = new Map();
+  for (const r of cur.recordset) {
+    const code = String(r.slot_code).split('-').pop();
+    if (isValidGridCode(code)) existing.set(code, r);
+  }
+
+  const blocked = [];
+  for (const [code, row] of existing) {
+    if (wanted.has(code)) continue;
+    // Không xóa ô đang có xe / đã được đặt — sẽ làm mồ côi phiên gửi xe.
+    if (String(row.status).toLowerCase() !== 'available') { blocked.push(code); continue; }
+    await pool.request().input('slot_code', sql.NVarChar, row.slot_code)
+      .query(`DELETE FROM dbo.parking_slots WHERE slot_code = @slot_code`);
+  }
+
+  for (const [code, vehicleType] of wanted) {
+    const row = ROW_DEFAULTS[code[0]];
+    const label = SLOT_VEHICLE_LABEL[vehicleType] || row.vehicleType;
+    if (existing.has(code)) {
+      await pool.request()
+        .input('slot_code',    sql.NVarChar, existing.get(code).slot_code)
+        .input('vehicle_type', sql.NVarChar, label)
+        .query(`UPDATE dbo.parking_slots SET vehicle_type = @vehicle_type WHERE slot_code = @slot_code`);
+      continue;
+    }
+    await pool.request()
+      .input('slot_code',    sql.NVarChar, `${codePrefix}F1-${code}`)
+      .input('floor',        sql.Int,      row.floor)
+      .input('zone',         sql.NVarChar, row.zone)
+      .input('vehicle_type', sql.NVarChar, label)
+      .input('parking_lot',  sql.NVarChar, lotName)
+      .query(`
+        IF NOT EXISTS (SELECT 1 FROM dbo.parking_slots WHERE slot_code = @slot_code)
+          INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status, parking_lot)
+          VALUES (@slot_code, @floor, @zone, @vehicle_type, 'Available', @parking_lot)
+      `);
+  }
+  return blocked;
+}
+
+app.post('/api/parking-lots', async (req, res) => {
+  try {
+    const { name, bookingLabel, address, description, imageData, mapsUrl, status, slots, gates } = req.body;
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'Tên bãi đỗ là bắt buộc.' });
+    const lotName = String(name).trim();
+    if (status && !LOT_STATUSES.includes(status)) {
+      return res.status(400).json({ error: 'Trạng thái không hợp lệ.' });
+    }
+
+    const dup = await pool.request().input('name', sql.NVarChar, lotName)
+      .query(`SELECT 1 FROM dbo.parking_lots WHERE name = @name`);
+    if (dup.recordset.length) return res.status(409).json({ error: 'Tên bãi đỗ đã tồn tại.' });
+
+    const codePrefix = await generateCodePrefix(lotName);
+    const addr = String(address || '').trim();
+    const ins = await pool.request()
+      .input('name',          sql.NVarChar, lotName)
+      .input('status',        sql.NVarChar, status || 'Hoạt động')
+      .input('code_prefix',   sql.NVarChar, codePrefix)
+      .input('booking_label', sql.NVarChar, String(bookingLabel || '').trim() || lotName)
+      .input('address',       sql.NVarChar, addr)
+      .input('description',   sql.NVarChar, String(description || ''))
+      .input('image_data',    sql.NVarChar, String(imageData || ''))
+      .input('maps_url',      sql.NVarChar, String(mapsUrl || '').trim() || (addr ? mapsUrlFor(addr) : ''))
+      .query(`
+        INSERT INTO dbo.parking_lots
+          (name, status, code_prefix, booking_label, address, description, image_data, maps_url, updated_at)
+        OUTPUT inserted.lot_id
+        VALUES
+          (@name, @status, @code_prefix, @booking_label, @address, @description, @image_data, @maps_url, SYSUTCDATETIME())
+      `);
+    const lotId = ins.recordset[0].lot_id;
+
+    await syncLotSlots(lotName, codePrefix, slots);
+    await replaceGates(lotId, gates);
+    return res.status(201).json(await readLotById(lotId));
+  } catch (err) {
+    console.error('POST /api/parking-lots', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi tạo bãi đỗ.' });
+  }
+});
+
+app.put('/api/parking-lots/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
+    const { name, bookingLabel, address, description, imageData, mapsUrl, status, slots, gates } = req.body;
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'Tên bãi đỗ là bắt buộc.' });
+    const lotName = String(name).trim();
+    if (status && !LOT_STATUSES.includes(status)) {
+      return res.status(400).json({ error: 'Trạng thái không hợp lệ.' });
+    }
+
+    const cur = await pool.request().input('id', sql.Int, id)
+      .query(`SELECT * FROM dbo.parking_lots WHERE lot_id = @id`);
+    if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
+    const before = cur.recordset[0];
+
+    const dup = await pool.request()
+      .input('name', sql.NVarChar, lotName).input('id', sql.Int, id)
+      .query(`SELECT 1 FROM dbo.parking_lots WHERE name = @name AND lot_id <> @id`);
+    if (dup.recordset.length) return res.status(409).json({ error: 'Tên bãi đỗ đã tồn tại.' });
+
+    // Đổi tên bãi phải kéo theo mọi bảng đang tham chiếu bãi BẰNG TÊN
+    // (parking_slots.parking_lot, users.assigned_parking_lot, reservations.parking_lot),
+    // nếu không staff sẽ mất bãi phụ trách và ô đỗ thành mồ côi.
+    if (lotName !== before.name) {
+      for (const q of [
+        `UPDATE dbo.parking_slots SET parking_lot = @new WHERE parking_lot = @old`,
+        `UPDATE dbo.users SET assigned_parking_lot = @new WHERE assigned_parking_lot = @old`,
+        `UPDATE dbo.reservations SET parking_lot = @new WHERE parking_lot = @old`,
+      ]) {
+        await pool.request()
+          .input('new', sql.NVarChar, lotName)
+          .input('old', sql.NVarChar, before.name)
+          .query(q);
+      }
+    }
+
+    const addr = String(address || '').trim();
+    await pool.request()
+      .input('id',            sql.Int,      id)
+      .input('name',          sql.NVarChar, lotName)
+      .input('status',        sql.NVarChar, status || before.status)
+      .input('booking_label', sql.NVarChar, String(bookingLabel || '').trim() || lotName)
+      .input('address',       sql.NVarChar, addr)
+      .input('description',   sql.NVarChar, String(description || ''))
+      .input('image_data',    sql.NVarChar, String(imageData || ''))
+      .input('maps_url',      sql.NVarChar, String(mapsUrl || '').trim() || (addr ? mapsUrlFor(addr) : ''))
+      .query(`
+        UPDATE dbo.parking_lots SET
+          name = @name, status = @status, booking_label = @booking_label,
+          address = @address, description = @description, image_data = @image_data,
+          maps_url = @maps_url, updated_at = SYSUTCDATETIME()
+        WHERE lot_id = @id
+      `);
+
+    const blocked = slots === undefined
+      ? []
+      : await syncLotSlots(lotName, before.code_prefix, slots);
+    if (gates !== undefined) await replaceGates(id, gates);
+
+    const dto = await readLotById(id);
+    // Ghi được phần còn lại rồi mới báo — Admin thấy đúng trạng thái đã lưu
+    // kèm lý do các ô kia không bỏ được.
+    if (blocked.length) {
+      return res.status(409).json({
+        error: `Không thể xóa ô đang có xe hoặc đã được đặt: ${blocked.join(', ')}. Các thay đổi khác đã được lưu.`,
+        lot: dto,
+      });
+    }
+    return res.json(dto);
+  } catch (err) {
+    console.error('PUT /api/parking-lots/:id', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật bãi đỗ.' });
+  }
+});
+
+app.delete('/api/parking-lots/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
+    const cur = await pool.request().input('id', sql.Int, id)
+      .query(`SELECT * FROM dbo.parking_lots WHERE lot_id = @id`);
+    if (!cur.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
+    const lot = cur.recordset[0];
+
+    // Chặn xóa khi bãi còn xe trong đó hoặc còn đặt chỗ chưa kết thúc — xóa sẽ
+    // để lại reservations/sessions trỏ tới một bãi không còn tồn tại.
+    const busy = await pool.request().input('lot', sql.NVarChar, lot.name).query(`
+      SELECT
+        (SELECT COUNT(*) FROM dbo.parking_slots
+          WHERE parking_lot = @lot AND LOWER(status) <> 'available') AS busySlots,
+        (SELECT COUNT(*) FROM dbo.reservations
+          WHERE parking_lot = @lot AND status NOT IN ('Completed', 'Cancelled')) AS openRes
+    `);
+    const { busySlots, openRes } = busy.recordset[0];
+    if (busySlots > 0 || openRes > 0) {
+      return res.status(409).json({
+        error: `Không thể xóa bãi "${lot.name}": còn ${busySlots} ô đang sử dụng và ${openRes} đặt chỗ chưa kết thúc.`,
+      });
+    }
+
+    await pool.request().input('lot', sql.NVarChar, lot.name)
+      .query(`DELETE FROM dbo.parking_slots WHERE parking_lot = @lot`);
+    // gates có ON DELETE CASCADE nên xóa lot là đủ
+    await pool.request().input('id', sql.Int, id)
+      .query(`DELETE FROM dbo.parking_lots WHERE lot_id = @id`);
+    // Staff đang phụ trách bãi vừa xóa → gỡ gán để không trỏ vào bãi không tồn tại
+    await pool.request().input('lot', sql.NVarChar, lot.name)
+      .query(`UPDATE dbo.users SET assigned_parking_lot = '' WHERE assigned_parking_lot = @lot`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/parking-lots/:id', err);
+    return res.status(500).json({ error: 'Lỗi máy chủ khi xóa bãi đỗ.' });
+  }
+});
+
+// Manager đổi trạng thái vận hành theo TÊN bãi. Đường dẫn có hậu tố /status để
+// không đụng route PUT /:id ở trên.
+app.put('/api/parking-lots/:name/status', async (req, res) => {
   try {
     const name = req.params.name;
     const { status } = req.body;
-    if (!['Hoạt động', 'Bảo trì', 'Đóng cửa'].includes(status)) {
+    if (!LOT_STATUSES.includes(status)) {
       return res.status(400).json({ error: 'Trạng thái không hợp lệ.' });
     }
     const upd = await pool.request()
@@ -3491,292 +3932,10 @@ app.put('/api/parking-lots/:name', async (req, res) => {
         WHERE name = @name
       `);
     if (!upd.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
-    return res.json(toParkingLotDto(upd.recordset[0]));
+    return res.json(await readLotById(upd.recordset[0].lot_id));
   } catch (err) {
-    console.error('PUT /api/parking-lots/:name', err);
+    console.error('PUT /api/parking-lots/:name/status', err);
     return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật trạng thái bãi đỗ.' });
-  }
-});
-
-// ─── admin: parking lot layout management ──────────────────────────────────
-// Standalone lot-design tool (dbo.admin_parking_lots / admin_parking_slots) —
-// separate from dbo.parking_lots/parking_slots above, see createTables().
-
-function toAdminLotDto(r) {
-  return {
-    id: r.lot_id,
-    name: r.name,
-    description: r.description || '',
-    imageData: r.image_data || '',
-    slotCount: typeof r.slot_count === 'number' ? r.slot_count : undefined,
-    createdAt: r.created_at ? toVnStr(new Date(r.created_at)) : '',
-    updatedAt: r.updated_at ? toVnStr(new Date(r.updated_at)) : '',
-  };
-}
-
-function toAdminSlotDto(r) {
-  return {
-    id: r.slot_id,
-    lotId: r.lot_id,
-    code: r.slot_code,
-    vehicleType: r.vehicle_type,
-    status: r.status,
-    x: r.pos_x,
-    y: r.pos_y,
-    rotation: r.rotation,
-    width: r.width,
-    height: r.height,
-  };
-}
-
-const ADMIN_VEHICLE_TYPES = ['car', 'motorbike', 'bicycle'];
-const ADMIN_SLOT_STATUSES = ['Available', 'Occupied', 'Maintenance'];
-
-app.get('/api/admin/parking-lots', async (_req, res) => {
-  try {
-    const r = await pool.request().query(`
-      SELECT l.*, (SELECT COUNT(*) FROM dbo.admin_parking_slots s WHERE s.lot_id = l.lot_id) AS slot_count
-      FROM dbo.admin_parking_lots l
-      ORDER BY l.lot_id ASC
-    `);
-    return res.json(r.recordset.map(toAdminLotDto));
-  } catch (err) {
-    console.error('GET /api/admin/parking-lots', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi tải danh sách bãi đỗ.' });
-  }
-});
-
-app.post('/api/admin/parking-lots', async (req, res) => {
-  try {
-    const { name, description, imageData } = req.body;
-    const cleanName = (name || '').trim();
-    if (!cleanName) return res.status(400).json({ error: 'Tên bãi đỗ là bắt buộc.' });
-
-    const dup = await pool.request()
-      .input('name', sql.NVarChar, cleanName)
-      .query(`SELECT 1 FROM dbo.admin_parking_lots WHERE name = @name`);
-    if (dup.recordset.length) return res.status(409).json({ error: 'Tên bãi đỗ đã tồn tại.' });
-
-    const ins = await pool.request()
-      .input('name', sql.NVarChar, cleanName)
-      .input('description', sql.NVarChar, (description || '').trim())
-      .input('image_data', sql.NVarChar, imageData || '')
-      .query(`
-        INSERT INTO dbo.admin_parking_lots (name, description, image_data)
-        OUTPUT inserted.*
-        VALUES (@name, @description, @image_data)
-      `);
-    return res.status(201).json(toAdminLotDto(ins.recordset[0]));
-  } catch (err) {
-    console.error('POST /api/admin/parking-lots', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi tạo bãi đỗ.' });
-  }
-});
-
-app.put('/api/admin/parking-lots/:id', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
-    const { name, description, imageData } = req.body;
-    const cleanName = (name || '').trim();
-    if (!cleanName) return res.status(400).json({ error: 'Tên bãi đỗ là bắt buộc.' });
-
-    const dup = await pool.request()
-      .input('id', sql.Int, id)
-      .input('name', sql.NVarChar, cleanName)
-      .query(`SELECT 1 FROM dbo.admin_parking_lots WHERE name = @name AND lot_id <> @id`);
-    if (dup.recordset.length) return res.status(409).json({ error: 'Tên bãi đỗ đã tồn tại.' });
-
-    const upd = await pool.request()
-      .input('id', sql.Int, id)
-      .input('name', sql.NVarChar, cleanName)
-      .input('description', sql.NVarChar, (description || '').trim())
-      .input('image_data', sql.NVarChar, imageData || '')
-      .query(`
-        UPDATE dbo.admin_parking_lots
-        SET name = @name, description = @description, image_data = @image_data, updated_at = SYSUTCDATETIME()
-        OUTPUT inserted.*
-        WHERE lot_id = @id
-      `);
-    if (!upd.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
-    return res.json(toAdminLotDto(upd.recordset[0]));
-  } catch (err) {
-    console.error('PUT /api/admin/parking-lots/:id', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật bãi đỗ.' });
-  }
-});
-
-app.delete('/api/admin/parking-lots/:id', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
-    const del = await pool.request()
-      .input('id', sql.Int, id)
-      .query(`DELETE FROM dbo.admin_parking_lots OUTPUT deleted.lot_id WHERE lot_id = @id`);
-    if (!del.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error('DELETE /api/admin/parking-lots/:id', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi xóa bãi đỗ.' });
-  }
-});
-
-app.get('/api/admin/parking-lots/:id/slots', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
-    const r = await pool.request()
-      .input('lot_id', sql.Int, id)
-      .query(`SELECT * FROM dbo.admin_parking_slots WHERE lot_id = @lot_id ORDER BY slot_id ASC`);
-    return res.json(r.recordset.map(toAdminSlotDto));
-  } catch (err) {
-    console.error('GET /api/admin/parking-lots/:id/slots', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi tải danh sách ô đỗ.' });
-  }
-});
-
-app.post('/api/admin/parking-slots', async (req, res) => {
-  try {
-    const { lotId, code, vehicleType, status, x, y, rotation, width, height } = req.body;
-    const lot_id = Number(lotId);
-    const cleanCode = (code || '').trim();
-    if (!Number.isInteger(lot_id)) return res.status(400).json({ error: 'Thiếu bãi đỗ.' });
-    if (!cleanCode) return res.status(400).json({ error: 'Mã ô đỗ là bắt buộc.' });
-    const vt = ADMIN_VEHICLE_TYPES.includes(vehicleType) ? vehicleType : 'car';
-    const st = ADMIN_SLOT_STATUSES.includes(status) ? status : 'Available';
-
-    const lotExists = await pool.request()
-      .input('lot_id', sql.Int, lot_id)
-      .query(`SELECT 1 FROM dbo.admin_parking_lots WHERE lot_id = @lot_id`);
-    if (!lotExists.recordset.length) return res.status(404).json({ error: 'Không tìm thấy bãi đỗ.' });
-
-    const dup = await pool.request()
-      .input('lot_id', sql.Int, lot_id)
-      .input('code', sql.NVarChar, cleanCode)
-      .query(`SELECT 1 FROM dbo.admin_parking_slots WHERE lot_id = @lot_id AND slot_code = @code`);
-    if (dup.recordset.length) return res.status(409).json({ error: 'Mã ô đỗ đã tồn tại trong bãi này.' });
-
-    const ins = await pool.request()
-      .input('lot_id', sql.Int, lot_id)
-      .input('code', sql.NVarChar, cleanCode)
-      .input('vehicle_type', sql.NVarChar, vt)
-      .input('status', sql.NVarChar, st)
-      .input('x', sql.Float, Number(x) || 0)
-      .input('y', sql.Float, Number(y) || 0)
-      .input('rotation', sql.Float, Number(rotation) || 0)
-      .input('width', sql.Float, Number(width) || 60)
-      .input('height', sql.Float, Number(height) || 40)
-      .query(`
-        INSERT INTO dbo.admin_parking_slots (lot_id, slot_code, vehicle_type, status, pos_x, pos_y, rotation, width, height)
-        OUTPUT inserted.*
-        VALUES (@lot_id, @code, @vehicle_type, @status, @x, @y, @rotation, @width, @height)
-      `);
-    return res.status(201).json(toAdminSlotDto(ins.recordset[0]));
-  } catch (err) {
-    console.error('POST /api/admin/parking-slots', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi tạo ô đỗ.' });
-  }
-});
-
-app.put('/api/admin/parking-slots/:id', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID ô đỗ không hợp lệ.' });
-    const existing = await pool.request()
-      .input('id', sql.Int, id)
-      .query(`SELECT * FROM dbo.admin_parking_slots WHERE slot_id = @id`);
-    if (!existing.recordset.length) return res.status(404).json({ error: 'Không tìm thấy ô đỗ.' });
-    const current = existing.recordset[0];
-
-    const { code, vehicleType, status, x, y, rotation, width, height } = req.body;
-    const cleanCode = code !== undefined ? String(code).trim() : current.slot_code;
-    if (!cleanCode) return res.status(400).json({ error: 'Mã ô đỗ là bắt buộc.' });
-    const vt = vehicleType !== undefined ? (ADMIN_VEHICLE_TYPES.includes(vehicleType) ? vehicleType : current.vehicle_type) : current.vehicle_type;
-    const st = status !== undefined ? (ADMIN_SLOT_STATUSES.includes(status) ? status : current.status) : current.status;
-
-    if (cleanCode !== current.slot_code) {
-      const dup = await pool.request()
-        .input('lot_id', sql.Int, current.lot_id)
-        .input('code', sql.NVarChar, cleanCode)
-        .input('id', sql.Int, id)
-        .query(`SELECT 1 FROM dbo.admin_parking_slots WHERE lot_id = @lot_id AND slot_code = @code AND slot_id <> @id`);
-      if (dup.recordset.length) return res.status(409).json({ error: 'Mã ô đỗ đã tồn tại trong bãi này.' });
-    }
-
-    const upd = await pool.request()
-      .input('id', sql.Int, id)
-      .input('code', sql.NVarChar, cleanCode)
-      .input('vehicle_type', sql.NVarChar, vt)
-      .input('status', sql.NVarChar, st)
-      .input('x', sql.Float, x !== undefined ? Number(x) : current.pos_x)
-      .input('y', sql.Float, y !== undefined ? Number(y) : current.pos_y)
-      .input('rotation', sql.Float, rotation !== undefined ? Number(rotation) : current.rotation)
-      .input('width', sql.Float, width !== undefined ? Number(width) : current.width)
-      .input('height', sql.Float, height !== undefined ? Number(height) : current.height)
-      .query(`
-        UPDATE dbo.admin_parking_slots
-        SET slot_code = @code, vehicle_type = @vehicle_type, status = @status,
-            pos_x = @x, pos_y = @y, rotation = @rotation, width = @width, height = @height,
-            updated_at = SYSUTCDATETIME()
-        OUTPUT inserted.*
-        WHERE slot_id = @id
-      `);
-    return res.json(toAdminSlotDto(upd.recordset[0]));
-  } catch (err) {
-    console.error('PUT /api/admin/parking-slots/:id', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi cập nhật ô đỗ.' });
-  }
-});
-
-app.delete('/api/admin/parking-slots/:id', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID ô đỗ không hợp lệ.' });
-    const del = await pool.request()
-      .input('id', sql.Int, id)
-      .query(`DELETE FROM dbo.admin_parking_slots OUTPUT deleted.slot_id WHERE slot_id = @id`);
-    if (!del.recordset.length) return res.status(404).json({ error: 'Không tìm thấy ô đỗ.' });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error('DELETE /api/admin/parking-slots/:id', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi xóa ô đỗ.' });
-  }
-});
-
-app.post('/api/admin/parking-lots/:id/layout', async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID bãi đỗ không hợp lệ.' });
-    const positions = req.body;
-    if (!Array.isArray(positions)) return res.status(400).json({ error: 'Dữ liệu sơ đồ không hợp lệ.' });
-
-    const owned = await pool.request()
-      .input('lot_id', sql.Int, id)
-      .query(`SELECT slot_id FROM dbo.admin_parking_slots WHERE lot_id = @lot_id`);
-    const ownedIds = new Set(owned.recordset.map((r) => r.slot_id));
-
-    for (const p of positions) {
-      const slotId = Number(p.slotId);
-      if (!Number.isInteger(slotId) || !ownedIds.has(slotId)) continue;
-      await pool.request()
-        .input('id', sql.Int, slotId)
-        .input('x', sql.Float, Number(p.x) || 0)
-        .input('y', sql.Float, Number(p.y) || 0)
-        .input('rotation', sql.Float, Number(p.rotation) || 0)
-        .query(`
-          UPDATE dbo.admin_parking_slots
-          SET pos_x = @x, pos_y = @y, rotation = @rotation, updated_at = SYSUTCDATETIME()
-          WHERE slot_id = @id
-        `);
-    }
-
-    const refreshed = await pool.request()
-      .input('lot_id', sql.Int, id)
-      .query(`SELECT * FROM dbo.admin_parking_slots WHERE lot_id = @lot_id ORDER BY slot_id ASC`);
-    return res.json(refreshed.recordset.map(toAdminSlotDto));
-  } catch (err) {
-    console.error('POST /api/admin/parking-lots/:id/layout', err);
-    return res.status(500).json({ error: 'Lỗi máy chủ khi lưu sơ đồ bãi đỗ.' });
   }
 });
 

@@ -35,7 +35,7 @@ import RoleManagement from "./pages/admin/RoleManagement";
 import SystemConfiguration from "./pages/admin/SystemConfiguration";
 import ParkingLotManagement from "./pages/admin/ParkingLotManagement";
 import ParkingLayoutEditor from "./pages/admin/ParkingLayoutEditor";
-import type { AdminParkingLot } from "./services/adminParkingLotService";
+import { setLotCatalog, type ParkingLotInfo } from "./utils/parkingLots";
 
 // Manager pages
 import ManagerDashboard from "./pages/manager/ManagerDashboard";
@@ -288,9 +288,9 @@ export default function App() {
   const [interfaceMode, setInterfaceMode] = useState<"light" | "dark">(
     initialSystemConfig.interfaceMode ?? "light",
   );
-  // Which admin-designed parking lot the layout editor is currently open for
+  // Which parking lot the layout editor is currently open for
   // (mirrors the onViewDetail/lot pattern ManagerParkingLotDetail already uses).
-  const [adminLayoutLot, setAdminLayoutLot] = useState<AdminParkingLot | null>(null);
+  const [adminLayoutLot, setAdminLayoutLot] = useState<ParkingLotInfo | null>(null);
 
   const setView = (view: string) => {
     window.location.hash = `#/${view}`;
@@ -441,7 +441,11 @@ export default function App() {
     // maintenance, User/Staff see it within 30s without reloading.
     const syncLotStatuses = async () => {
       const dbLots = await fetchParkingLotStatuses();
-      if (dbLots.length) setLotStatuses(dbLots);
+      if (!dbLots.length) return;
+      setLotStatuses(dbLots);
+      // Nạp cache cho lotKeyOf/sameLot — các hàm thuần được gọi từ sâu trong
+      // logic lọc nên không tiện nhận catalog qua tham số.
+      setLotCatalog(dbLots);
     };
     sync();
     syncPricing();
@@ -625,7 +629,11 @@ export default function App() {
   // Trạng thái vận hành (Hoạt động/Bảo trì/Đóng cửa) của 3 bãi — nguồn chân lý
   // duy nhất cho việc chặn đặt chỗ (user) và khóa thao tác (staff) khi bãi
   // đang bảo trì. Trước đây chỉ là state cục bộ trong ManagerParkingLots.tsx.
-  const [lotStatuses, setLotStatuses] = useState<ParkingLotStatus[]>([]);
+  // Danh mục bãi ĐẦY ĐỦ (tên, trạng thái, địa chỉ, ảnh, ô đỗ, cổng) — không chỉ
+  // trạng thái như tên biến gợi ý. Giữ nguyên tên `lotStatuses` vì đây đã là
+  // kênh sẵn có chảy xuống Manager/Staff/AvailableSlots; ParkingLotInfo là siêu
+  // tập của ParkingLotStatus nên mọi caller cũ đọc .name/.status vẫn đúng.
+  const [lotStatuses, setLotStatuses] = useState<ParkingLotInfo[]>([]);
   const [systemConfig, setSystemConfig] =
     useState<SystemConfig>(initialSystemConfig);
   const [adminActivities, setAdminActivities] = useState<AdminActivity[]>(
@@ -1857,17 +1865,29 @@ export default function App() {
 
   const handleUpdateLotStatus = async (name: string, status: ParkingLotStatus['status']): Promise<boolean> => {
     const previous = lotStatuses;
+    // Cập nhật lạc quan: chỉ đổi status của bãi đã có (bãi lạ thì bỏ qua — danh
+    // mục đầy đủ phải đến từ API, không dựng hàng giả thiếu địa chỉ/ô đỗ ở đây).
+    setLotStatuses((prev) => prev.map((l) => (l.name === name ? { ...l, status } : l)));
+    const saved = await updateParkingLotStatus(name, status);
+    if (!saved) { setLotStatuses(previous); setLotCatalog(previous); return false; }
     setLotStatuses((prev) => {
-      const idx = prev.findIndex((l) => l.name === name);
-      if (idx === -1) return [...prev, { name, status, updatedAt: '' }];
-      const next = [...prev];
-      next[idx] = { ...next[idx], status };
+      const next = prev.map((l) => (l.name === name ? saved : l));
+      setLotCatalog(next);
       return next;
     });
-    const saved = await updateParkingLotStatus(name, status);
-    if (!saved) { setLotStatuses(previous); return false; }
-    setLotStatuses((prev) => prev.map((l) => (l.name === name ? saved : l)));
     return true;
+  };
+
+  /** Admin vừa thêm/sửa/xóa bãi → tải lại danh mục cho toàn hệ thống. */
+  const reloadParkingLots = async (): Promise<void> => {
+    const dbLots = await fetchParkingLotStatuses();
+    setLotStatuses(dbLots);
+    setLotCatalog(dbLots);
+    // Bãi mới kèm ô đỗ mới → làm mới luôn kho ô đỗ để sơ đồ mọi trang khớp ngay.
+    try {
+      const freshSlots = await fetchSlotStatuses();
+      if (freshSlots.length) setSlots(freshSlots);
+    } catch { /* fetch lỗi — danh mục bãi vẫn đã cập nhật */ }
   };
 
   const handleSubmitFeedback = (newFb: any) => {
@@ -2375,7 +2395,7 @@ export default function App() {
                 <Homepage setView={setView} stats={publicStats} pricingRules={pricingRules} />
               )}
               {currentView === "baixe" && (
-                <ParkingLotsList setView={setView} pricingRules={pricingRules} />
+                <ParkingLotsList setView={setView} pricingRules={pricingRules} parkingLots={lotStatuses} />
               )}
               {currentView === "info" && (
                 <ParkingInformation setView={setView} />
@@ -2472,6 +2492,7 @@ export default function App() {
                   onToggleLockUser={handleToggleLockUser}
                   activeAdminEmail={currentUser.email}
                   viewerRole={currentUser.role}
+                  parkingLots={lotStatuses}
                 />
               )}
               {currentView === "rolemanagement" && (
@@ -2485,7 +2506,8 @@ export default function App() {
               )}
               {currentView === "parkinglotmanagement" && (
                 <ParkingLotManagement
-                  setView={setView}
+                  lots={lotStatuses}
+                  onReload={reloadParkingLots}
                   onOpenLayout={(lot) => {
                     setAdminLayoutLot(lot);
                     setView("parkinglayouteditor");
@@ -2493,7 +2515,11 @@ export default function App() {
                 />
               )}
               {currentView === "parkinglayouteditor" && (
-                <ParkingLayoutEditor lot={adminLayoutLot} setView={setView} />
+                <ParkingLayoutEditor
+                  lot={adminLayoutLot}
+                  setView={setView}
+                  onSaved={reloadParkingLots}
+                />
               )}
               {currentView === "systemconfig" && (
                 <SystemConfiguration
@@ -2674,7 +2700,7 @@ export default function App() {
                 <Homepage setView={setView} stats={publicStats} pricingRules={pricingRules} />
               )}
               {currentView === "baixe" && (
-                <ParkingLotsList setView={setView} pricingRules={pricingRules} />
+                <ParkingLotsList setView={setView} pricingRules={pricingRules} parkingLots={lotStatuses} />
               )}
               {currentView === "info" && (
                 <ParkingInformation setView={setView} />
