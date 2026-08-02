@@ -361,6 +361,21 @@ async function createTables() {
       ALTER TABLE dbo.parking_slots ADD parking_lot NVARCHAR(100) NOT NULL DEFAULT N'ParkFlow Quận 9';
     END
   `);
+  // pos_x/pos_y — vị trí ô trên sơ đồ khi Admin kéo thả tự do. NULL nghĩa là
+  // "dùng đúng vị trí công thức của lưới mẫu" (mọi ô cũ đều vậy), nên thêm cột
+  // này không làm xê dịch bất kỳ sơ đồ nào đang có.
+  // pos_w/pos_h — kích thước ô sau khi Admin kéo dãn. NULL = dùng kích thước
+  // mặc định của lưới mẫu (mỗi dãy một cỡ khác nhau).
+  await pool.request().query(`
+    IF COL_LENGTH('dbo.parking_slots', 'pos_x') IS NULL
+      ALTER TABLE dbo.parking_slots ADD pos_x FLOAT NULL;
+    IF COL_LENGTH('dbo.parking_slots', 'pos_y') IS NULL
+      ALTER TABLE dbo.parking_slots ADD pos_y FLOAT NULL;
+    IF COL_LENGTH('dbo.parking_slots', 'pos_w') IS NULL
+      ALTER TABLE dbo.parking_slots ADD pos_w FLOAT NULL;
+    IF COL_LENGTH('dbo.parking_slots', 'pos_h') IS NULL
+      ALTER TABLE dbo.parking_slots ADD pos_h FLOAT NULL;
+  `);
 
   // slot_issues
   await pool.request().query(`
@@ -3147,10 +3162,10 @@ app.get('/api/slots', async (req, res) => {
     const lotFilter = req.query.lot ? String(req.query.lot) : null;
     const r = lotFilter
       ? await pool.request().input('lot', sql.NVarChar, lotFilter).query(
-          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot
+          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot, pos_x, pos_y, pos_w, pos_h
            FROM dbo.parking_slots WHERE parking_lot = @lot ORDER BY slot_code`)
       : await pool.request().query(
-          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot FROM dbo.parking_slots ORDER BY slot_code`);
+          `SELECT slot_code, floor, zone, vehicle_type, status, parking_lot, pos_x, pos_y, pos_w, pos_h FROM dbo.parking_slots ORDER BY slot_code`);
     const vtMap = {
       'Xe máy / Xe máy điện':    'motorbike',
       'Ô tô 4-7 chỗ (Xăng)':    'car',
@@ -3170,6 +3185,7 @@ app.get('/api/slots', async (req, res) => {
       available: 'Available', occupied: 'Occupied', reserved: 'Reserved',
       pending: 'Pending', maintenance: 'Maintenance', locked: 'Locked',
     };
+    const nullableNum = (v) => (v === null || v === undefined ? null : Number(v));
     return res.json(r.recordset.map((s) => ({
       id: `SL-${s.slot_code.replace(/^F1-/, '')}`,
       slotCode: s.slot_code,
@@ -3179,6 +3195,12 @@ app.get('/api/slots', async (req, res) => {
       status: canonStatus[String(s.status || '').toLowerCase()] || 'Available',
       parkingLot: s.parking_lot || 'ParkFlow Quận 9',
       nearestGate: 'Cổng chính',
+      // Vị trí + kích thước Admin đặt trong trình thiết kế — để sơ đồ của
+      // staff/manager/user vẽ ô ĐÚNG như Admin đã bố trí. null = theo lưới mẫu.
+      posX: nullableNum(s.pos_x),
+      posY: nullableNum(s.pos_y),
+      posW: nullableNum(s.pos_w),
+      posH: nullableNum(s.pos_h),
     })));
   } catch (err) {
     console.error('GET /api/slots', err);
@@ -3549,10 +3571,9 @@ app.patch('/api/issues/:id', async (req, res) => {
 
 const LOT_STATUSES = ['Hoạt động', 'Bảo trì', 'Đóng cửa'];
 
-// Mặt bằng mẫu dùng chung cho mọi bãi (khớp buildSpaces() trong
-// ParkingFloorMap.tsx): số ô tối đa mỗi dãy, cùng loại xe/tầng/khu mặc định.
-// Admin chọn bật/tắt từng vị trí trong lưới này chứ không đặt toạ độ tự do.
-const GRID_ROWS = { A: 11, B: 5, C: 5, D: 4, E: 11 };
+// Mặc định theo chữ cái đầu của mã ô (khớp lưới mẫu trong ParkingFloorMap.tsx).
+// Admin đặt được mã tùy ý và kéo thả tự do, nên đây chỉ là giá trị khởi tạo cho
+// tầng/khu/loại xe khi thêm ô mới.
 const ROW_DEFAULTS = {
   A: { floor:  2, zone: 'A', vehicleType: 'Ô tô 4-7 chỗ (Xăng)' },
   B: { floor:  1, zone: 'A', vehicleType: 'Xe máy / Xe máy điện' },
@@ -3568,12 +3589,26 @@ const SLOT_VEHICLE_LABEL = {
   'electric vehicle': 'Ô tô 4-7 chỗ (Điện / EV)',
 };
 
-/** 'A01' hợp lệ khi nằm trong lưới mẫu (A01-A11, B01-B05, C01-C05, D01-D04, E01-E11). */
-function isValidGridCode(code) {
-  const m = /^([A-E])(\d{2})$/.exec(String(code || ''));
-  if (!m) return false;
-  const num = Number(m[2]);
-  return num >= 1 && num <= GRID_ROWS[m[1]];
+/**
+ * Mã ô do Admin tự đặt: chữ HOA + số, tối đa 10 ký tự. KHÔNG cho dấu '-' vì
+ * slot_code ghép theo dạng `<prefix>F1-<mã>` và sơ đồ tách mã bằng dấu '-'.
+ */
+function isValidSlotCode(code) {
+  return /^[A-Z0-9]{1,10}$/.test(String(code || ''));
+}
+
+/**
+ * slot_code trong DB → mã ô hiển thị trên sơ đồ, hoặc null nếu hàng đó KHÔNG do
+ * trình thiết kế quản. Nhận diện bằng đúng tiền tố `<codePrefix>F1-` thay vì
+ * "đoạn cuối sau dấu '-'" như trước: từ khi Admin đặt được mã tùy ý, cách cũ sẽ
+ * hiểu nhầm các hàng dữ liệu cũ ('T1-A-01' → '01') là ô đỗ hợp lệ rồi xóa oan.
+ */
+function designerCodeOf(slotCode, codePrefix) {
+  const expected = `${codePrefix || ''}F1-`;
+  const s = String(slotCode || '');
+  if (!s.startsWith(expected)) return null;
+  const code = s.slice(expected.length);
+  return isValidSlotCode(code) ? code : null;
 }
 
 function stripDiacritics(s) {
@@ -3635,25 +3670,36 @@ function toParkingLotDto(r, gates = [], slots = []) {
   };
 }
 
-/** Đọc gates + mã ô lưới của mọi bãi một lượt (tránh N+1 khi trả danh sách). */
+/** Đọc gates + ô đỗ của mọi bãi một lượt (tránh N+1 khi trả danh sách). */
 async function loadLotChildren() {
-  const [gates, slots] = await Promise.all([
+  const [gates, slots, lots] = await Promise.all([
     pool.request().query(`SELECT * FROM dbo.parking_lot_gates ORDER BY gate_id ASC`),
-    pool.request().query(`SELECT parking_lot, slot_code, vehicle_type FROM dbo.parking_slots`),
+    pool.request().query(`SELECT parking_lot, slot_code, vehicle_type, pos_x, pos_y, pos_w, pos_h FROM dbo.parking_slots`),
+    pool.request().query(`SELECT name, code_prefix FROM dbo.parking_lots`),
   ]);
   const gatesByLot = new Map();
   for (const g of gates.recordset) {
     if (!gatesByLot.has(g.lot_id)) gatesByLot.set(g.lot_id, []);
     gatesByLot.get(g.lot_id).push(g);
   }
+  // Tách mã ô cần biết prefix của chính bãi chứa nó.
+  const prefixByLot = new Map(lots.recordset.map((l) => [l.name, l.code_prefix || '']));
   const vtKey = Object.fromEntries(Object.entries(SLOT_VEHICLE_LABEL).map(([k, v]) => [v, k]));
   const slotsByLot = new Map();
   for (const s of slots.recordset) {
-    // slot_code = <prefix>F1-A01 → mã lưới là đoạn cuối sau dấu '-'
-    const code = String(s.slot_code).split('-').pop();
-    if (!isValidGridCode(code)) continue;
+    const code = designerCodeOf(s.slot_code, prefixByLot.get(s.parking_lot));
+    if (code === null) continue;
     if (!slotsByLot.has(s.parking_lot)) slotsByLot.set(s.parking_lot, []);
-    slotsByLot.get(s.parking_lot).push({ code, vehicleType: vtKey[s.vehicle_type] || 'car' });
+    const num = (v) => (v === null || v === undefined ? null : Number(v));
+    slotsByLot.get(s.parking_lot).push({
+      code,
+      vehicleType: vtKey[s.vehicle_type] || 'car',
+      // null = chưa kéo thả/kéo dãn, sơ đồ tự đặt theo công thức lưới mẫu
+      x: num(s.pos_x),
+      y: num(s.pos_y),
+      w: num(s.pos_w),
+      h: num(s.pos_h),
+    });
   }
   return { gatesByLot, slotsByLot };
 }
@@ -3703,23 +3749,41 @@ async function replaceGates(lotId, gates) {
  * Trả về mảng mã ô không xóa được (đang có xe/đặt chỗ) để caller báo lỗi.
  */
 async function syncLotSlots(lotName, codePrefix, slots) {
+  // Mã ô giờ do Admin tự đặt (không còn bó trong lưới A01-E11), kèm toạ độ kéo
+  // thả. Toạ độ null = để sơ đồ tự xếp theo công thức lưới mẫu như trước.
+  // null/undefined/'' → null (ô về vị trí mặc định của lưới). KHÔNG dùng thẳng
+  // Number(v) vì Number(null) === 0 và Number.isFinite(0) === true, khiến lệnh
+  // "về vị trí mặc định" lại ghim ô vào toạ độ (0,0) ở góc bãi.
+  const toCoord = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const clampSize = (n, min, max) => (n === null ? null : Math.min(max, Math.max(min, n)));
   const wanted = new Map();
   for (const s of Array.isArray(slots) ? slots : []) {
-    if (isValidGridCode(s.code)) wanted.set(s.code, s.vehicleType);
+    const code = String(s.code || '').trim().toUpperCase();
+    if (!isValidSlotCode(code) || wanted.has(code)) continue;
+    wanted.set(code, {
+      vehicleType: s.vehicleType,
+      x: toCoord(s.x),
+      y: toCoord(s.y),
+      // Kẹp kích thước để ô không bị kéo bé xíu hoặc phủ kín cả bãi
+      w: clampSize(toCoord(s.w), 24, 300),
+      h: clampSize(toCoord(s.h), 20, 240),
+    });
   }
 
   const cur = await pool.request().input('lot', sql.NVarChar, lotName)
     .query(`SELECT slot_code, status FROM dbo.parking_slots WHERE parking_lot = @lot`);
 
-  // CHỈ những hàng có mã lưới hợp lệ mới thuộc quyền quản của trình thiết kế.
-  // DB còn các hàng cũ kiểu 'T1-A-01'/'B1-A-02' (đuôi '01', '02' — không phải mã
-  // lưới, không bao giờ vẽ lên sơ đồ): nếu gom cả vào đây thì (a) chúng sẽ bị
-  // xóa oan vì không nằm trong `wanted`, và (b) nhiều hàng cùng đuôi '01' sẽ đè
-  // lên nhau trong Map. Bỏ qua hẳn để dữ liệu cũ nguyên vẹn.
+  // CHỈ những hàng mang đúng tiền tố `<prefix>F1-` mới thuộc quyền quản của
+  // trình thiết kế. DB còn các hàng cũ kiểu 'T1-A-01'/'B1-A-02': nếu gom cả vào
+  // đây thì chúng sẽ bị xóa oan vì không nằm trong `wanted`.
   const existing = new Map();
   for (const r of cur.recordset) {
-    const code = String(r.slot_code).split('-').pop();
-    if (isValidGridCode(code)) existing.set(code, r);
+    const code = designerCodeOf(r.slot_code, codePrefix);
+    if (code !== null) existing.set(code, r);
   }
 
   const blocked = [];
@@ -3731,14 +3795,24 @@ async function syncLotSlots(lotName, codePrefix, slots) {
       .query(`DELETE FROM dbo.parking_slots WHERE slot_code = @slot_code`);
   }
 
-  for (const [code, vehicleType] of wanted) {
-    const row = ROW_DEFAULTS[code[0]];
-    const label = SLOT_VEHICLE_LABEL[vehicleType] || row.vehicleType;
+  for (const [code, want] of wanted) {
+    // Mã tự đặt có thể không bắt đầu bằng A-E → dùng mặc định của dãy A.
+    const row = ROW_DEFAULTS[code[0]] ?? ROW_DEFAULTS.A;
+    const label = SLOT_VEHICLE_LABEL[want.vehicleType] || row.vehicleType;
     if (existing.has(code)) {
       await pool.request()
         .input('slot_code',    sql.NVarChar, existing.get(code).slot_code)
         .input('vehicle_type', sql.NVarChar, label)
-        .query(`UPDATE dbo.parking_slots SET vehicle_type = @vehicle_type WHERE slot_code = @slot_code`);
+        .input('pos_x',        sql.Float,    want.x)
+        .input('pos_y',        sql.Float,    want.y)
+        .input('pos_w',        sql.Float,    want.w)
+        .input('pos_h',        sql.Float,    want.h)
+        .query(`
+          UPDATE dbo.parking_slots
+          SET vehicle_type = @vehicle_type,
+              pos_x = @pos_x, pos_y = @pos_y, pos_w = @pos_w, pos_h = @pos_h
+          WHERE slot_code = @slot_code
+        `);
       continue;
     }
     await pool.request()
@@ -3747,10 +3821,15 @@ async function syncLotSlots(lotName, codePrefix, slots) {
       .input('zone',         sql.NVarChar, row.zone)
       .input('vehicle_type', sql.NVarChar, label)
       .input('parking_lot',  sql.NVarChar, lotName)
+      .input('pos_x',        sql.Float,    want.x)
+      .input('pos_y',        sql.Float,    want.y)
+      .input('pos_w',        sql.Float,    want.w)
+      .input('pos_h',        sql.Float,    want.h)
       .query(`
         IF NOT EXISTS (SELECT 1 FROM dbo.parking_slots WHERE slot_code = @slot_code)
-          INSERT INTO dbo.parking_slots (slot_code, floor, zone, vehicle_type, status, parking_lot)
-          VALUES (@slot_code, @floor, @zone, @vehicle_type, 'Available', @parking_lot)
+          INSERT INTO dbo.parking_slots
+            (slot_code, floor, zone, vehicle_type, status, parking_lot, pos_x, pos_y, pos_w, pos_h)
+          VALUES (@slot_code, @floor, @zone, @vehicle_type, 'Available', @parking_lot, @pos_x, @pos_y, @pos_w, @pos_h)
       `);
   }
   return blocked;

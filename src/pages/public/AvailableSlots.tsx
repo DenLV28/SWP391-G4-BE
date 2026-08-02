@@ -572,7 +572,16 @@ export default function AvailableSlots({
                   </div>
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-2 overflow-hidden">
                     <ParkingFloorMap
-                      slots={lotSlots.map((s) => ({ id: s.id, code: s.slotCode.split('-').pop() ?? s.slotCode, status: s.status } as MapSlot))}
+                      slots={lotSlots.map((s) => ({
+                        id: s.id,
+                        code: s.slotCode.split('-').pop() ?? s.slotCode,
+                        status: s.status,
+                        // Vẽ ô đúng chỗ Admin đã kéo thả trong trình thiết kế
+                        x: s.posX ?? null,
+                        y: s.posY ?? null,
+                        w: s.posW ?? null,
+                        h: s.posH ?? null,
+                      } as MapSlot))}
                       gates={findLot(selectedLot)?.gates}
                       selectedId={selectedSlotId}
                       onSelect={(id) => setSelectedSlotId((prev) => (prev === id ? null : id))}

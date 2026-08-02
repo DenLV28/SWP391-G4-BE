@@ -157,6 +157,11 @@ export default function EmergencyPanel({
     id: s.slotCode,
     code: s.slotCode.split('-').pop() ?? s.slotCode,
     status: s.status as MapSlot['status'],
+    // Vẽ ô đúng chỗ Admin đã kéo thả trong trình thiết kế
+    x: s.posX ?? null,
+    y: s.posY ?? null,
+    w: s.posW ?? null,
+    h: s.posH ?? null,
   }));
 
   const cleanSelectedSlot = selectedSlot?.startsWith('virtual-')

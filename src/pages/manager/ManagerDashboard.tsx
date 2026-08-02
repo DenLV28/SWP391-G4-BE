@@ -752,6 +752,11 @@ function DashboardContent({
               id: s.id,
               code: s.slotCode.split('-').pop() ?? s.slotCode,
               status: s.status,
+              // Vẽ ô đúng chỗ Admin đã kéo thả trong trình thiết kế
+              x: s.posX ?? null,
+              y: s.posY ?? null,
+              w: s.posW ?? null,
+              h: s.posH ?? null,
             } as MapSlot))}
             gates={selectedLot?.gates}
             interactive={false}

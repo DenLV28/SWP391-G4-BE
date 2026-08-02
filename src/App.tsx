@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { UserCircle2 } from "lucide-react";
 // Common UI components
 import Topbar from "./components/Topbar";
@@ -292,9 +292,14 @@ export default function App() {
   // (mirrors the onViewDetail/lot pattern ManagerParkingLotDetail already uses).
   const [adminLayoutLot, setAdminLayoutLot] = useState<ParkingLotInfo | null>(null);
 
-  const setView = (view: string) => {
+  // useCallback là BẮT BUỘC, không phải tối ưu: setView được truyền xuống làm
+  // prop và nhiều trang đưa nó vào mảng phụ thuộc của useEffect. Nếu tạo mới
+  // mỗi lần render (App re-render liên tục vì đồng bộ 30s + sự kiện SSE) thì
+  // các effect đó chạy lại liên tục và ghi đè state đang soạn dở của người dùng
+  // — đúng lỗi "chỉnh sơ đồ bãi xong lại quay về như cũ".
+  const setView = useCallback((view: string) => {
     window.location.hash = `#/${view}`;
-  };
+  }, []);
 
   // Sync view state with URL hash
   useEffect(() => {
@@ -424,8 +429,18 @@ export default function App() {
             if (!db) return s;
             const statusChanged = db.status !== s.status;
             const lotChanged = !!db.parkingLot && db.parkingLot !== s.parkingLot;
-            if (!statusChanged && !lotChanged) return s;
-            return { ...s, status: db.status, parkingLot: db.parkingLot ?? s.parkingLot };
+            // Toạ độ cũng phải theo DB: Admin kéo ô sang chỗ khác trong trình
+            // thiết kế thì sơ đồ của User/Staff/Manager phải dời theo, nếu bỏ
+            // qua ở đây thì ô đã biết sẽ mãi nằm ở vị trí cũ.
+            const posChanged = (db.posX ?? null) !== (s.posX ?? null) || (db.posY ?? null) !== (s.posY ?? null);
+            if (!statusChanged && !lotChanged && !posChanged) return s;
+            return {
+              ...s,
+              status: db.status,
+              parkingLot: db.parkingLot ?? s.parkingLot,
+              posX: db.posX ?? null,
+              posY: db.posY ?? null,
+            };
           });
         const additions = dbSlots.filter((d) => !known.has(d.slotCode));
         return additions.length ? [...merged, ...additions] : merged;

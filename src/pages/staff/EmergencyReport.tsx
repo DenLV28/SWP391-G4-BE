@@ -64,6 +64,11 @@ export default function EmergencyReport({
     id: s.slotCode,
     code: s.slotCode.split('-').pop() ?? s.slotCode,
     status: s.status as MapSlot['status'],
+    // Vẽ ô đúng chỗ Admin đã kéo thả trong trình thiết kế
+    x: s.posX ?? null,
+    y: s.posY ?? null,
+    w: s.posW ?? null,
+    h: s.posH ?? null,
   }));
 
   // Strip the "virtual-" prefix that ParkingFloorMap adds for unmatched spaces

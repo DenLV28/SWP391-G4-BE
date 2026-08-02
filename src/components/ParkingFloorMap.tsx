@@ -1,9 +1,15 @@
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 
 export interface MapSlot {
   id: string;
   code: string;
   status: 'Available' | 'Occupied' | 'Reserved' | 'Maintenance' | 'Locked' | 'Pending';
+  /** Toạ độ kéo thả (hệ toạ độ SVG). Bỏ trống → xếp theo công thức lưới mẫu. */
+  x?: number | null;
+  y?: number | null;
+  /** Kích thước sau khi kéo dãn. Bỏ trống → cỡ mặc định của lưới mẫu. */
+  w?: number | null;
+  h?: number | null;
 }
 
 // Which vehicle type each slot row serves (derived from code prefix)
@@ -44,6 +50,12 @@ interface Props {
    */
   designMode?: boolean;
   onToggleSlot?: (code: string) => void;
+  /** designMode: tô sáng các vị trí còn trống làm đích khi đang đổi chỗ một ô. */
+  highlightEmpty?: boolean;
+  /** designMode: kéo thả xong một ô — trả về toạ độ mới trong hệ toạ độ SVG. */
+  onMoveSlot?: (code: string, x: number, y: number) => void;
+  /** designMode: kéo dãn ô — trả về kích thước mới trong hệ toạ độ SVG. */
+  onResizeSlot?: (code: string, w: number, h: number) => void;
 }
 
 // ── Layout constants — generously spaced so slots never crowd each other ──
@@ -202,13 +214,35 @@ export default function ParkingFloorMap({
   gates,
   designMode = false,
   onToggleSlot,
+  highlightEmpty = false,
+  onMoveSlot,
+  onResizeSlot,
 }: Props) {
   const spaceDefs = useMemo(() => buildSpaces(level), [level]);
   const gateList = gates && gates.length ? gates : DEFAULT_GATES;
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  // Ô đang kéo — giữ trong ref để không re-render mỗi lần con trỏ nhích.
+  const dragRef = useRef<{ code: string; dx: number; dy: number } | null>(null);
+  // Ô đang kéo dãn: giữ góc trái-trên cố định, con trỏ điều khiển góc phải-dưới.
+  const resizeRef = useRef<{ code: string; x0: number; y0: number } | null>(null);
 
   const enriched = useMemo(() => {
     const byCode = new Map(slots?.map((s) => [s.code, s]) ?? []);
-    return spaceDefs.map((def) => {
+    const gridCodes = new Set(spaceDefs.map((d) => d.code));
+
+    // Ô có mã ngoài lưới mẫu (Admin tự đặt, vd. 'VIP1') không có sẵn ô trong
+    // `spaceDefs` — dựng thêm def từ chính toạ độ của nó.
+    const extraDefs: SpaceDef[] = (slots ?? [])
+      .filter((s) => !gridCodes.has(s.code))
+      .map((s) => ({
+        code: s.code,
+        x: typeof s.x === 'number' ? s.x : VW / 2,
+        y: typeof s.y === 'number' ? s.y : BH / 2,
+        w: ROW_W,
+        h: ROW_H,
+      }));
+
+    return [...spaceDefs, ...extraDefs].map((def) => {
       const slot = byCode.get(def.code);
       const rowType = slotRowType(def.code);
       const hiddenByArea =
@@ -218,6 +252,12 @@ export default function ParkingFloorMap({
       const dimmedByFilter = filterVehicleType != null ? rowType !== filterVehicleType : false;
       return {
         ...def,
+        // Ô đã được kéo thả/kéo dãn thì dùng giá trị riêng, chưa thì giữ nguyên
+        // vị trí và kích thước của lưới mẫu.
+        x: typeof slot?.x === 'number' ? slot.x : def.x,
+        y: typeof slot?.y === 'number' ? slot.y : def.y,
+        w: typeof slot?.w === 'number' ? slot.w : def.w,
+        h: typeof slot?.h === 'number' ? slot.h : def.h,
         id: slot?.id ?? `virtual-${def.code}`,
         status: slot?.status ?? 'Available' as MapSlot['status'],
         isReal: !!slot,
@@ -228,11 +268,65 @@ export default function ParkingFloorMap({
     });
   }, [spaceDefs, slots, filterVehicleType, areaMode]);
 
+  /** Toạ độ con trỏ (pixel màn hình) → hệ toạ độ trong viewBox của SVG. */
+  const toSvgPoint = (clientX: number, clientY: number) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const p = pt.matrixTransform(ctm.inverse());
+    return { x: p.x, y: p.y };
+  };
+
+  const handleDragStart = (e: React.PointerEvent, sp: { code: string; x: number; y: number }) => {
+    if (!designMode || !onMoveSlot) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const p = toSvgPoint(e.clientX, e.clientY);
+    // Ghi lại khoảng lệch để ô không "nhảy" về góc khi bắt đầu kéo.
+    dragRef.current = { code: sp.code, dx: p.x - sp.x, dy: p.y - sp.y };
+  };
+
+  const handleResizeStart = (e: React.PointerEvent, sp: { code: string; x: number; y: number }) => {
+    if (!designMode || !onResizeSlot) return;
+    // Chặn nổi bọt để không kích hoạt kéo-di-chuyển của chính ô này.
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    resizeRef.current = { code: sp.code, x0: sp.x, y0: sp.y };
+  };
+
+  const handleDragMove = (e: React.PointerEvent) => {
+    const r = resizeRef.current;
+    if (r) {
+      const p = toSvgPoint(e.clientX, e.clientY);
+      // Kẹp trùng giới hạn với backend (24-300 × 20-240) và không tràn khỏi bãi.
+      const w = Math.max(24, Math.min(300, Math.min(VW - 8, p.x) - r.x0));
+      const h = Math.max(20, Math.min(240, Math.min(BH - 8, p.y) - r.y0));
+      onResizeSlot?.(r.code, Math.round(w), Math.round(h));
+      return;
+    }
+    const d = dragRef.current;
+    if (!d) return;
+    const p = toSvgPoint(e.clientX, e.clientY);
+    // Giữ ô nằm trong khung bãi
+    const x = Math.max(8, Math.min(VW - ROW_W - 8, p.x - d.dx));
+    const y = Math.max(8, Math.min(BH - ROW_H - 8, p.y - d.dy));
+    onMoveSlot?.(d.code, Math.round(x), Math.round(y));
+  };
+
+  const handleDragEnd = () => { dragRef.current = null; resizeRef.current = null; };
+
   return (
     <svg
+      ref={svgRef}
       viewBox={`0 0 ${VW} ${VH}`}
       className="w-full rounded-2xl border border-slate-200 shadow-sm"
-      style={{ background: '#ffffff', fontFamily: 'sans-serif' }}
+      style={{ background: '#ffffff', fontFamily: 'sans-serif', touchAction: designMode ? 'none' : undefined }}
+      onPointerMove={designMode ? handleDragMove : undefined}
+      onPointerUp={designMode ? handleDragEnd : undefined}
+      onPointerCancel={designMode ? handleDragEnd : undefined}
     >
       <defs>
         {/* Floor texture pattern */}
@@ -334,15 +428,54 @@ export default function ParkingFloorMap({
       {enriched.map((sp) => {
         if (sp.hiddenByArea) return null;
 
-        // Chế độ thiết kế: vẽ ĐỦ mặt bằng mẫu, ô chưa thêm để nét đứt mờ, bấm
-        // vào bất kỳ ô nào cũng bật/tắt được — đây là cách Admin "thêm ô đỗ".
+        // Chế độ thiết kế: vẽ ĐỦ mặt bằng mẫu, ô chưa thêm để nét đứt mờ. Bấm
+        // vào ô để chọn/thêm — thao tác xóa và đổi vị trí nằm ở panel bên phải.
         if (designMode) {
-          const c: SlotColors = sp.isReal
-            ? slotColors('Available', selectedId === sp.code)
-            : { fill: '#ffffff', stroke: '#cbd5e1', text: '#94a3b8', dashArray: '4,3' };
+          const isSel = selectedId === sp.code;
+          let c: SlotColors;
+          if (sp.isReal) {
+            c = slotColors('Available', isSel);
+          } else if (isSel) {
+            // Vị trí trống đang được chọn — viền đậm để thấy rõ đang đứng ở đâu
+            c = { fill: '#eff6ff', stroke: '#2563eb', text: '#1d4ed8', dashArray: '4,3' };
+          } else if (highlightEmpty) {
+            // Đang đổi chỗ: mọi vị trí trống là đích hợp lệ
+            c = { fill: '#fffbeb', stroke: '#f59e0b', text: '#b45309', dashArray: '4,3' };
+          } else {
+            c = { fill: '#ffffff', stroke: '#cbd5e1', text: '#94a3b8', dashArray: '4,3' };
+          }
           return (
-            <g key={sp.code} onClick={() => onToggleSlot?.(sp.code)}>
-              <SlotCard sp={{ ...sp, status: 'Available' }} c={c} clickable />
+            <g key={sp.code}>
+              <g
+                onClick={() => { if (!dragRef.current && !resizeRef.current) onToggleSlot?.(sp.code); }}
+                // Chỉ ô ĐÃ CÓ mới kéo được; vị trí trống của lưới mẫu thì không.
+                onPointerDown={sp.isReal ? (e) => handleDragStart(e, sp) : undefined}
+                style={sp.isReal && onMoveSlot ? { cursor: 'grab' } : undefined}
+              >
+                <SlotCard sp={{ ...sp, status: 'Available' }} c={c} clickable />
+              </g>
+              {/* Tay nắm kéo dãn — chỉ hiện ở ô ĐANG CHỌN để sơ đồ khỏi rối */}
+              {sp.isReal && isSel && onResizeSlot && (
+                <g
+                  onPointerDown={(e) => handleResizeStart(e, sp)}
+                  style={{ cursor: 'nwse-resize' }}
+                >
+                  {/* Vùng bắt chuột rộng hơn phần vẽ để dễ trúng */}
+                  <rect
+                    x={sp.x + sp.w - 11} y={sp.y + sp.h - 11} width="20" height="20"
+                    fill="transparent"
+                  />
+                  <rect
+                    x={sp.x + sp.w - 7} y={sp.y + sp.h - 7} width="11" height="11"
+                    rx="2.5" fill="#ffffff" stroke="#2563eb" strokeWidth="1.6"
+                  />
+                  <line
+                    x1={sp.x + sp.w - 4.5} y1={sp.y + sp.h + 1.5}
+                    x2={sp.x + sp.w + 1.5} y2={sp.y + sp.h - 4.5}
+                    stroke="#2563eb" strokeWidth="1.3" strokeLinecap="round"
+                  />
+                </g>
+              )}
             </g>
           );
         }
@@ -375,13 +508,18 @@ export default function ParkingFloorMap({
       <rect x="0" y={BH} width={VW} height={VH - BH} fill="#ffffff" />
       <line x1="0" y1={BH} x2={VW} y2={BH} stroke="#e2e8f0" strokeWidth="1" />
       <text x="14" y={BH + 20} fill="#64748b" fontSize="9" fontWeight="800" letterSpacing="1.5">
-        {designMode ? 'BẤM VÀO Ô ĐỂ THÊM / BỎ' : 'TRẠNG THÁI Ô ĐỖ'}
+        {designMode
+          ? (highlightEmpty ? 'BẤM VÀO Ô TRỐNG ĐỂ CHUYỂN Ô ĐANG CHỌN TỚI ĐÓ' : 'BẤM VÀO Ô ĐỂ CHỌN / THÊM')
+          : 'TRẠNG THÁI Ô ĐỖ'}
       </text>
 
       {(designMode
         ? [
             { color: '#ffffff', stroke: '#3b82f6', label: 'Đã thêm vào bãi', tx: 14 },
             { color: '#ffffff', stroke: '#cbd5e1', label: 'Chưa thêm',       tx: 160, dash: '4,3' },
+            ...(highlightEmpty
+              ? [{ color: '#fffbeb', stroke: '#f59e0b', label: 'Đích có thể chuyển tới', tx: 268, dash: '4,3' }]
+              : []),
           ]
         : [
         { color: '#ffffff', stroke: '#3b82f6', label: 'Trống',      tx: 14 },

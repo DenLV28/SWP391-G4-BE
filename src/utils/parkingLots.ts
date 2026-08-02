@@ -26,10 +26,20 @@ export type LotGate = {
   position: 'left' | 'center' | 'right';
 };
 
-/** Một ô đỗ trong lưới mặt bằng mẫu — `code` là mã lưới ('A01'), không phải slot_code DB. */
+/**
+ * Một ô đỗ trên sơ đồ. `code` là mã hiển thị Admin tự đặt ('A01', 'VIP1'...),
+ * không phải slot_code đầy đủ trong DB (đó là `<codePrefix>F1-<code>`).
+ * `x`/`y` là toạ độ kéo thả trong hệ toạ độ SVG của sơ đồ; null nghĩa là chưa
+ * kéo bao giờ → sơ đồ tự xếp theo công thức lưới mẫu.
+ */
 export type LotGridSlot = {
   code: string;
   vehicleType: 'car' | 'motorbike' | 'electric vehicle';
+  x?: number | null;
+  y?: number | null;
+  /** Kích thước sau khi Admin kéo dãn; null = cỡ mặc định của lưới mẫu. */
+  w?: number | null;
+  h?: number | null;
 };
 
 export type ParkingLotInfo = {

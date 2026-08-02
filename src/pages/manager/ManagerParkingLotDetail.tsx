@@ -49,6 +49,11 @@ export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: Ma
     id: s.slotCode,
     code: s.slotCode.split('-').pop() ?? s.slotCode,
     status: s.status as MapSlot['status'],
+    // Vẽ ô đúng chỗ Admin đã kéo thả trong trình thiết kế
+    x: s.posX ?? null,
+    y: s.posY ?? null,
+    w: s.posW ?? null,
+    h: s.posH ?? null,
   }));
   // Cổng vào/ra do Admin đặt riêng cho bãi này.
   const lotGates = findLot(lot.name)?.gates;

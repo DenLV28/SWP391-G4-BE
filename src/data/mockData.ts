@@ -103,6 +103,15 @@ export type Slot = {
   /** Bãi đỗ sở hữu ô này (mỗi bãi có kho ô riêng); rỗng = bãi gốc Quận 9. */
   parkingLot?: string;
   nearestGate?: string;
+  /**
+   * Vị trí Admin đã kéo thả ô này trên sơ đồ (hệ toạ độ SVG của ParkingFloorMap).
+   * null/undefined = chưa kéo bao giờ → sơ đồ xếp theo công thức lưới mẫu.
+   */
+  posX?: number | null;
+  posY?: number | null;
+  /** Kích thước ô sau khi Admin kéo dãn; null = cỡ mặc định của lưới mẫu. */
+  posW?: number | null;
+  posH?: number | null;
 };
 
 export type ParkingSession = {
