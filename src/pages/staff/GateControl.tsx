@@ -16,7 +16,6 @@ import {
   LogOut,
   Lock,
   Unlock,
-  Siren,
   RefreshCw,
   IdCard,
   Radio,
@@ -24,7 +23,7 @@ import {
   CalendarCheck,
 } from 'lucide-react';
 import jsQR from 'jsqr';
-import type { Gate, ScanEvent, ScanDirection } from '../../types/staff';
+import type { Gate, ScanEvent, ScanDirection, RecognitionResult } from '../../types/staff';
 import { manualVehicleOptions } from '../../types/staff';
 import type { User, VehicleKey, PricingRule, Reservation, Payment, ParkingSession } from '../../data/mockData';
 import { validateLicensePlate } from '../../data/mockData';
@@ -35,8 +34,9 @@ import { fetchActiveSessions, createSession, updateSession } from '../../service
 import { updateReservation } from '../../services/reservationService';
 import { createPayment, updatePayment } from '../../services/paymentService';
 import { updateSlotStatus } from '../../services/slotService';
-import { createRfidScan, updateRfidScan, subscribeToRfidTaps, sendGateCommand, fetchRfidScans, type RfidScan } from '../../services/rfidScanService';
-import { perVisitOverstay, overstayDue, isReservationPaid, realtimeParkingFee, addOneMonth } from '../../utils/reservationPricing';
+import { createRfidScan, updateRfidScan, subscribeToRfidTaps, sendGateCommand, fetchRfidScans, clearRfidScanImages, type RfidScan } from '../../services/rfidScanService';
+import { sameLot } from '../../utils/parkingLots';
+import { perVisitOverstay, overstayDue, isReservationPaid, realtimeParkingFee, addOneMonth, findActiveMonthlyReservation } from '../../utils/reservationPricing';
 
 interface GateControlProps {
   gates: Gate[];
@@ -54,8 +54,6 @@ interface GateControlProps {
   onRfidVerified: (gateId: string, direction: ScanDirection, plate: string, vehicleType: VehicleKey, ownerName: string, rfidUid: string, collectedFee?: number) => void;
   /** Lệnh rào chắn gửi xuống tầng IoT (ESP32/simulator). */
   onGateCommand?: (gateId: string, command: 'open' | 'close') => boolean;
-  /** Báo động khẩn cấp — ghi vào nhật ký sự cố & báo quản lý. */
-  onAlarm?: (description: string) => void;
   addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
   /** Bãi đang Bảo trì/Đóng cửa — chỉ hiển thị banner cảnh báo; các thao tác thật
    * sự bị chặn ở StaffDashboard (nơi truyền các handler xuống đây). */
@@ -74,6 +72,16 @@ function labelToVehicleKey(label: string): VehicleKey {
 }
 
 const normPlate = (p: string) => p.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/**
+ * Hộp thoại chọn loại xe cho khách vãng lai tự chốt sau ngần này giây.
+ *
+ * Rào CHƯA mở khi hộp thoại đang hiện — loại xe phải chốt trước thì mới xếp
+ * đúng ô và tính đúng giá. Mốc dự phòng này để xe không kẹt vô hạn ở cổng khi
+ * staff bận ở cổng kia hoặc rời quầy: hết giờ thì chốt theo loại đang chọn sẵn
+ * rồi mở rào, thay vì bắt khách đứng chờ mãi.
+ */
+const WALKIN_FALLBACK_SECONDS = 20;
 
 // ── QR thẻ tháng ──────────────────────────────────────────────────────────────
 // Payload do trang "Lịch sử đặt chỗ" của driver sinh ra (MyReservations):
@@ -141,7 +149,6 @@ export default function GateControl({
   onManualEntry,
   onRfidVerified,
   onGateCommand,
-  onAlarm,
   addToast,
   isUnderMaintenance = false,
 }: GateControlProps) {
@@ -151,6 +158,48 @@ export default function GateControl({
 
   const [plate, setPlate] = useState('');
   const [manualType, setManualType] = useState<VehicleKey>('motorbike');
+
+  /**
+   * KHÁCH VÃNG LAI — hộp thoại nhập thủ công loại xe.
+   *
+   * Camera chỉ đọc được biển số, không biết đó là xe máy hay ô tô; mà loại xe
+   * quyết định cỡ ô đỗ được xếp và bảng giá. Trước đây khách vãng lai bị gán
+   * cứng theo ô "Loại phương tiện" ở đầu trang — staff chưa kịp chọn thì ô tô
+   * bị vào vé xe máy. Nay RÀO CHƯA MỞ khi hộp thoại đang hiện: staff chọn loại
+   * xe xong thì hệ thống mới gắn thẻ, mở vé rồi mở rào.
+   */
+  const [walkIn, setWalkIn] = useState<{ plate: string; uid: string; gateId: string } | null>(null);
+  const [walkInSeconds, setWalkInSeconds] = useState(WALKIN_FALLBACK_SECONDS);
+  const [walkInBusy, setWalkInBusy] = useState(false);
+
+  /**
+   * Xe vừa quét đã có mặt trong bãi → chặn vào lần hai và BÁO HẲN LÊN MÀN HÌNH.
+   *
+   * Chỉ báo bằng toast là không đủ: toast tự tắt sau vài giây, staff đứng ở cổng
+   * quay đi một cái là mất, rồi tưởng hệ thống không phản hồi và quẹt lại.
+   */
+  const [alreadyInside, setAlreadyInside] = useState<
+    { plate: string; slotCode: string; checkInTime: string; ticketCode: string } | null
+  >(null);
+
+  /**
+   * XE THẺ THÁNG QUẸT NHẦM Ở LUỒNG RFID.
+   *
+   * Thẻ tháng phải vào bãi bằng mã QR — đó là đường duy nhất kiểm được hạn thẻ
+   * và giữ đúng ô đã đăng ký. Vào bằng RFID thì hệ thống coi như khách vãng
+   * lai: mở vé theo lượt, xếp một ô bất kỳ, và tới lúc ra mới phát hiện đây là
+   * xe tháng nên đánh dấu ô vừa mượn thành ô giữ chỗ tháng — sai cả ô lẫn tiền.
+   *
+   * Nên chặn ngay tại cổng vào và yêu cầu staff chuyển sang quét QR.
+   */
+  const [monthlyNeedsQr, setMonthlyNeedsQr] = useState<
+    { plate: string; code: string; slotCode: string; expiry: string } | null
+  >(null);
+
+  /** Xe tra ở cổng ra nhưng vé thuộc bãi khác — không cho ra tại đây. */
+  const [wrongLotExit, setWrongLotExit] = useState<
+    { plate: string; lot: string; ticketCode: string } | null
+  >(null);
 
   // Đồng hồ THỜI GIAN THỰC (tick mỗi giây) cho overlay camera, thời gian ra,
   // tổng thời gian và tiền — như bảng điện tử ở cổng bãi xe thật.
@@ -257,6 +306,25 @@ export default function GateControl({
       if (result.plate) {
         setPlate(result.plate);
         setOcrStatus('done');
+        // ĐỌC RA BIỂN XE THÁNG THÌ BÁO NGAY, bất kể đọc bằng đường nào.
+        //
+        // Đặt ở đây chứ không chỉ trong luồng quẹt thẻ: nhân viên bấm "Chụp &
+        // OCR" tay cũng phải thấy cảnh báo, vì cái quyết định "xe này phải đi
+        // bằng QR" nằm ở BIỂN SỐ chứ không nằm ở chuyện có quẹt thẻ hay không.
+        const monthly = findActiveMonthlyReservation(result.plate, reservations);
+        if (monthly) {
+          setMonthlyNeedsQr({
+            plate: result.plate,
+            code: monthly.reservationCode,
+            slotCode: monthly.slotCode || '',
+            expiry: addOneMonth(monthly.date.split('T')[0]),
+          });
+        } else {
+          // Chụp lại ra một biển KHÁC và không phải xe tháng → xoá cảnh báo cũ.
+          // Không xoá thì băng hồng của chiếc xe trước còn treo trên màn hình và
+          // khoá luôn nút "Thu tiền & Mở cổng" của chiếc xe đang đứng ở cổng.
+          setMonthlyNeedsQr(null);
+        }
         return { image: dataUrl, plate: result.plate };
       } else {
         setOcrStatus('no_plate');
@@ -293,7 +361,23 @@ export default function GateControl({
   ) => {
     try {
       const active = await fetchActiveSessions();
-      if (active.some((s) => normPlate(s.licensePlate) === normPlate(plateVal))) return;
+      // Chốt sớm phía cổng để đỡ gọi API thừa; chốt thật nằm ở backend (409
+      // ALREADY_INSIDE) vì kiểm-tra-rồi-mới-ghi ở đây có kẽ hở: hai lượt quét
+      // sát nhau cùng đọc thấy "chưa có vé" rồi cùng tạo vé.
+      const inside = active.find((s) => normPlate(s.licensePlate) === normPlate(plateVal));
+      if (inside) {
+        setAlreadyInside({
+          plate: plateVal,
+          slotCode: inside.slotCode || '',
+          checkInTime: inside.checkInTime || '',
+          ticketCode: inside.ticketCode || '',
+        });
+        addToast?.(
+          `Xe ${plateVal} đang ở trong bãi${inside.slotCode ? ` (ô ${inside.slotCode})` : ''} — không mở vé thêm lần nữa.`,
+          'error',
+        );
+        return;
+      }
       const { session, autoAssignedSlot } = await createSession(
         {
           licensePlate: plateVal,
@@ -311,8 +395,10 @@ export default function GateControl({
               }
             : {}),
         } as ParkingSession,
-        // Không có đặt chỗ → nhờ backend tự chọn ô trống trong đúng bãi đang phụ trách.
-        reservationSlot ? undefined : currentUser?.assignedParkingLot,
+        // LUÔN gửi bãi đang phụ trách — không chỉ khi cần backend tự chọn ô.
+        // Backend ghi giá trị này lên chính vé, nhờ đó vé vẫn quy được về đúng
+        // bãi ngay cả khi bãi hết ô phù hợp và chưa xếp được ô nào.
+        currentUser?.assignedParkingLot,
       );
       if (reservationSlot?.slotCode) {
         updateSlotStatus(reservationSlot.slotCode, 'Occupied').catch(() => {});
@@ -321,7 +407,21 @@ export default function GateControl({
       } else if (!reservationSlot) {
         addToast?.('Xe vào bãi nhưng bãi đã hết ô trống phù hợp — cần xếp ô thủ công.', 'error');
       }
-    } catch { /* backend offline — nhật ký ra vào vẫn được ghi */ }
+    } catch (e) {
+      // 409 ALREADY_INSIDE mang câu giải thích của backend (đang ở ô nào, từ
+      // lúc nào) — hiện cho staff. Lỗi khác coi như mất kết nối: nhật ký ra vào
+      // vẫn được ghi nên không chặn luồng cổng.
+      const err = e as Error & { code?: string; session?: { ticketCode?: string; slotCode?: string; checkInTime?: string } };
+      if (err?.code === 'ALREADY_INSIDE') {
+        setAlreadyInside({
+          plate: plateVal,
+          slotCode: err.session?.slotCode || '',
+          checkInTime: err.session?.checkInTime || '',
+          ticketCode: err.session?.ticketCode || '',
+        });
+        addToast?.(err.message, 'error');
+      }
+    }
   };
 
   /**
@@ -386,28 +486,130 @@ export default function GateControl({
     return matched;
   };
 
-  const handleManualSubmit = () => {
+  /**
+   * Chốt khách vãng lai sau khi staff chọn loại xe: gắn thẻ vào biển số vừa
+   * đọc rồi mở vé đúng loại xe. Rào đã mở từ lúc phát hiện, hàm này chỉ lo phần
+   * hồ sơ nên chạy chậm vài giây cũng không giữ xe lại ở cổng.
+   */
+  const finishWalkIn = async (vehicleType: VehicleKey, auto = false) => {
+    const pending = walkIn;
+    if (!pending || walkInBusy) return;
+    setWalkInBusy(true);
+    try {
+      const typeLabel = manualVehicleOptions.find((o) => o.key === vehicleType)?.label;
+      // Gắn thẻ với đúng loại xe staff vừa chọn — hồ sơ xe vãng lai được backend
+      // tạo mới sẽ mang loại xe này, không còn mặc định "Xe máy".
+      const link = await linkRfidCard(pending.uid, pending.plate, typeLabel, currentUser?.assignedParkingLot);
+
+      // Backend xác định đây là XE THẺ THÁNG → DỪNG HẲN luồng vãng lai.
+      //
+      // Chốt phía trước (monthlyByOcr) chỉ tra được thẻ tháng của BÃI STAFF ĐANG
+      // PHỤ TRÁCH — `reservations` đã bị lọc theo bãi. Thẻ tháng ở bãi khác lọt
+      // qua đó, và nếu chỉ báo lỗi rồi vẫn mở vé thì xe tháng vẫn vào diện vãng
+      // lai như cũ. Backend biết toàn cục nên đây mới là chốt cuối.
+      if (!link.ok && link.code === 'MONTHLY_CANNOT_LINK_RFID') {
+        const m = findActiveMonthlyReservation(pending.plate, reservations);
+        setMonthlyNeedsQr({
+          plate: pending.plate,
+          code: m?.reservationCode ?? '—',
+          slotCode: m?.slotCode ?? '',
+          expiry: m ? addOneMonth(m.date.split('T')[0]) : '—',
+        });
+        addToast?.(link.error ?? 'Xe thẻ tháng — phải quét mã QR thẻ tháng.', 'error');
+        setAutoPipelineNote('');
+        return;
+      }
+
+      if (link.ok) {
+        const relook = await fetchRfidInfo(pending.uid);
+        if (relook.ok === true) {
+          setRfidInfo(relook.data);
+          setRfidStatus('found');
+          setRfidError('');
+        }
+      }
+
+      onManualEntry(pending.gateId, pending.plate, vehicleType, 'entry');
+      // Vẫn tra đặt chỗ trước: xe có thể đã đặt chỗ mà chưa gắn thẻ RFID.
+      const matched = await checkInIfReserved(pending.plate, vehicleType, pending.gateId);
+      if (!matched) await openEntrySession(pending.plate, vehicleType, pending.gateId);
+
+      // MỞ RÀO Ở ĐÂY — sau khi đã chốt loại xe, gắn thẻ và mở vé xong.
+      sendGateCommand(pending.gateId, 'open');
+
+      const typeText = typeLabel ?? vehicleType;
+      addToast?.(
+        link.ok
+          ? `Khách vãng lai ${pending.plate} (${typeText})${auto ? ' — hết giờ chờ, chốt theo loại đang chọn' : ''} — đã gắn thẻ, mở vé & mở rào.`
+          : `Khách vãng lai ${pending.plate} (${typeText}) — đã mở vé & mở rào, nhưng CHƯA gắn được thẻ (${link.error ?? 'lỗi liên kết'}).`,
+        link.ok ? 'success' : 'error',
+      );
+      setAutoPipelineNote('');
+    } finally {
+      setWalkInBusy(false);
+      setWalkIn(null);
+    }
+  };
+
+  // Đếm ngược của hộp thoại khách vãng lai; hết giờ thì tự chốt theo loại xe
+  // đang chọn ở ô "Loại phương tiện" để xe trong bãi luôn có vé.
+  useEffect(() => {
+    if (!walkIn) return;
+    const t = setInterval(() => {
+      setWalkInSeconds((s) => {
+        if (s <= 1) { void finishWalkIn(manualType, true); return 0; }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [walkIn, manualType]);
+
+  const handleManualSubmit = async () => {
     if (!plate.trim()) return;
     const plateErr = validateLicensePlate(plate);
     if (plateErr) { alert(plateErr); return; }
     const plateVal = plate.trim().toUpperCase();
-    onManualEntry(gate.id, plateVal, manualType, activeDirection);
     if (activeDirection === 'entry') {
-      openEntrySession(plateVal, manualType, gate.id);
-      addToast?.(`Đã xác nhận cho xe ${plateVal} vào cổng.`, 'success');
-    } else {
-      closeExitSession();
+      onManualEntry(gate.id, plateVal, manualType, activeDirection);
+      // TRA ĐẶT CHỖ TRƯỚC, y như đường quẹt thẻ RFID.
+      //
+      // Trước đây nhánh nhập tay gọi thẳng openEntrySession nên đặt chỗ đã xác
+      // nhận bị bỏ qua hoàn toàn: xe được mở một vé VÃNG LAI ở một ô khác, còn
+      // đơn đặt chỗ vẫn treo ở 'Confirmed' và vẫn giữ ô đã đặt. Kết quả là một
+      // chiếc xe sinh ra HAI dòng trong lịch sử và chiếm HAI ô đỗ.
+      const matched = await checkInIfReserved(plateVal, manualType, gate.id);
+      if (!matched) await openEntrySession(plateVal, manualType, gate.id);
+      addToast?.(
+        matched
+          ? `Đã check-in đặt chỗ ${matched.reservationCode} cho xe ${plateVal} — ô ${matched.slotCode || '—'}.`
+          : `Đã xác nhận cho xe ${plateVal} vào cổng.`,
+        'success',
+      );
+    } else if (await closeExitSession()) {
+      // Cũng như nhánh RFID: chỉ ghi nhật ký SAU khi vé đóng được thật.
+      onManualEntry(gate.id, plateVal, manualType, activeDirection);
       addToast?.(
         dueAmount != null
           ? `Đã thu ${formatCurrency(dueAmount)} & ghi nhận xe ${plateVal} ra cổng.`
           : `Đã ghi nhận xe ${plateVal} ra cổng.`,
         'success',
       );
+    } else {
+      if (!exitSession && !matchedRes) {
+        addToast?.(
+          `Xe ${plateVal} không có vé đang mở trong bãi — có thể đã ra rồi hoặc chưa từng vào. Không cho ra lần nữa.`,
+          'error',
+        );
+      }
+      return; // giữ nguyên màn hình để staff kiểm tra lại, không xóa trắng form
     }
     handleRefresh();
   };
 
   const handleRefresh = () => {
+    setAlreadyInside(null);
+    setMonthlyNeedsQr(null);
+    setWrongLotExit(null);
     setPlate('');
     setOcrStatus('idle');
     setOcrError('');
@@ -450,11 +652,23 @@ export default function GateControl({
     fetchActiveSessions()
       .then((list) => {
         if (cancelled) return;
-        setExitSession(list.find((s) => normPlate(s.licensePlate) === normPlate(exitPlate)) ?? null);
+        const hit = list.find((s) => normPlate(s.licensePlate) === normPlate(exitPlate));
+        // VÀO BÃI NÀO RA BÃI ĐÓ. fetchActiveSessions trả vé của TOÀN HỆ THỐNG,
+        // nên tra theo biển số thôi là nhân viên bãi B lôi được vé của bãi A ra.
+        //
+        // VẪN nạp vé để staff nhìn thấy xe này đang ở đâu, vé nào — giấu đi thì
+        // họ không hiểu vì sao không thao tác được. Nhưng đánh dấu `wrongLotExit`
+        // để KHOÁ nút "Thu tiền — Xác nhận & Mở cổng".
+        setExitSession(hit ?? null);
+        setWrongLotExit(
+          hit && hit.parkingLot && !sameLot(hit.parkingLot, currentUser?.assignedParkingLot)
+            ? { plate: hit.licensePlate, lot: hit.parkingLot, ticketCode: hit.ticketCode }
+            : null,
+        );
       })
       .catch(() => { if (!cancelled) setExitSession(null); });
     return () => { cancelled = true; };
-  }, [exitPlate]);
+  }, [exitPlate, currentUser?.assignedParkingLot]);
 
   // Xe ra + thẻ hợp lệ → nạp bản ghi quét lúc vào (ảnh + biển số) để đối soát.
   useEffect(() => {
@@ -538,32 +752,49 @@ export default function GateControl({
           uid,
           matchedBooking.licensePlate,
           manualVehicleOptions.find((o) => o.key === matchedBooking.vehicleType)?.label,
+          currentUser?.assignedParkingLot,
         );
         if (link.ok) {
           const relook = await fetchRfidInfo(uid);
           if (relook.ok === true) {
             finalLookup = relook;
             const gid = opts?.gateId || gate.id;
-            sendGateCommand(gid, 'open');
+            const dirNow = opts?.direction ?? activeDirection;
+
+            // CHỈ CHIỀU VÀO ĐƯỢC TỰ MỞ RÀO.
+            //
+            // Trước đây lệnh mở rào nằm ngoài mọi kiểm tra chiều, chỉ riêng
+            // check-in mới bọc trong `=== 'entry'`. Nên ở CỔNG RA, một thẻ chưa
+            // liên kết mà camera đọc ra biển trùng với đơn đặt chỗ đang mở là
+            // servo bật lên ngay lúc quẹt — xe ra khỏi bãi trước khi staff kịp
+            // thu tiền, và vé thì vẫn còn mở trong hệ thống.
+            //
+            // Rào cổng ra chỉ được mở ở đúng một chỗ: handleRfidConfirm(), sau
+            // khi closeExitSession() chốt phí và đóng vé thành công.
+            if (dirNow === 'entry') {
+              sendGateCommand(gid, 'open');
+            }
             onRfidVerified(
               gid,
-              opts?.direction ?? activeDirection,
+              dirNow,
               relook.data.vehicle.licensePlate,
               labelToVehicleKey(relook.data.vehicle.vehicleType),
               relook.data.owner.fullName || 'Chủ thẻ RFID',
               uid,
             );
-            if ((opts?.direction ?? activeDirection) === 'entry') {
+            if (dirNow === 'entry') {
               await checkInReservation(
                 matchedBooking,
                 relook.data.vehicle.licensePlate,
                 labelToVehicleKey(relook.data.vehicle.vehicleType),
                 gid,
               );
+              autoHandledEntry = true;
             }
-            autoHandledEntry = true;
             addToast?.(
-              `Thẻ đã tự liên kết với xe ${matchedBooking.licensePlate} (đặt chỗ ${matchedBooking.reservationCode}) — đã mở rào & check-in.`,
+              dirNow === 'entry'
+                ? `Thẻ đã tự liên kết với xe ${matchedBooking.licensePlate} (đặt chỗ ${matchedBooking.reservationCode}) — đã mở rào & check-in.`
+                : `Thẻ đã tự liên kết với xe ${matchedBooking.licensePlate} — CHƯA mở rào. Bấm "Thu tiền — Xác nhận & Mở cổng" để cho xe ra.`,
               'success',
             );
           }
@@ -582,18 +813,69 @@ export default function GateControl({
       // nhánh này xử lý thẻ ĐÃ liên kết sẵn).
       if (dir === 'entry' && !autoHandledEntry) {
         const gid = opts?.gateId || gate.id;
-        sendGateCommand(gid, 'open');
-        onRfidVerified(
-          gid,
-          dir,
-          finalLookup.data.vehicle.licensePlate,
-          labelToVehicleKey(finalLookup.data.vehicle.vehicleType),
-          finalLookup.data.owner.fullName || 'Chủ thẻ RFID',
-          uid,
-        );
-        const vKey = labelToVehicleKey(finalLookup.data.vehicle.vehicleType);
-        const matched = await checkInIfReserved(finalLookup.data.vehicle.licensePlate, vKey, gid);
-        if (!matched) openEntrySession(finalLookup.data.vehicle.licensePlate, vKey, gid);
+        const cardPlate = finalLookup.data.vehicle.licensePlate;
+
+        // XE ĐÃ Ở TRONG BÃI → dừng NGAY, trước khi mở rào và trước khi ghi
+        // nhật ký. Trước đây thứ tự ngược lại: rào mở + nhật ký ghi "GRANTED —
+        // xe vào", rồi openEntrySession mới phát hiện xe đã ở trong và từ chối.
+        // Hậu quả mỗi lần quẹt lại: rào mở cho một chiếc xe đang đỗ, và nhật ký
+        // ghi thêm một lượt vào không có thật.
+        const active = await fetchActiveSessions().catch(() => []);
+        const inside = active.find((s) => normPlate(s.licensePlate) === normPlate(cardPlate));
+        const monthly = findActiveMonthlyReservation(cardPlate, reservations);
+        if (inside) {
+          setAlreadyInside({
+            plate: cardPlate,
+            slotCode: inside.slotCode || '',
+            checkInTime: inside.checkInTime || '',
+            ticketCode: inside.ticketCode || '',
+          });
+          addToast?.(
+            `Xe ${cardPlate} đang ở trong bãi${inside.slotCode ? ` (ô ${inside.slotCode})` : ''} — không mở rào.`,
+            'error',
+          );
+        } else if (monthly) {
+          // Xe thẻ tháng phải vào bằng QR — không mở rào ở luồng RFID.
+          setMonthlyNeedsQr({
+            plate: cardPlate,
+            code: monthly.reservationCode,
+            slotCode: monthly.slotCode || '',
+            expiry: addOneMonth(monthly.date.split('T')[0]),
+          });
+          addToast?.(`Xe ${cardPlate} là XE THẺ THÁNG — hãy quét mã QR thẻ tháng, không mở rào bằng thẻ RFID.`, 'error');
+        } else if (!ocrPlate) {
+          // CHƯA ĐỌC ĐƯỢC BIỂN SỐ → chưa mở rào.
+          //
+          // Trước đây nhánh này tin hoàn toàn vào biển ghi trên thẻ: quẹt phát
+          // là mở cổng, camera đọc được hay không cũng mặc kệ. Thẻ đưa nhầm xe,
+          // hoặc thẻ gắn với biển cũ, đều lọt qua mà không ai đối soát được.
+          // Cổng RA đã bắt buộc có biển camera từ trước; cổng VÀO nay theo cùng
+          // quy tắc đó.
+          setAutoPipelineNote(
+            `Thẻ hợp lệ (${cardPlate}) — đang chờ camera đọc biển số để đối soát. Bấm "Chụp & OCR" nếu cần quét lại.`,
+          );
+          addToast?.(`Thẻ hợp lệ nhưng CHƯA đọc được biển số — chưa mở rào, hãy quét biển số.`, 'error');
+        } else if (normPlate(ocrPlate) !== normPlate(cardPlate)) {
+          // Camera đọc ra một biển KHÁC biển đã gắn với thẻ — không tự mở rào,
+          // để staff kiểm tra xem có phải thẻ bị đưa nhầm xe không.
+          setAutoPipelineNote(
+            `Biển camera đọc (${ocrPlate}) KHÁC biển đã gắn với thẻ (${cardPlate}) — chưa mở rào, kiểm tra lại xe.`,
+          );
+          addToast?.(`Biển số ${ocrPlate} khác biển đã gắn với thẻ (${cardPlate}) — chưa mở rào.`, 'error');
+        } else {
+          sendGateCommand(gid, 'open');
+          onRfidVerified(
+            gid,
+            dir,
+            cardPlate,
+            labelToVehicleKey(finalLookup.data.vehicle.vehicleType),
+            finalLookup.data.owner.fullName || 'Chủ thẻ RFID',
+            uid,
+          );
+          const vKey = labelToVehicleKey(finalLookup.data.vehicle.vehicleType);
+          const matched = await checkInIfReserved(cardPlate, vKey, gid);
+          if (!matched) openEntrySession(cardPlate, vKey, gid);
+        }
       }
     } else {
       setRfidError(finalLookup.error);
@@ -601,6 +883,50 @@ export default function GateControl({
       // Biển số OCR được thì điền sẵn vào ô "Liên kết biển số" — staff chỉ
       // cần liếc xác nhận rồi bấm Liên kết, khỏi gõ tay.
       if (ocrPlate) setLinkPlate(ocrPlate);
+
+      // XE CHƯA LIÊN KẾT TÀI KHOẢN vẫn được vào bãi diện KHÁCH VÃNG LAI, miễn
+      // camera đọc được biển số hợp lệ. Trước đây nhánh này chỉ điền sẵn ô
+      // "Liên kết biển số" rồi dừng: rào không mở, không mở vé, nên xe lạ bắt
+      // buộc phải gắn thẻ vào một tài khoản mới qua cổng được.
+      const dir = opts?.direction ?? activeDirection;
+
+      // THẺ TRẮNG NHƯNG BIỂN SỐ LÀ XE THÁNG — đây chính là tình huống báo lỗi:
+      // camera đọc ra biển của khách tháng, thẻ thì chưa liên kết, nên luồng bên
+      // dưới coi là khách vãng lai, mở rào và mở vé theo lượt. Chặn trước.
+      const monthlyByOcr = ocrPlate ? findActiveMonthlyReservation(ocrPlate, reservations) : undefined;
+      // XE THÁNG THÌ CẢ HAI CHIỀU đều phải đi bằng QR.
+      //
+      // Trước đây nhánh này còn kèm `dir === 'entry'`, nên ở CỔNG RA màn hình
+      // rơi thẳng xuống ô "Thẻ chưa được liên kết với phương tiện nào" và mời
+      // nhân viên gắn thẻ RFID cho chính chiếc xe tháng — đúng thứ không được
+      // phép làm. Gắn được thì lượt sau xe tháng vào bãi diện vãng lai và mất ô
+      // riêng; không gắn được thì nhân viên vẫn phải mò mới biết vì sao.
+      if (monthlyByOcr) {
+        setMonthlyNeedsQr({
+          plate: ocrPlate,
+          code: monthlyByOcr.reservationCode,
+          slotCode: monthlyByOcr.slotCode || '',
+          expiry: addOneMonth(monthlyByOcr.date.split('T')[0]),
+        });
+        addToast?.(
+          dir === 'entry'
+            ? `Xe ${ocrPlate} là XE THẺ THÁNG — hãy quét mã QR thẻ tháng, không mở rào bằng thẻ RFID.`
+            : `Xe ${ocrPlate} là XE THẺ THÁNG — hãy quét mã QR thẻ tháng để cho ra, không dùng thẻ RFID.`,
+          'error',
+        );
+      } else if (dir === 'entry' && ocrPlate && !validateLicensePlate(ocrPlate)) {
+        const gid = opts?.gateId || gate.id;
+
+        // CHƯA mở rào. Rào chỉ mở SAU KHI staff chọn loại xe (finishWalkIn).
+        //
+        // Loại xe quyết định cỡ ô đỗ và bảng giá, nên phải chốt trước khi cho xe
+        // vào — mở rào rồi mới hỏi thì xe đã lăn bánh vào bãi mà hệ thống chưa
+        // biết xếp nó vào đâu và thu bao nhiêu.
+        setAutoPipelineNote(`Khách vãng lai ${ocrPlate} — chọn loại xe để mở rào & mở vé.`);
+        setWalkIn({ plate: ocrPlate, uid, gateId: gid });
+        setWalkInSeconds(WALKIN_FALLBACK_SECONDS);
+        addToast?.(`Khách vãng lai ${ocrPlate} — hãy chọn loại xe để mở rào.`, 'info');
+      }
     }
 
     const matchedVehicleId = finalLookup.ok === true ? finalLookup.data.vehicle.id : '';
@@ -647,8 +973,27 @@ export default function GateControl({
 
   // Nút "Xác nhận & Mở cổng" chỉ còn render cho chiều RA (chiều vào đã tự động
   // hoàn toàn ở runRfidPipeline — xem "CỔNG VÀO TỰ ĐỘNG" phía trên).
-  const handleRfidConfirm = () => {
+  const handleRfidConfirm = async () => {
     if (!rfidInfo) return;
+    // Xe ra: chốt phí, đóng vé/hoàn tất đặt chỗ, trả ô đỗ, trả thẻ về trạng
+    // thái trắng — và đẩy lệnh mở rào xuống ESP32 thật (rào cổng ra chỉ mở
+    // SAU khi staff xác nhận thu tiền).
+    //
+    // ĐÓNG VÉ TRƯỚC, ghi nhật ký sau. Trước đây onRfidVerified() chạy ngay dòng
+    // đầu nên nhật ký ghi "RA — Thành công" bất kể vé có đóng được hay không;
+    // xe bị server từ chối vẫn để lại một dòng ra thành công giả trong sổ.
+    const closed = await closeExitSession(rfidInfo.rfidUid);
+    if (!closed) {
+      // Vé không đóng được: sai bãi, đã ra rồi, hoặc không có vé đang mở.
+      // KHÔNG mở rào và KHÔNG ghi nhật ký — closeExitSession đã báo lý do.
+      if (!exitSession && !matchedRes) {
+        addToast?.(
+          `Xe ${rfidInfo.vehicle.licensePlate} không có vé đang mở trong bãi — có thể đã ra rồi. Không mở cổng.`,
+          'error',
+        );
+      }
+      return;
+    }
     onRfidVerified(
       gate.id,
       'exit',
@@ -658,10 +1003,6 @@ export default function GateControl({
       rfidInfo.rfidUid,
       dueAmount,
     );
-    // Xe ra: chốt phí, đóng vé/hoàn tất đặt chỗ, trả ô đỗ, trả thẻ về trạng
-    // thái trắng — và đẩy lệnh mở rào xuống ESP32 thật (rào cổng ra chỉ mở
-    // SAU khi staff xác nhận thu tiền).
-    closeExitSession(rfidInfo.rfidUid);
     sendGateCommand(gate.id, 'open');
     addToast?.(
       dueAmount != null
@@ -682,6 +1023,7 @@ export default function GateControl({
       uid,
       linkPlate.trim().toUpperCase(),
       manualVehicleOptions.find((o) => o.key === manualType)?.label,
+      currentUser?.assignedParkingLot,
     );
     setLinking(false);
     if (result.ok) {
@@ -800,6 +1142,13 @@ export default function GateControl({
     const { res } = qrResult;
     if (activeDirection === 'entry') {
       await checkInReservation(res, res.licensePlate, res.vehicleType, gate.id);
+      // Ô của thẻ tháng nằm ở trạng thái 'Locked' giữa hai lần vào (giữ riêng
+      // cho khách suốt tháng). openEntrySession chỉ đánh dấu Occupied khi nó
+      // thật sự mở được vé mới; nếu vé đã có sẵn thì ô kẹt ở 'Locked' và sơ đồ
+      // không hiện xe, dù danh sách "Xe đang đỗ trong bãi" vẫn có. Ghi lại một
+      // lần nữa ở đây cho chắc — updateSlotStatus là thao tác không đổi kết quả
+      // khi lặp lại.
+      if (res.slotCode) updateSlotStatus(res.slotCode, 'Occupied').catch(() => {});
     } else {
       // Xe tháng ra: đóng phiên gửi xe đang hoạt động (nếu có) + hoàn tất đặt
       // chỗ — không thu thêm phí (đã bao trong gói tháng). Ô đỗ trả về
@@ -818,7 +1167,15 @@ export default function GateControl({
             paymentStatus: 'Paid',
             checkOutTime: localNowStr(),
           }).catch(() => {});
-          if (activeSession.slotCode) updateSlotStatus(activeSession.slotCode, 'Locked').catch(() => {});
+          // CHỈ ô đăng ký trên thẻ mới được giữ 'Locked'. Xe tháng vào bãi lúc
+          // ô riêng đang bận (hoặc vào diện vãng lai) sẽ mượn một ô khác — ô
+          // mượn đó phải trả lại cho bãi, không được đánh dấu "Xe tháng".
+          if (activeSession.slotCode) {
+            updateSlotStatus(
+              activeSession.slotCode,
+              activeSession.slotCode === res.slotCode ? 'Locked' : 'Available',
+            ).catch(() => {});
+          }
         }
         if (res.status === 'Checked-in') {
           await updateReservation(res.id, { status: 'Completed', staffId: currentUser?.id }).catch(() => {});
@@ -851,11 +1208,6 @@ export default function GateControl({
     );
   };
 
-  const handleAlarm = () => {
-    onAlarm?.(`BÁO ĐỘNG thủ công tại ${gate.name} (${activeDirection === 'entry' ? 'cổng vào' : 'cổng ra'})${plate ? ` — biển số liên quan: ${plate}` : ''}.`);
-    addToast?.('Đã kích hoạt báo động — thông tin đã gửi tới quản lý & an ninh.', 'error');
-  };
-
   // ── Thông tin lượt gửi cho thẻ "Biển số nhận diện" ─────────────────────────
   // Xe RA: tra lượt gửi Checked-in theo biển số → giờ vào, tổng thời gian và
   // tổng tiền (giá vé gói, cộng phụ phí quá giờ, trừ phần đã thanh toán).
@@ -864,6 +1216,42 @@ export default function GateControl({
     if (!p) return undefined;
     return reservations.find((r) => r.status === 'Checked-in' && normPlate(r.licensePlate) === p);
   }, [reservations, plate]);
+
+  /**
+   * Xe RA mang biển khác biển đã đăng ký cho thẻ.
+   *
+   * Thẻ có thể bị đưa nhầm sang xe khác, hoặc khách đổi xe mà quên báo. Dù lý
+   * do gì, hiển thị biển đăng ký như thể mọi thứ bình thường là sai — staff cần
+   * thấy biển THẬT của chiếc xe đang đứng trước rào.
+   */
+  /**
+   * Loại khách của một lượt quét, suy từ dữ liệu đặt chỗ thật.
+   *
+   * Không dùng `scan.recognition` do đầu đọc gắn: nhãn đó được quyết định theo
+   * từng lượt quét riêng lẻ nên cùng một xe tháng có thể lúc ra 'subscriber',
+   * lúc ra 'casual' — hàng đợi khi đó hiện xe vừa là Khách tháng vừa là Khách
+   * vãng lai. Thẻ tháng còn hiệu lực thì LUÔN là khách tháng.
+   */
+  const scanRecognitionOf = (scan: ScanEvent): RecognitionResult => {
+    if (!scan.licensePlate) return 'unknown';
+    if (findActiveMonthlyReservation(scan.licensePlate, reservations)) return 'subscriber';
+    return scan.recognition === 'unknown' ? 'unknown' : 'casual';
+  };
+
+  /** Cổng VÀO: biển camera đọc khác biển đã gắn với thẻ → chưa được mở rào. */
+  const plateMismatchEntry =
+    activeDirection === 'entry' &&
+    !!plate &&
+    rfidStatus === 'found' &&
+    !!rfidInfo &&
+    normPlate(plate) !== normPlate(rfidInfo.vehicle.licensePlate);
+
+  const plateMismatch =
+    activeDirection === 'exit' &&
+    !!plate &&
+    rfidStatus === 'found' &&
+    !!rfidInfo &&
+    normPlate(plate) !== normPlate(rfidInfo.vehicle.licensePlate);
 
   const feeInfo = useMemo(() => {
     if (!matchedRes) return null;
@@ -898,6 +1286,58 @@ export default function GateControl({
   // giá đã chốt lúc đặt + phụ phí qua đêm nếu có) hơn exitFee (xe vãng lai,
   // phí theo lượt cố định + qua đêm) — 2 nguồn khác công thức nên không trộn lẫn.
   const dueAmount = feeInfo ? feeInfo.due : exitFee ? exitFee.due : undefined;
+
+  /**
+   * Vé đang hiển thị ở cổng ra có thuộc bãi khác không.
+   *
+   * Suy TRỰC TIẾP từ `exitSession` đang render, không đọc cờ `wrongLotExit`.
+   * Cờ đó được đặt trong một effect bất đồng bộ nên có khoảng ngắn giữa lúc OCR
+   * điền biển số và lúc fetch trả về — trong khoảnh khắc đó nút vẫn xanh và bấm
+   * được. Tính tại chỗ từ chính vé đang hiện thì hai thứ không thể lệch nhau:
+   * đã thấy vé là đã biết vé thuộc bãi nào.
+   */
+  const exitLotMismatch =
+    !!exitSession?.parkingLot &&
+    !sameLot(exitSession.parkingLot, currentUser?.assignedParkingLot);
+
+  /** Biển đang hiển thị có phải xe thẻ tháng còn hạn không — nguồn duy nhất
+   *  cho cả băng cảnh báo lẫn khoá nút thu tiền. */
+  const monthlyForPlate = useMemo(
+    () => (plate.trim() ? findActiveMonthlyReservation(plate.trim(), reservations) : undefined),
+    [plate, reservations],
+  );
+
+  /**
+   * LÝ DO KHÔNG ĐƯỢC THU TIỀN & MỞ CỔNG — null nghĩa là hợp lệ, cho bấm.
+   *
+   * Gom MỌI trường hợp không hợp lệ về một chỗ để nút chỉ có đúng hai trạng
+   * thái: xanh (bấm được) hoặc xám (không bấm được). Tất cả đều tính ngay tại
+   * lúc render từ dữ liệu đang hiển thị — không đợi staff bấm rồi mới báo lỗi,
+   * vì với thu tiền mặt thì bấm xong là đã nhận tiền của khách.
+   */
+  const exitBlockReason: string | null = (() => {
+    // XE THÁNG KHÔNG RA BẰNG ĐƯỜNG NÀY. Thu tiền ở đây là thu sai (phí đã bao
+    // trong gói tháng) và closeExitSession sẽ trả ô riêng về cho bãi. Đường
+    // đúng là quét QR thẻ tháng — handleQrConfirm giữ nguyên ô và không thu phí.
+    //
+    // Tính LẠI từ biển số đang hiển thị, KHÔNG dựa vào state `monthlyNeedsQr`:
+    // băng cảnh báo có nút "Đóng", mà bấm Đóng thì không được biến chiếc xe
+    // tháng thành xe thu tiền được. Khoá phải bám vào dữ liệu, không bám vào
+    // việc nhân viên đã tắt thông báo hay chưa.
+    if (monthlyForPlate) {
+      return `Xe ${plate.trim()} là XE THẺ THÁNG (${monthlyForPlate.reservationCode}) — phải cho ra bằng mã QR thẻ tháng, không thu tiền và không dùng thẻ RFID.`;
+    }
+    if (exitLotMismatch) {
+      return `Sai bãi đỗ — xe đang đỗ ở ${exitSession?.parkingLot} (vé ${exitSession?.ticketCode}). Phải cho ra tại chính bãi đó.`;
+    }
+    if (plateMismatch) {
+      return `Thẻ khác biển ban đầu — camera đọc ${plate}, thẻ đăng ký cho ${rfidInfo?.vehicle.licensePlate}. Kiểm tra lại xe trước khi cho ra.`;
+    }
+    if (!exitSession && !matchedRes) {
+      return 'Không có vé đang mở cho biển số này — xe có thể đã ra rồi hoặc chưa từng vào bãi.';
+    }
+    return null;
+  })();
 
   /** Ghi nhận hóa đơn ĐÃ THANH TOÁN cho đúng chủ xe — chỉ khi biết được chủ xe
    *  thật (qua thẻ đã liên kết hoặc đặt chỗ, không phải khách vãng lai không
@@ -941,25 +1381,87 @@ export default function GateControl({
    *  hoàn tất đặt chỗ đó (Completed, kèm staffId để backend kiểm tra đúng bãi)
    *  — driver nhận thông báo xe đã check-out VÀ hóa đơn "Đã thanh toán" ngay
    *  trong "Thanh toán" của họ. */
-  const closeExitSession = (unlinkUid?: string) => {
+  /**
+   * Cho xe ra. Trả về false nếu KHÔNG có gì để đóng — tức xe này không ở trong
+   * bãi (chưa từng vào, hoặc đã ra rồi).
+   *
+   * Trước đây hàm này im lặng không làm gì trong trường hợp đó nhưng nơi gọi
+   * vẫn báo "Đã ghi nhận xe ra cổng" — staff tưởng đã cho ra, còn hệ thống thì
+   * không ghi gì. Xe ra hai lần cũng không ai biết.
+   */
+  const closeExitSession = async (unlinkUid?: string): Promise<boolean> => {
     const ticketCode = exitSession?.ticketCode || matchedRes?.reservationCode;
     const driverUserId = matchedRes?.userId || (rfidStatus === 'found' ? rfidInfo?.owner.id : undefined);
     const licensePlateForPayment = exitSession?.licensePlate || matchedRes?.licensePlate || plate;
 
+    if (!exitSession && !matchedRes) return false;
+
+    /**
+     * XE THÁNG ra bãi KHÔNG được xử lý như khách vãng lai.
+     *
+     * Thẻ tháng còn hiệu lực nghĩa là ô đỗ vẫn thuộc về khách suốt tháng: xe về
+     * nhà buổi tối rồi sáng mai quay lại, ô đó không ai được đặt vào. Trước đây
+     * nhánh này trả ô về 'Available' và GỠ LUÔN liên kết thẻ RFID — sau lần ra
+     * đầu tiên là khách mất trắng cả ô lẫn thẻ, đúng như báo lỗi "đăng ký xe
+     * theo tháng khi ra bị mất luôn ô đăng ký tháng".
+     *
+     * Đường quét QR thẻ tháng (handleQrConfirm) đã làm đúng từ trước; nhánh
+     * RFID này chỉ là chưa được đồng bộ theo.
+     */
+    const monthlyCard = findActiveMonthlyReservation(
+      exitSession?.licensePlate || matchedRes?.licensePlate || plate,
+      reservations,
+    );
+    /**
+     * Chỉ giữ 'Locked' cho ĐÚNG Ô ĐÃ ĐĂNG KÝ trên thẻ tháng.
+     *
+     * Trước đây điều kiện chỉ là "chủ xe có thẻ tháng không", nên bất kỳ ô nào
+     * chiếc xe đó đang đỗ cũng bị khoá lại khi ra. Khách tháng vào bãi diện
+     * vãng lai (mượn tạm một ô khác) là ô mượn đó bị đánh dấu "Xe tháng" vĩnh
+     * viễn — chính là ô LP-F1-B01 đang kẹt: không đặt chỗ nào trỏ tới nó, chỉ
+     * toàn vé đã đóng, mà vẫn hiện màu thẻ tháng.
+     *
+     * Ô đăng ký thì giữ; ô đi mượn thì trả lại cho bãi.
+     */
+    const releasedStatusFor = (slotCode?: string) =>
+      monthlyCard && slotCode && slotCode === monthlyCard.slotCode ? 'Locked' : 'Available';
+
     if (exitSession) {
-      updateSession(exitSession.id, {
-        sessionStatus: 'Completed',
-        paymentStatus: 'Paid',
-        checkOutTime: localNowStr(),
-        estimatedFee: dueAmount ?? exitSession.estimatedFee,
-      }).catch(() => {});
-      if (exitSession.slotCode) updateSlotStatus(exitSession.slotCode, 'Available').catch(() => {});
+      // CHỜ server trả lời rồi mới coi là đã cho ra.
+      //
+      // Trước đây lệnh này chạy "bắn rồi quên": hàm trả về true ngay, nên dù
+      // server từ chối (403 sai bãi / 409 đã ra rồi) thì cổng vẫn mở và nhật ký
+      // vẫn ghi "Thành công". Đúng hiện tượng đang gặp: xe đỗ ở bãi Nhà Văn Hóa
+      // mà quẹt ra được ở Long Phước.
+      try {
+        await updateSession(exitSession.id, {
+          sessionStatus: 'Completed',
+          paymentStatus: 'Paid',
+          checkOutTime: localNowStr(),
+          estimatedFee: dueAmount ?? exitSession.estimatedFee,
+          // Kèm staffId để backend chặn cho xe ra ở bãi khác với bãi đã vào.
+          staffId: currentUser?.id,
+        });
+      } catch (e) {
+        const err = e as Error & { code?: string; session?: { parkingLot?: string; ticketCode?: string } };
+        if (err?.code === 'WRONG_LOT_EXIT') {
+          setWrongLotExit({
+            plate: exitSession.licensePlate,
+            lot: err.session?.parkingLot || exitSession.parkingLot || '—',
+            ticketCode: err.session?.ticketCode || exitSession.ticketCode,
+          });
+        }
+        addToast?.(err?.message || 'Không thể đóng vé — vui lòng thử lại.', 'error');
+        // KHÔNG trả ô, KHÔNG gỡ thẻ, KHÔNG ghi hóa đơn: server đã từ chối.
+        return false;
+      }
+      if (exitSession.slotCode) updateSlotStatus(exitSession.slotCode, releasedStatusFor(exitSession.slotCode)).catch(() => {});
       setExitSession(null);
     }
     if (matchedRes) {
       updateReservation(matchedRes.id, { status: 'Completed', staffId: currentUser?.id }).catch(() => {});
       if (matchedRes.slotCode && matchedRes.slotCode !== exitSession?.slotCode) {
-        updateSlotStatus(matchedRes.slotCode, 'Available').catch(() => {});
+        updateSlotStatus(matchedRes.slotCode, releasedStatusFor(matchedRes.slotCode)).catch(() => {});
       }
     }
     // dueAmount > 0: có tiền THỰC THU tại cổng mới cần ghi hóa đơn mới — xe đã
@@ -967,7 +1469,30 @@ export default function GateControl({
     if (driverUserId && driverUserId.toUpperCase() !== 'GUEST' && ticketCode && dueAmount != null && dueAmount > 0) {
       recordExitPayment(driverUserId, ticketCode, matchedRes?.reservationCode, licensePlateForPayment, dueAmount);
     }
-    if (unlinkUid) unlinkRfidCard(unlinkUid);
+    // Thẻ tháng phải GIỮ liên kết với xe suốt thời hạn — gỡ thẻ chỉ đúng với
+    // thẻ mượn phát cho khách vãng lai ở cổng, thu lại khi xe ra.
+    if (unlinkUid && !monthlyCard) unlinkRfidCard(unlinkUid);
+
+    // XE ĐÃ RA → DỌN ẢNH ĐÃ LƯU TRÊN THẺ.
+    //
+    // Ảnh biển số chụp ở cổng chỉ phục vụ việc đối soát người–xe trong lúc xe
+    // còn trong bãi. Xe ra rồi thì chúng chỉ còn là dữ liệu tồn: mỗi khung
+    // base64 nặng vài trăm KB nằm thẳng trong rfid_scans.image_data, và thẻ
+    // mượn quay vòng liên tục nên đống ảnh cũ cứ dồn lại mãi.
+    //
+    // Kèm biển số để chỉ xóa ảnh CỦA ĐÚNG XE VỪA RA — cùng một thẻ mượn có thể
+    // đã phục vụ xe khác đang còn trong bãi, ảnh của xe đó phải giữ nguyên.
+    // Chạy nền: xóa ảnh hỏng cũng không được cản việc mở rào cho xe ra.
+    if (unlinkUid) {
+      clearRfidScanImages(unlinkUid, licensePlateForPayment).catch(() => 0);
+    }
+    if (monthlyCard) {
+      addToast?.(
+        `Xe tháng ${monthlyCard.licensePlate} ra bãi — giữ nguyên thẻ và ô ${monthlyCard.slotCode || '—'} tới hết hạn ${addOneMonth(monthlyCard.date.split('T')[0])}.`,
+        'info',
+      );
+    }
+    return true;
   };
 
   const confidencePct =
@@ -975,6 +1500,146 @@ export default function GateControl({
 
   return (
     <div className="space-y-6">
+
+      {/* KHÁCH VÃNG LAI — nhập thủ công loại xe. Rào đã mở, chỉ chờ chốt vé. */}
+      {walkIn && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <span className="mt-0.5 rounded-xl bg-amber-100 p-2 text-amber-600">
+                <AlertCircle className="h-5 w-5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-lg font-bold text-slate-800">Khách vãng lai — chọn loại xe để mở rào</h3>
+                <p className="mt-1 text-sm text-slate-500">
+                  Thẻ chưa liên kết, biển số đọc được là{' '}
+                  <span className="font-bold text-slate-800">{walkIn.plate}</span>.{' '}
+                  <strong className="text-amber-700">Rào chưa mở</strong> — camera không nhận ra được loại xe.
+                  Chọn loại xe để xếp đúng cỡ ô đỗ, tính đúng bảng giá, rồi rào mới mở.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 grid gap-2 sm:grid-cols-3">
+              {manualVehicleOptions.map((opt) => (
+                <button
+                  key={opt.key}
+                  disabled={walkInBusy}
+                  onClick={() => { setManualType(opt.key); void finishWalkIn(opt.key); }}
+                  className="rounded-xl border-2 border-slate-200 px-4 py-4 text-sm font-bold text-slate-700 transition hover:border-blue-500 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50"
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-3 border-t border-slate-100 pt-4">
+              <p className="text-xs text-slate-400">
+                {walkInBusy
+                  ? 'Đang gắn thẻ, mở vé & mở rào...'
+                  : `Không chọn thì sau ${walkInSeconds}s sẽ tự chốt & mở rào theo "${manualVehicleOptions.find((o) => o.key === manualType)?.label}".`}
+              </p>
+              <button
+                disabled={walkInBusy}
+                onClick={() => void finishWalkIn(manualType)}
+                className="shrink-0 rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-200 disabled:opacity-50"
+              >
+                Dùng loại đang chọn
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* XE ĐÃ Ở TRONG BÃI — chặn vào lần hai, báo rõ đến khi staff tự đóng. */}
+      {alreadyInside && (
+        <div className="flex flex-wrap items-start gap-3 rounded-2xl border-2 border-rose-300 bg-rose-50 px-5 py-4 text-rose-800">
+          <AlertCircle className="mt-0.5 h-6 w-6 shrink-0 text-rose-600" />
+          <div className="min-w-0 flex-1">
+            <p className="text-base font-bold">
+              Xe {alreadyInside.plate} đã có trong bãi — không cho vào lần nữa.
+            </p>
+            <p className="mt-1 text-sm leading-relaxed text-rose-700">
+              {alreadyInside.slotCode ? <>Đang đỗ tại ô <strong className="font-mono">{alreadyInside.slotCode}</strong>. </> : null}
+              {alreadyInside.checkInTime ? <>Vào lúc <strong>{alreadyInside.checkInTime}</strong>. </> : null}
+              {alreadyInside.ticketCode ? <>Vé <strong className="font-mono">{alreadyInside.ticketCode}</strong>. </> : null}
+              Xe phải ra khỏi bãi trước khi vào lại.
+            </p>
+          </div>
+          <button
+            onClick={() => setAlreadyInside(null)}
+            className="shrink-0 rounded-xl border border-rose-300 bg-white px-4 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100"
+          >
+            Đã hiểu
+          </button>
+        </div>
+      )}
+
+      {/* VÀO BÃI NÀO RA BÃI ĐÓ — vé thuộc bãi khác thì không cho ra ở đây. */}
+      {wrongLotExit && (
+        <div className="flex flex-wrap items-start gap-3 rounded-2xl border-2 border-rose-300 bg-rose-50 px-5 py-4 text-rose-900">
+          <AlertCircle className="mt-0.5 h-6 w-6 shrink-0 text-rose-600" />
+          <div className="min-w-0 flex-1">
+            <p className="text-base font-bold">
+              Xe {wrongLotExit.plate} không vào ở bãi này — không cho ra tại đây.
+            </p>
+            <p className="mt-1 text-sm leading-relaxed text-rose-700">
+              Xe đã vào tại <strong>{wrongLotExit.lot}</strong> (vé{' '}
+              <strong className="font-mono">{wrongLotExit.ticketCode}</strong>). Xe phải ra đúng bãi đã vào —
+              cho ra ở bãi khác sẽ nhả oan ô đỗ bên đó và tính sai tiền.
+            </p>
+          </div>
+          <button
+            onClick={() => setWrongLotExit(null)}
+            className="shrink-0 rounded-xl border border-rose-300 bg-white px-4 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100"
+          >
+            Đã hiểu
+          </button>
+        </div>
+      )}
+
+      {/* XE THẺ THÁNG — phải đi bằng QR ở CẢ HAI CHIỀU, không dùng thẻ RFID. */}
+      {monthlyNeedsQr && (
+        <div className="flex flex-wrap items-start gap-3 rounded-2xl border-2 border-pink-300 bg-pink-50 px-5 py-4 text-pink-900">
+          <CalendarCheck className="mt-0.5 h-6 w-6 shrink-0 text-pink-600" />
+          <div className="min-w-0 flex-1">
+            <p className="text-base font-bold">
+              Xe {monthlyNeedsQr.plate} là XE THẺ THÁNG — chưa mở rào.
+            </p>
+            <p className="mt-1 text-sm leading-relaxed text-pink-800">
+              Thẻ <strong className="font-mono">{monthlyNeedsQr.code}</strong>
+              {monthlyNeedsQr.slotCode ? <>, ô riêng <strong className="font-mono">{monthlyNeedsQr.slotCode}</strong></> : null}
+              , hạn đến <strong>{monthlyNeedsQr.expiry}</strong>.{' '}
+              {activeDirection === 'entry' ? (
+                <>
+                  Xe tháng phải vào bằng <strong>mã QR thẻ tháng</strong> để giữ đúng ô đã đăng ký và kiểm tra hạn thẻ —
+                  vào bằng thẻ RFID sẽ bị tính như khách vãng lai và xếp nhầm ô.
+                </>
+              ) : (
+                <>
+                  Xe tháng phải ra bằng <strong>mã QR thẻ tháng</strong> — phí đã bao trong gói tháng và ô riêng phải
+                  được giữ lại tới hết hạn. Cho ra bằng thẻ RFID sẽ thu tiền như khách vãng lai và trả ô về cho bãi.
+                  <strong> Không gắn thẻ RFID cho xe này.</strong>
+                </>
+              )}
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <button
+              onClick={() => { setMonthlyNeedsQr(null); void startQrScan(); }}
+              className="rounded-xl bg-pink-600 px-4 py-2 text-xs font-bold text-white hover:bg-pink-700"
+            >
+              Quét QR thẻ tháng
+            </button>
+            <button
+              onClick={() => setMonthlyNeedsQr(null)}
+              className="rounded-xl border border-pink-300 bg-white px-4 py-2 text-xs font-bold text-pink-700 hover:bg-pink-100"
+            >
+              Đóng
+            </button>
+          </div>
+        </div>
+      )}
 
       {isUnderMaintenance && (
         <div className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] text-amber-800">
@@ -1144,8 +1809,11 @@ export default function GateControl({
               </div>
               <button
                 onClick={handleManualSubmit}
-                disabled={!plate.trim()}
-                className="flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 transition disabled:opacity-40"
+                // Sai bãi thì khoá luôn đường nhập tay — nếu không, chặn ở nút
+                // RFID xong staff vẫn cho ra được bằng cách gõ biển số.
+                disabled={!plate.trim() || (activeDirection === 'exit' && !!exitBlockReason)}
+                title={activeDirection === 'exit' ? exitBlockReason ?? undefined : undefined}
+                className="flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 transition disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Check className="h-4 w-4" />
                 {activeDirection === 'entry' ? 'Xác nhận vào cổng' : 'Xác nhận ra cổng'}
@@ -1367,16 +2035,32 @@ export default function GateControl({
 
             {/* RFID owner info */}
             {rfidStatus === 'found' && rfidInfo && (
-              <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 p-3 space-y-2">
-                <div className="flex items-center gap-2 text-emerald-700">
-                  <UserCheck className="h-4 w-4" />
-                  <span className="text-xs font-bold uppercase tracking-wide">Thẻ RFID hợp lệ</span>
+              <div className={`mt-3 rounded-xl border p-3 space-y-2 ${plateMismatch ? 'border-amber-300 bg-amber-50/70' : 'border-emerald-200 bg-emerald-50/60'}`}>
+                {/* Biển camera đọc được khác biển đã đăng ký cho thẻ → KHÔNG được
+                    báo "hợp lệ", vì thẻ đang đi cùng một chiếc xe khác. */}
+                <div className={`flex items-center gap-2 ${plateMismatch ? 'text-amber-700' : 'text-emerald-700'}`}>
+                  {plateMismatch ? <AlertCircle className="h-4 w-4 shrink-0" /> : <UserCheck className="h-4 w-4 shrink-0" />}
+                  <span className="text-xs font-bold uppercase tracking-wide">
+                    {plateMismatch ? 'Thẻ khác biển ban đầu' : 'Thẻ RFID hợp lệ'}
+                  </span>
                 </div>
-                <p className="text-xs text-slate-600">
-                  <span className="font-mono font-bold text-slate-800">{rfidInfo.vehicle.licensePlate}</span>
-                  {' · '}{rfidInfo.vehicle.vehicleType}
-                  <span className="block">{rfidInfo.owner.fullName || '—'} · {rfidInfo.owner.phone || '—'}</span>
-                </p>
+                <div className="space-y-0.5 text-xs text-slate-600">
+                  {/* Ưu tiên biển THẬT camera vừa đọc; biển đăng ký lùi xuống dòng
+                      phụ. Trước đây chỉ hiện biển đăng ký nên xe ra mang biển khác
+                      vẫn hiển thị biển cũ, staff không có cách nào nhận ra. */}
+                  <p className="break-words">
+                    <span className="font-mono text-sm font-bold text-slate-800">
+                      {plateMismatch ? plate : rfidInfo.vehicle.licensePlate}
+                    </span>
+                    <span className="ml-1.5">· {rfidInfo.vehicle.vehicleType}</span>
+                  </p>
+                  {plateMismatch && (
+                    <p className="break-words text-[11px] font-semibold text-amber-700">
+                      Biển đăng ký cho thẻ: <span className="font-mono">{rfidInfo.vehicle.licensePlate}</span>
+                    </p>
+                  )}
+                  <p className="break-words">{rfidInfo.owner.fullName || '—'} · {rfidInfo.owner.phone || '—'}</p>
+                </div>
 
                 {/* Xe khớp đặt chỗ trước → không phải khách vãng lai, staff cần thấy rõ */}
                 {activeDirection === 'entry' && matchedReservation && (
@@ -1440,16 +2124,56 @@ export default function GateControl({
                 )}
 
                 {activeDirection === 'exit' ? (
-                  // Chỉ cho xác nhận khi đã có biển số từ camera để đối soát
+                  // Chỉ cho xác nhận khi đã có biển số từ camera để đối soát.
                   plate ? (
-                    <button
-                      onClick={handleRfidConfirm}
-                      className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-emerald-600 py-2 text-xs font-bold text-white hover:bg-emerald-700 transition"
-                    >
-                      <Check className="h-3.5 w-3.5" />
-                      {dueAmount != null ? `Thu ${formatCurrency(dueAmount)} — Xác nhận & Mở cổng` : 'Xác nhận & Mở cổng'}
-                    </button>
+                    // SAI BÃI → nút chuyển XÁM và không bấm được. Giữ nút ở
+                    // nguyên chỗ (thay vì ẩn đi) để staff thấy rõ đúng thao tác
+                    // nào đang bị khoá; để bấm được rồi mới báo lỗi là quá muộn
+                    // vì tiền mặt đã thu của khách trước khi server từ chối.
+                    <div className="space-y-1.5">
+                      {exitBlockReason && (
+                        <p className="flex items-start gap-1.5 rounded-lg border border-rose-200 bg-rose-50 p-2 text-[11px] font-semibold leading-relaxed text-rose-700">
+                          <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                          <span>{exitBlockReason}</span>
+                        </p>
+                      )}
+                      <button
+                        onClick={handleRfidConfirm}
+                        disabled={!!exitBlockReason}
+                        title={exitBlockReason ?? undefined}
+                        className={`flex w-full items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-bold transition ${
+                          exitBlockReason
+                            ? 'cursor-not-allowed bg-slate-200 text-slate-400'
+                            : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                        }`}
+                      >
+                        {exitBlockReason ? <Lock className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
+                        {dueAmount != null ? `Thu ${formatCurrency(dueAmount)} — Xác nhận & Mở cổng` : 'Xác nhận & Mở cổng'}
+                      </button>
+                    </div>
                   ) : null
+                ) : monthlyNeedsQr || alreadyInside ? (
+                  // KHÔNG được báo "đã mở cổng" khi lượt vào vừa bị chặn.
+                  // Trước đây dòng này hiện vô điều kiện ở cổng vào, nên màn hình
+                  // tự mâu thuẫn: băng trên báo "chưa mở rào", bảng dưới lại báo
+                  // "đã tự động mở cổng — xe vào bãi".
+                  <p className="flex items-center justify-center gap-1.5 rounded-xl bg-rose-600/10 py-2 text-xs font-bold text-rose-700">
+                    <Lock className="h-3.5 w-3.5" /> Chưa mở rào — xem cảnh báo phía trên
+                  </p>
+                ) : !plate ? (
+                  // Chưa có biển camera → cổng vào CHƯA mở. Nói đúng trạng thái
+                  // thay vì báo "đã tự động mở cổng" như trước.
+                  <p className="flex items-start gap-1.5 rounded-xl bg-amber-50 p-2.5 text-[11px] font-semibold leading-relaxed text-amber-700">
+                    <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+                    Đang chờ camera đọc biển số để đối soát với thẻ — chưa mở rào. Đưa biển xe vào khung hình
+                    hoặc bấm "Chụp &amp; OCR".
+                  </p>
+                ) : plateMismatchEntry ? (
+                  <p className="flex items-start gap-1.5 rounded-xl bg-rose-50 p-2.5 text-[11px] font-semibold leading-relaxed text-rose-700">
+                    <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    Biển camera đọc ({plate}) khác biển đã gắn với thẻ ({rfidInfo.vehicle.licensePlate}) — chưa mở rào,
+                    kiểm tra lại xe.
+                  </p>
                 ) : (
                   // Cổng vào tự động — quét thẻ hợp lệ là cổng đã mở, không cần bấm
                   <p className="flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600/10 py-2 text-xs font-bold text-emerald-700">
@@ -1458,27 +2182,47 @@ export default function GateControl({
                 )}
               </div>
             )}
+            {/* BIỂN SỐ LÀ XE THÁNG → KHÔNG mời gắn thẻ.
+                Ô "Liên kết biển số" trước đây hiện cho mọi thẻ trắng, kể cả khi
+                camera vừa đọc ra một biển đang có thẻ tháng còn hạn. Nhân viên
+                bấm Liên kết thì server chặn (MONTHLY_CANNOT_LINK_RFID) nhưng
+                màn hình vẫn mời làm việc đó — nay ẩn hẳn và chỉ đường sang QR. */}
             {rfidStatus === 'not_found' && (
-              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3 space-y-2">
-                <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
-                  <AlertCircle className="h-3.5 w-3.5" /> {rfidError}
-                </p>
-                <div className="flex gap-2">
-                  <input
-                    value={linkPlate}
-                    onChange={(e) => setLinkPlate(e.target.value.toUpperCase())}
-                    placeholder="Liên kết biển số: 29C1-38383"
-                    className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs uppercase focus:border-blue-400 focus:outline-none"
-                  />
+              monthlyNeedsQr ? (
+                <div className="mt-3 rounded-xl border border-pink-200 bg-pink-50/70 p-3 space-y-2">
+                  <p className="flex items-start gap-1.5 text-xs font-bold text-pink-700">
+                    <CalendarCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    Xe {monthlyNeedsQr.plate} là xe thẻ tháng — không gắn thẻ RFID cho xe này.
+                  </p>
                   <button
-                    onClick={handleLinkCard}
-                    disabled={!linkPlate.trim() || linking}
-                    className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 transition disabled:opacity-40"
+                    onClick={() => { setMonthlyNeedsQr(null); void startQrScan(); }}
+                    className="w-full rounded-lg bg-pink-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-pink-700"
                   >
-                    {linking ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Liên kết'}
+                    Quét mã QR thẻ tháng
                   </button>
                 </div>
-              </div>
+              ) : (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3 space-y-2">
+                  <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+                    <AlertCircle className="h-3.5 w-3.5" /> {rfidError}
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      value={linkPlate}
+                      onChange={(e) => setLinkPlate(e.target.value.toUpperCase())}
+                      placeholder="Liên kết biển số: 29C1-38383"
+                      className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs uppercase focus:border-blue-400 focus:outline-none"
+                    />
+                    <button
+                      onClick={handleLinkCard}
+                      disabled={!linkPlate.trim() || linking}
+                      className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700 transition disabled:opacity-40"
+                    >
+                      {linking ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Liên kết'}
+                    </button>
+                  </div>
+                </div>
+              )
             )}
 
             {/* PaddleOCR service status */}
@@ -1494,8 +2238,8 @@ export default function GateControl({
             ) : null}
           </div>
 
-          {/* Rào chắn + báo động */}
-          <div className="grid grid-cols-3 gap-3">
+          {/* Rào chắn — đã bỏ nút "Báo động" */}
+          <div className="grid grid-cols-2 gap-3">
             <button
               onClick={() => handleBarrier('open')}
               className={`flex flex-col items-center gap-2 rounded-2xl px-3 py-5 text-sm font-bold transition ${
@@ -1517,13 +2261,6 @@ export default function GateControl({
             >
               <Lock className="h-6 w-6" />
               Đóng rào
-            </button>
-            <button
-              onClick={handleAlarm}
-              className="flex flex-col items-center gap-2 rounded-2xl bg-rose-100 px-3 py-5 text-sm font-bold text-rose-600 transition hover:bg-rose-200"
-            >
-              <Siren className="h-6 w-6" />
-              Báo động
             </button>
           </div>
 
@@ -1559,7 +2296,12 @@ export default function GateControl({
           </div>
           <div className="max-h-72 space-y-3 overflow-y-auto px-5 pb-5">
             {liveScans.map((scan) => {
-              const pill = recognitionPill[scan.recognition];
+              // Loại khách suy từ DỮ LIỆU THẬT (xe này có thẻ tháng còn hiệu
+              // lực không), không tin trường `recognition` của lượt quét: đầu
+              // đọc gắn nhãn theo từng lượt nên cùng một xe tháng quét hai lần
+              // có thể ra 'subscriber' lần này, 'casual' lần sau — màn hình khi
+              // đó hiện xe vừa là Khách tháng vừa là Khách vãng lai.
+              const pill = recognitionPill[scanRecognitionOf(scan)];
               return (
                 <div key={scan.id} className="rounded-xl border border-slate-100 p-4 shadow-sm">
                   <div className="flex flex-wrap items-center justify-between gap-2">

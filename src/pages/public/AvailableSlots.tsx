@@ -103,7 +103,7 @@ export default function AvailableSlots({
   const discardBooking = (id: string) => (onDiscardReservation ?? onCancelReservation)?.(id);
   // Danh sách bãi lấy từ danh mục backend — nhãn giữ nguyên như dữ liệu đặt chỗ cũ.
   const LOT_OPTIONS = useMemo(
-    () => lotStatuses.map((l) => l.bookingLabel || l.name),
+    () => lotStatuses.map((l) => l.name),
     [lotStatuses],
   );
   // Danh mục tải bất đồng bộ nên lúc mount còn rỗng: chọn bãi đầu tiên ngay khi
@@ -344,10 +344,13 @@ export default function AvailableSlots({
       const pendingBooking = {
         reservationCode,
         reservationType: reservationMeta.reservationType,
-        // Không khóa cứng slotCode: ô đã xem lúc đặt có thể bị chiếm mất trong
-        // lúc khách thao tác trên trang VNPay — để backend tự xếp ô Available
-        // còn trống cùng khu/tầng/loại xe tại đúng thời điểm thanh toán xong.
-        slotAssignmentMode: 'Auto' as const,
+        // MANG THEO Ô KHÁCH ĐÃ CHỌN. Trước đây chỗ này cố tình bỏ slotCode để
+        // "backend tự xếp ô trống", nhưng hệ quả là ô khách bấm trên sơ đồ bị
+        // vứt đi hoàn toàn: chọn D01, thanh toán xong lại nhận về A01 (ô trống
+        // đầu bảng). Ô chỉ được xếp lại khi ô đã chọn bị người khác chiếm mất
+        // trong lúc khách còn ở trang VNPay — xử lý ở handleAddReservation.
+        slotAssignmentMode: 'Manual' as const,
+        slotCode: matchedSlot.slotCode,
         vehicleType,
         licensePlate: plateVal,
         date: todayISO(),
@@ -581,6 +584,8 @@ export default function AvailableSlots({
                         y: s.posY ?? null,
                         w: s.posW ?? null,
                         h: s.posH ?? null,
+                        // Loai xe THAT cua o — khong suy tu chu cai dau ma o
+                        vehicleType: s.vehicleType,
                       } as MapSlot))}
                       gates={findLot(selectedLot)?.gates}
                       selectedId={selectedSlotId}

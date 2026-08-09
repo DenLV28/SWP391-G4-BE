@@ -13,7 +13,6 @@ export type ParkingLotStatus = {
 /** Dữ liệu Admin gửi lên khi tạo/sửa bãi. */
 export type ParkingLotInput = {
   name: string;
-  bookingLabel?: string;
   address?: string;
   description?: string;
   imageData?: string;
@@ -89,17 +88,25 @@ export async function updateParkingLot(id: number, input: ParkingLotInput): Prom
   }
 }
 
-export async function deleteParkingLot(id: number): Promise<{ ok: boolean; error?: string }> {
+/** Kết quả xóa bãi — kèm số liệu dữ liệu xe được GIỮ LẠI để báo cho Admin. */
+export type LotDeleteResult = {
+  ok: boolean;
+  error?: string;
+  removedSlots?: number;
+  keptBusySlots?: number;
+  keptOpenReservations?: number;
+  keptActiveSessions?: number;
+};
+
+export async function deleteParkingLot(id: number): Promise<LotDeleteResult> {
   try {
     const res = await fetch(buildApiUrl(`/api/parking-lots/${id}`), {
       method: 'DELETE',
       headers: defaultHeaders(),
     });
-    if (!res.ok) {
-      const body = await readJson<{ error?: string }>(res);
-      return { ok: false, error: body?.error || 'Không thể xóa bãi đỗ.' };
-    }
-    return { ok: true };
+    const body = await readJson<LotDeleteResult & { error?: string }>(res);
+    if (!res.ok) return { ok: false, error: body?.error || 'Không thể xóa bãi đỗ.' };
+    return { ok: true, ...(body ?? {}) };
   } catch {
     return { ok: false, error: 'Không kết nối được tới máy chủ.' };
   }

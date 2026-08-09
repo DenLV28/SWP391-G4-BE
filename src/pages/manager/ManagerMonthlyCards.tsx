@@ -2,10 +2,13 @@ import React, { useMemo, useState } from 'react';
 import { CalendarCheck, Search, AlertTriangle, CheckCircle, XCircle, Clock } from 'lucide-react';
 import type { Reservation, User, VehicleKey } from '../../data/mockData';
 import { addOneMonth } from '../../utils/reservationPricing';
+import ConfirmModal from '../../components/ConfirmModal';
 
 interface Props {
   reservations: Reservation[];
   users: User[];
+  /** Hủy thẻ tháng — thao tác CHỈ Quản lý được làm (nhân viên bị backend chặn). */
+  onCancelCard?: (reservationId: string) => void;
 }
 
 const VEHICLE_LABEL: Record<VehicleKey, string> = {
@@ -44,9 +47,10 @@ function daysBetween(fromIso: string, toIso: string): number {
   return Math.round((b - a) / 86_400_000);
 }
 
-export default function ManagerMonthlyCards({ reservations, users }: Props) {
+export default function ManagerMonthlyCards({ reservations, users, onCancelCard }: Props) {
   const [filter, setFilter] = useState<'all' | CardStatus>('all');
   const [query, setQuery] = useState('');
+  const [cancelTarget, setCancelTarget] = useState<Reservation | null>(null);
 
   const userNameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -178,6 +182,7 @@ export default function ManagerMonthlyCards({ reservations, users }: Props) {
                   <th className="px-4 py-3 text-right">Giá tháng</th>
                   <th className="px-4 py-3">Trạng thái đặt chỗ</th>
                   <th className="px-4 py-3">Trạng thái thẻ</th>
+                  {onCancelCard && <th className="px-4 py-3 text-right">Thao tác</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
@@ -216,6 +221,21 @@ export default function ManagerMonthlyCards({ reservations, users }: Props) {
                           {meta.label}
                         </span>
                       </td>
+                      {onCancelCard && (
+                        <td className="px-4 py-3 text-right">
+                          {/* Thẻ đã hủy/hết hạn thì không còn gì để chấm dứt. */}
+                          {cardStatus === 'cancelled' || cardStatus === 'expired' ? (
+                            <span className="text-[11px] text-slate-300">—</span>
+                          ) : (
+                            <button
+                              onClick={() => setCancelTarget(r)}
+                              className="rounded-lg border border-rose-200 px-3 py-1.5 text-[11px] font-bold text-rose-600 hover:bg-rose-50"
+                            >
+                              Hủy thẻ
+                            </button>
+                          )}
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
@@ -224,6 +244,21 @@ export default function ManagerMonthlyCards({ reservations, users }: Props) {
           </div>
         )}
       </div>
+
+      <ConfirmModal
+        isOpen={cancelTarget !== null}
+        title="Hủy thẻ tháng của khách?"
+        message={
+          cancelTarget
+            ? `Thẻ ${cancelTarget.reservationCode} — xe ${cancelTarget.licensePlate}, ô ${cancelTarget.slotCode || '—'} tại ${cancelTarget.parkingLot || '—'} sẽ bị chấm dứt. Ô đỗ được trả lại cho bãi và khách nhận thông báo. Khoản đã thanh toán cho tháng này KHÔNG tự động hoàn lại.`
+            : ''
+        }
+        onConfirm={() => {
+          if (cancelTarget) onCancelCard?.(cancelTarget.id);
+          setCancelTarget(null);
+        }}
+        onCancel={() => setCancelTarget(null)}
+      />
 
       {counts.expiring > 0 && (
         <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700">

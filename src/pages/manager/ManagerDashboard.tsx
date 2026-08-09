@@ -6,7 +6,7 @@ import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap'
 import PaymentWalletCard from '../../components/PaymentWalletCard';
 import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
-import { formatCurrency, localDateISO } from '../../utils/helpers';
+import { formatCurrency } from '../../utils/helpers';
 import { lotKeyOrDefault, type LotKey, type ParkingLotInfo } from '../../utils/parkingLots';
 import type { LotStatus } from '../../services/parkingLotService';
 import ManagerParkingLots from './ManagerParkingLots';
@@ -16,6 +16,7 @@ import ManagerReports from './ManagerReports';
 import ManagerExceptions from './ManagerExceptions';
 import ManagerFeedback from './ManagerFeedback';
 import ManagerMonthlyCards from './ManagerMonthlyCards';
+import { fetchOverviewReport, type OverviewReport } from '../../services/reportService';
 
 interface ManagerDashboardProps {
   slots: Slot[];
@@ -42,6 +43,8 @@ interface ManagerDashboardProps {
   onAssignStaff?: (userId: string, lotName: string) => Promise<boolean>;
   lotStatuses?: ParkingLotInfo[];
   onUpdateLotStatus?: (name: string, status: LotStatus) => Promise<boolean>;
+  /** Hủy thẻ tháng — chỉ vai trò Quản lý có thao tác này. */
+  onCancelMonthlyCard?: (reservationId: string) => void;
 }
 
 export default function ManagerDashboard({
@@ -69,6 +72,7 @@ export default function ManagerDashboard({
   onAssignStaff,
   lotStatuses = [],
   onUpdateLotStatus,
+  onCancelMonthlyCard,
 }: ManagerDashboardProps) {
   // Không còn bộ chọn bãi ở header — Tổng quan luôn gộp dữ liệu cả 3 bãi;
   // sơ đồ bãi đỗ (không gộp được, mỗi bãi trùng mã ô A01...) có bộ chọn riêng
@@ -146,14 +150,15 @@ export default function ManagerDashboard({
         // Trang danh sách bãi hiển thị cả 3 bãi → dùng allSlots (không theo bộ lọc bãi)
         return <ManagerParkingLots floors={floors} areas={areas} slots={allSlots} users={users} setView={setView} onAssignStaff={onAssignStaff} onViewDetail={setDetailLot} lotStatuses={lotStatuses} onUpdateLotStatus={onUpdateLotStatus} />;
       case 'parkinglotdetail':
-        return <ManagerParkingLotDetail setView={setView} lot={detailLot} slots={allSlots} />;
+        return <ManagerParkingLotDetail setView={setView} lot={detailLot} slots={allSlots} reservations={allReservations} users={users} />;
       case 'pricing-vehicles':
         return <ManagerPricingVehicles setView={setView} />;
       case 'reports':
         // Báo cáo có bộ lọc bãi + thời gian riêng — nhận dữ liệu toàn hệ thống
-        return <ManagerReports payments={payments} reservations={allReservations} parkingLots={lotStatuses} />;
+        return <ManagerReports parkingLots={lotStatuses} />;
       case 'monthlycards':
-        return <ManagerMonthlyCards reservations={reservations} users={users} />;
+        // Hủy thẻ tháng là quyền riêng của Quản lý — nhân viên bị backend chặn.
+        return <ManagerMonthlyCards reservations={reservations} users={users} onCancelCard={onCancelMonthlyCard} />;
       case 'exceptions':
         return (
           <ManagerExceptions
@@ -534,15 +539,36 @@ function DashboardContent({
   const dayNames = ['Chủ nhật', 'Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy'];
   const dateLabel = `${dayNames[now.getDay()]}, ${now.getDate()} Tháng ${now.getMonth() + 1}, ${now.getFullYear()}`;
 
-  const totalSlots = slots.length;
-  const occupiedCount = slots.filter((s) => s.status === 'Occupied').length;
+  // ── Số liệu tổng quan lấy thẳng từ backend ─────────────────────────────────
+  //
+  // Khối "Thống kê lượng xe ra vào hôm nay" và biểu đồ lưu lượng trước đây là
+  // số viết cứng trong JSX, trông y như số liệu thật. Thẻ doanh thu thì ghép
+  // hai phạm vi lệch nhau: tiền của HÔM NAY nhưng số giao dịch của TOÀN BỘ
+  // lịch sử — nên "5.000đ / 26 giao dịch" là hai con số không liên quan.
+  const [overview, setOverview] = useState<OverviewReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => fetchOverviewReport().then((d) => { if (!cancelled) setOverview(d); });
+    load();
+    const t = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const totalSlots = overview?.totalSlots ?? slots.length;
+  // "Xe đang đỗ" đếm VÉ CÒN MỞ, không đếm ô trạng thái Occupied: ô có thể kẹt
+  // ở Occupied sau dữ liệu cũ, còn xe vào lúc bãi hết ô phù hợp thì có vé mà
+  // chưa được xếp ô nào — cả hai chiều đều làm số ô sai lệch so với số xe.
+  const occupiedCount = overview?.activeSessions ?? slots.filter((s) => s.status === 'Occupied').length;
   const occupancyPct = totalSlots > 0 ? Math.round((occupiedCount / totalSlots) * 100) : 0;
 
-  const todayStr = localDateISO(now);
-  const paidPayments = payments.filter((p) => p.status === 'Paid');
-  const todayRevenue = paidPayments
-    .filter((p) => (p.paidAt || p.createdAt || '').startsWith(todayStr))
-    .reduce((sum, p) => sum + p.totalAmount, 0);
+  const todayRevenue = overview?.todayRevenue ?? 0;
+  const todayPaidCount = overview?.todayPaidCount ?? 0;
+
+  const VEHICLE_CARDS = [
+    { key: 'motorbike',        label: 'Xe máy',        icon: Bike, bg: 'bg-orange-50',  color: 'text-orange-500'  },
+    { key: 'car',              label: 'Ô tô 4-7 chỗ',  icon: Car,  bg: 'bg-blue-50',    color: 'text-blue-500'    },
+    { key: 'electric vehicle', label: 'Ô tô Điện/EV',  icon: Zap,  bg: 'bg-emerald-50', color: 'text-emerald-500' },
+  ] as const;
 
   return (
     <div className="space-y-6">
@@ -567,7 +593,7 @@ function DashboardContent({
             {formatCurrency(todayRevenue).replace('₫', '')} <span className="text-sm font-normal text-slate-400">VND</span>
           </p>
           <p className="mt-1.5 flex items-center gap-1 text-xs font-semibold text-slate-500">
-            <TrendingUp className="h-3.5 w-3.5" /> {paidPayments.length} giao dịch đã thanh toán
+            <TrendingUp className="h-3.5 w-3.5" /> {todayPaidCount} giao dịch hôm nay
           </p>
           <Car className="absolute -right-3 -bottom-3 h-20 w-20 text-slate-100" />
         </div>
@@ -604,12 +630,9 @@ function DashboardContent({
         </div>
 
         <div className={`grid gap-4 ${viewMode === 'grid' ? 'grid-cols-1 md:grid-cols-3' : 'grid-cols-1'}`}>
-          {([
-            { label: 'Xe máy',         icon: Bike,  bg: 'bg-orange-50', color: 'text-orange-500', vao: 1240, ra: 1080, hienCo: 467 },
-            { label: 'Ô tô 4-7 chỗ',  icon: Car,   bg: 'bg-blue-50',   color: 'text-blue-500',   vao: 452,  ra: 380,  hienCo: 158 },
-            { label: 'Ô tô Điện/EV',   icon: Zap,   bg: 'bg-emerald-50', color: 'text-emerald-500', vao: 86,   ra: 72,   hienCo: 24  },
-          ] as const).map((v) => {
+          {VEHICLE_CARDS.map((v) => {
             const Icon = v.icon;
+            const stat = overview?.byVehicle.find((x) => x.vehicleType === v.key);
             return (
               <div key={v.label} className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
                 <div className="mb-4 flex items-center gap-2">
@@ -619,7 +642,11 @@ function DashboardContent({
                   <span className="text-sm font-semibold text-slate-700">{v.label}</span>
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-center">
-                  {([['Vào', v.vao, 'text-slate-800'], ['Ra', v.ra, 'text-slate-800'], ['Hiện có', v.hienCo, 'text-blue-600']] as const).map(([lbl, val, cls]) => (
+                  {([
+                    ['Vào', stat?.enters ?? 0, 'text-slate-800'],
+                    ['Ra', stat?.exits ?? 0, 'text-slate-800'],
+                    ['Hiện có', stat?.current ?? 0, 'text-blue-600'],
+                  ] as const).map(([lbl, val, cls]) => (
                     <div key={lbl}>
                       <p className="text-[10px] font-medium text-slate-400">{lbl}</p>
                       <p className={`text-xl font-bold ${cls}`}>{Number(val).toLocaleString('vi-VN')}</p>
@@ -637,18 +664,33 @@ function DashboardContent({
         {/* Traffic chart */}
         <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
           <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-800">Thống kê lưu lượng</h3>
-            <button className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition">
-              Tháng này <ChevronDown className="h-3.5 w-3.5" />
-            </button>
+            <h3 className="text-sm font-bold text-slate-800">Lượt xe vào 7 ngày qua</h3>
+            <span className="rounded-lg bg-blue-50 px-2.5 py-1 text-[11px] font-bold text-blue-600">
+              {(overview?.week ?? []).reduce((s, d) => s + d.enters, 0)} lượt
+            </span>
           </div>
+          {/* Cột vẽ theo tỉ lệ với ngày cao nhất. Nhãn thứ lấy từ ngày thật do
+              server trả về, không phải dãy T2…CN cố định — 7 ngày gần nhất
+              không bao giờ bắt đầu đúng thứ Hai. */}
           <div className="flex items-end gap-2" style={{ height: 96 }}>
-            {[28, 45, 32, 58, 72, 51, 40].map((h, i) => (
-              <div key={i} className="flex flex-1 flex-col items-center gap-1">
-                <div className="w-full rounded-t-md bg-blue-100" style={{ height: `${h}px` }} />
-                <span className="text-[9px] text-slate-400">{['T2','T3','T4','T5','T6','T7','CN'][i]}</span>
-              </div>
-            ))}
+            {(() => {
+              const week = overview?.week ?? [];
+              const max = Math.max(1, ...week.map((d) => d.enters));
+              const WD = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
+              if (week.length === 0) {
+                return <p className="w-full self-center text-center text-xs text-slate-400">Đang tải…</p>;
+              }
+              return week.map((d) => (
+                <div key={d.date} className="flex flex-1 flex-col items-center gap-1" title={`${d.date}: ${d.enters} lượt`}>
+                  <span className="text-[9px] font-semibold text-slate-500">{d.enters || ''}</span>
+                  <div
+                    className="w-full rounded-t-md bg-blue-200"
+                    style={{ height: `${Math.round((d.enters / max) * 72)}px` }}
+                  />
+                  <span className="text-[9px] text-slate-400">{WD[d.weekday]}</span>
+                </div>
+              ));
+            })()}
           </div>
         </div>
 
@@ -740,7 +782,7 @@ function DashboardContent({
               className="w-full appearance-none rounded-xl border border-slate-300 bg-white px-4 py-2.5 pr-10 text-sm font-semibold text-slate-800 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-600/10"
             >
               {parkingLots.map((lot) => (
-                <option key={lot.key} value={lot.key}>{lot.bookingLabel}</option>
+                <option key={lot.key} value={lot.key}>{lot.name}</option>
               ))}
             </select>
             <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -757,6 +799,8 @@ function DashboardContent({
               y: s.posY ?? null,
               w: s.posW ?? null,
               h: s.posH ?? null,
+              // Loai xe THAT cua o — khong suy tu chu cai dau ma o
+              vehicleType: s.vehicleType,
             } as MapSlot))}
             gates={selectedLot?.gates}
             interactive={false}

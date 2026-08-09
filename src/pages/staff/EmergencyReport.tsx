@@ -69,6 +69,8 @@ export default function EmergencyReport({
     y: s.posY ?? null,
     w: s.posW ?? null,
     h: s.posH ?? null,
+    // Loai xe THAT cua o — khong suy tu chu cai dau ma o
+    vehicleType: s.vehicleType,
   }));
 
   // Strip the "virtual-" prefix that ParkingFloorMap adds for unmatched spaces

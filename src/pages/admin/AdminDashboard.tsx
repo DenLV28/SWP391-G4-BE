@@ -9,6 +9,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { AdminActivity, Payment, Reservation, Slot, SystemConfig, User, VehicleKey, mockPricingRules } from '../../data/mockData';
+import { fetchOverviewReport, type OverviewReport } from '../../services/reportService';
 
 type FilterPeriod = '7days' | 'month' | 'year';
 
@@ -18,54 +19,16 @@ const filterOptions: { value: FilterPeriod; label: string }[] = [
   { value: 'year', label: 'Năm này' },
 ];
 
-const CHART_DATA: Record<FilterPeriod, { label: string; value: number }[]> = {
-  '7days': [
-    { label: 'T2', value: 42 },
-    { label: 'T3', value: 58 },
-    { label: 'T4', value: 35 },
-    { label: 'T5', value: 71 },
-    { label: 'T6', value: 88 },
-    { label: 'T7', value: 64 },
-    { label: 'CN', value: 49 },
-  ],
-  'month': [
-    { label: 'Tuần 1', value: 210 },
-    { label: 'Tuần 2', value: 285 },
-    { label: 'Tuần 3', value: 342 },
-    { label: 'Tuần 4', value: 298 },
-  ],
-  'year': [
-    { label: 'Th.1', value: 45 },
-    { label: 'Th.2', value: 52 },
-    { label: 'Th.3', value: 61 },
-    { label: 'Th.4', value: 58 },
-    { label: 'Th.5', value: 74 },
-    { label: 'Th.6', value: 88 },
-    { label: 'Th.7', value: 95 },
-    { label: 'Th.8', value: 82 },
-    { label: 'Th.9', value: 70 },
-    { label: 'Th.10', value: 63 },
-    { label: 'Th.11', value: 55 },
-    { label: 'Th.12', value: 48 },
-  ],
-};
-
 const REVENUE_TITLES: Record<FilterPeriod, string> = {
   '7days': 'Doanh thu 7 ngày qua',
   'month': 'Doanh thu tháng này',
   'year': 'Doanh thu năm nay',
 };
 
-const GROWTH_TEXTS: Record<FilterPeriod, string> = {
-  '7days': '+15.2% so với tuần trước',
-  'month': '+9.4% so với tháng trước',
-  'year': '+22.1% so với năm ngoái',
-};
-
-const DEMO_REVENUE: Record<FilterPeriod, number> = {
-  '7days': 87150000,
-  'month': 342800000,
-  'year': 4125000000,
+const GROWTH_PERIOD_LABEL: Record<FilterPeriod, string> = {
+  '7days': 'tuần trước',
+  'month': 'tháng trước',
+  'year':  'năm ngoái',
 };
 
 export default function AdminDashboard({
@@ -102,31 +65,36 @@ export default function AdminDashboard({
   }, []);
 
   const today = new Date();
-  const totalSlots = slots.length || 1;
-  const occupiedSlots = slots.filter((slot) => slot.status === 'Occupied').length;
+
+  // ── Số liệu lấy thẳng từ backend ────────────────────────────────────────────
+  //
+  // Trang này trước đây bịa gần như toàn bộ con số:
+  //  • "Thống kê lượng xe ra vào hôm nay" tính bằng phép nhân trên số Ô ĐỖ
+  //    (`current * 12 + available * 8 + index * 14`) rồi trình bày như lượt xe
+  //    thật — không có lượt vào/ra nào được đếm cả;
+  //  • biểu đồ lưu lượng là mảng cố định CHART_DATA;
+  //  • "+15.2% so với tuần trước" là chuỗi viết cứng, không tính từ dữ liệu;
+  //  • doanh thu rơi về DEMO_REVENUE (87 triệu) mỗi khi kỳ đó chưa có thu.
+  const [overview, setOverview] = useState<OverviewReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => fetchOverviewReport(undefined, filterPeriod).then((d) => {
+      if (!cancelled) setOverview(d);
+    });
+    load();
+    const t = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [filterPeriod]);
+
+  const totalSlots = overview?.totalSlots || slots.length || 1;
+  const occupiedSlots = overview?.occupiedSlots ?? slots.filter((slot) => slot.status === 'Occupied').length;
   const occupancyRate = Math.round((occupiedSlots / totalSlots) * 100);
-  const activeSessions = occupiedSlots || reservations.filter((r) => r.status === 'Checked-in').length;
+  // Xe đang đỗ = vé còn mở, không phải số ô Occupied (ô có thể kẹt trạng thái,
+  // và xe chưa được xếp ô vẫn là xe trong bãi).
+  const activeSessions = overview?.activeSessions ?? 0;
 
-  const getStartDate = (period: FilterPeriod): Date => {
-    const now = new Date();
-    if (period === '7days') {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 7);
-      return d;
-    }
-    if (period === 'month') return new Date(now.getFullYear(), now.getMonth(), 1);
-    return new Date(now.getFullYear(), 0, 1);
-  };
-
-  const startDate = getStartDate(filterPeriod);
-  const periodRevenue =
-    payments
-      .filter((p) => {
-        if (p.status !== 'Paid' || !p.paidAt) return false;
-        const paidDate = new Date(p.paidAt.slice(0, 10));
-        return paidDate >= startDate;
-      })
-      .reduce((sum, p) => sum + p.totalAmount, 0) || DEMO_REVENUE[filterPeriod];
+  const periodRevenue = overview?.periodRevenue ?? 0;
+  const growthPct = overview?.growthPct ?? null;
 
   const vehicleGroups: Array<{ key: VehicleKey; title: string; icon: React.ReactNode }> = [
     { key: 'motorbike', title: 'Xe máy', icon: <Bike className="h-5 w-5" /> },
@@ -134,21 +102,17 @@ export default function AdminDashboard({
     { key: 'electric vehicle', title: 'Ô tô 4-7 chỗ (Điện/EV)', icon: <Zap className="h-5 w-5" /> },
   ];
 
-  const vehicleStats = vehicleGroups.map((group, index) => {
-    const matchingSlots = slots.filter((slot) => slot.vehicleType === group.key);
-    const available = matchingSlots.filter((slot) => slot.status === 'Available').length;
-    const occupied = matchingSlots.filter((slot) => slot.status === 'Occupied').length;
-    const reserved = matchingSlots.filter((slot) => slot.status === 'Reserved').length;
-    const current = occupied + reserved;
+  const vehicleStats = vehicleGroups.map((group) => {
+    const stat = overview?.byVehicle.find((v) => v.vehicleType === group.key);
     return {
       ...group,
-      inCount: current * 12 + available * 8 + index * 14,
-      outCount: Math.max(current * 10 + available * 6 + index * 8, 0),
-      current: current || available || index + 8,
+      inCount: stat?.enters ?? 0,
+      outCount: stat?.exits ?? 0,
+      current: stat?.current ?? 0,
     };
   });
 
-  const chartData = CHART_DATA[filterPeriod];
+  const chartData = overview?.chart ?? [];
   const chartMax = Math.max(...chartData.map((d) => d.value), 1);
   const currentFilterLabel = filterOptions.find((o) => o.value === filterPeriod)?.label ?? '';
 
@@ -216,10 +180,23 @@ export default function AdminDashboard({
                 </div>
                 <div className="pb-1.5 text-[18px] font-semibold text-slate-600">VND</div>
               </div>
-              <div className="inline-flex items-center gap-2 text-[13px] font-semibold text-emerald-700">
-                <MoveUpRight className="h-4.5 w-4.5" />
-                {GROWTH_TEXTS[filterPeriod]}
-              </div>
+              {/* % tăng trưởng tính từ doanh thu kỳ trước. Kỳ trước chưa có
+                  thu thì KHÔNG có gì để so — nói thẳng thay vì hiện một con số
+                  xanh trông như đang tăng trưởng. */}
+              {growthPct == null ? (
+                <div className="text-[13px] font-semibold text-slate-400">
+                  Chưa có doanh thu {GROWTH_PERIOD_LABEL[filterPeriod]} để so sánh
+                </div>
+              ) : (
+                <div
+                  className={`inline-flex items-center gap-2 text-[13px] font-semibold ${
+                    growthPct >= 0 ? 'text-emerald-700' : 'text-rose-600'
+                  }`}
+                >
+                  <MoveUpRight className={`h-4.5 w-4.5 ${growthPct < 0 ? 'rotate-90' : ''}`} />
+                  {growthPct >= 0 ? '+' : ''}{growthPct}% so với {GROWTH_PERIOD_LABEL[filterPeriod]}
+                </div>
+              )}
             </div>
 
             <div className="hidden h-16 w-16 items-center justify-center rounded-[18px] bg-[#eef5ff] text-[#d9e7ff] md:flex">
@@ -277,6 +254,11 @@ export default function AdminDashboard({
           </div>
 
           <div className="mt-8 flex h-[280px] items-end gap-2">
+            {chartData.length === 0 && (
+              <p className="w-full self-center text-center text-[13px] text-slate-400">
+                {overview ? 'Chưa có lượt xe nào trong kỳ này' : 'Đang tải số liệu…'}
+              </p>
+            )}
             {chartData.map((item) => (
               <div key={item.label} className="flex flex-1 flex-col items-center justify-end gap-2">
                 <div className="text-[11px] font-semibold text-slate-400">{item.value}</div>

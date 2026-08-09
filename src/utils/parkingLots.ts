@@ -47,8 +47,6 @@ export type ParkingLotInfo = {
   key: LotKey;
   /** Tên ngắn — dùng cho gán staff, hiển thị quản trị. */
   name: string;
-  /** Nhãn đầy đủ trên form đặt chỗ (đã tồn tại trong dữ liệu reservations). */
-  bookingLabel: string;
   status: LotStatusValue;
   updatedAt: string;
   /** Tiền tố mã ô giữ slot_code UNIQUE toàn cục ('TD-', 'LP-', '' cho bãi gốc). */
@@ -111,7 +109,7 @@ export function lotKeyOf(value?: string | null): LotKey | null {
   if (!v) return null;
 
   // 1. Khớp chính xác tên hoặc nhãn đặt chỗ.
-  const exact = CATALOG.find((l) => normalize(l.name) === v || normalize(l.bookingLabel) === v);
+  const exact = CATALOG.find((l) => normalize(l.name) === v);
   if (exact) return exact.key;
 
   // 2. Khớp chứa nhau — bắt các biến thể "…Quận 9 - Lò Lu" ⊃ "…Quận 9".
@@ -119,7 +117,7 @@ export function lotKeyOf(value?: string | null): LotKey | null {
   const contains = CATALOG
     .filter((l) => {
       const n = normalize(l.name);
-      return n.length > 0 && (v.includes(n) || normalize(l.bookingLabel).includes(v));
+      return n.length > 0 && v.includes(n);
     })
     .sort((a, b) => normalize(b.name).length - normalize(a.name).length)[0];
   if (contains) return contains.key;

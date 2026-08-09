@@ -28,8 +28,13 @@ CREATE TABLE users (
     email        NVARCHAR(150) NOT NULL UNIQUE,
     phone        NVARCHAR(20)  UNIQUE,
     password_hash NVARCHAR(255) NOT NULL,
-    role         NVARCHAR(20)  NOT NULL DEFAULT 'user'
-                 CHECK (role IN ('admin','manager','staff','guest','user')),
+    -- Backend (server.js) lưu vai trò bằng TÊN HIỂN THỊ; bản cũ của file này
+    -- chỉ cho phép bộ mã ngắn nên mọi lệnh đăng ký tài khoản đều bị CHECK chặn
+    -- (lỗi 547 → "Lỗi máy chủ khi tạo tài khoản"). Chấp nhận cả hai bộ.
+    role         NVARCHAR(50)  NOT NULL DEFAULT 'user'
+                 CHECK (role IN ('admin','manager','staff','guest','user',
+                                 'System Administrator','Parking Manager',
+                                 'Parking Staff','Parking User / Driver')),
     is_active    BIT           NOT NULL DEFAULT 1,
     created_at   DATETIME2     NOT NULL DEFAULT GETDATE()
 );
@@ -41,8 +46,17 @@ GO
 CREATE TABLE vehicles (
     vehicle_id    INT IDENTITY(1,1) PRIMARY KEY,
     user_id       INT          NOT NULL,
-    vehicle_type  NVARCHAR(30) NOT NULL
-                  CHECK (vehicle_type IN (N'Xe máy', N'Ô tô', N'Xe đạp', N'Xe tải nhỏ')),
+    -- Bộ nhãn CŨ (Xe máy / Ô tô / ...) và bộ nhãn ĐẦY ĐỦ mà backend dùng ở mọi
+    -- nơi khác (giống parking_slots.vehicle_type). Bản cũ chỉ nhận bộ ngắn nên
+    -- hồ sơ xe tạo kèm lúc đăng ký luôn bị CHECK chặn — tài khoản vẫn tạo được
+    -- nhưng người dùng không có xe nào, và lỗi bị nuốt im lặng.
+    vehicle_type  NVARCHAR(50) NOT NULL
+                  CHECK (vehicle_type IN (
+                      N'Xe máy', N'Ô tô', N'Xe đạp', N'Xe tải nhỏ',
+                      N'Xe máy / Xe máy điện',
+                      N'Ô tô 4-7 chỗ (Xăng)',
+                      N'Ô tô 4-7 chỗ (Điện / EV)'
+                  )),
     license_plate NVARCHAR(20) NOT NULL UNIQUE,
     brand         NVARCHAR(100),
     model         NVARCHAR(100),

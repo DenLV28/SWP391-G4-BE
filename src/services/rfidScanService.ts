@@ -136,6 +136,34 @@ export function subscribeToRfidTaps(onTap: (e: RfidTapEvent) => void): () => voi
   return () => { cancelled = true; clearTimeout(retryTimer); };
 }
 
+/**
+ * Xóa ẢNH đã lưu của một thẻ RFID sau khi xe ra khỏi bãi.
+ *
+ * Truyền `licensePlate` khi biết, để chỉ xóa ảnh của đúng chiếc xe vừa ra —
+ * thẻ mượn ở cổng được thu lại rồi phát cho xe khác, quét theo mỗi UID sẽ xóa
+ * lây ảnh của xe đang còn trong bãi. Bản ghi lượt quét vẫn giữ nguyên (sổ ra
+ * vào + số liệu "Cảnh báo" của bãi đếm trên đó).
+ */
+export async function clearRfidScanImages(
+  rfidUid: string,
+  licensePlate?: string,
+): Promise<number> {
+  try {
+    const query = `rfidUid=${encodeURIComponent(rfidUid)}${
+      licensePlate ? `&licensePlate=${encodeURIComponent(licensePlate)}` : ''
+    }`;
+    const res = await fetch(buildApiUrl(`/api/rfid-scans/images?${query}`), {
+      method: 'DELETE',
+      headers: defaultHeaders(),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return Number(data?.cleared) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Xóa hẳn bản ghi (kèm ảnh) khỏi DB — tác vụ dọn dữ liệu thủ công, không dùng cho luồng "Từ chối" ở Gate Control nữa (xem rejectRfidScan). */
 export async function deleteRfidScan(id: string | number): Promise<boolean> {
   try {

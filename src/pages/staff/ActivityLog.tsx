@@ -1,12 +1,19 @@
 import { useState } from 'react';
+import type { ReactNode } from 'react';
 import { Calendar, ChevronDown, ChevronLeft, ChevronRight, Eye, Mail, Phone, User as UserIcon, X } from 'lucide-react';
 import type { AccessLog } from '../../types/staff';
 import type { Reservation, User } from '../../data/mockData';
 
 interface ActivityLogProps {
-  accessLogs: AccessLog[];
+  /** `loggedAt` chỉ có ở bản ghi đọc từ server — dùng để hiện ĐÚNG ngày. */
+  accessLogs: (AccessLog & { loggedAt?: string })[];
   reservations?: Reservation[];
   users?: User[];
+  /** Manager dùng lại bảng này cho nhật ký từng bãi nên cần đổi tiêu đề… */
+  title?: string;
+  subtitle?: string;
+  /** …và chèn bộ lọc bãi vào cạnh tiêu đề. */
+  headerRight?: ReactNode;
 }
 
 type ExtRow = {
@@ -33,19 +40,40 @@ type ExtRow = {
 const todayDate = new Date();
 const todayISO = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, '0')}-${String(todayDate.getDate()).padStart(2, '0')}`;
 
+/**
+ * NGÀY THẬT CỦA MỘT DÒNG NHẬT KÝ.
+ *
+ * Bản ghi đọc từ server có `loggedAt` (ISO, giờ UTC). Trước đây mọi dòng đều
+ * bị gán cứng là "Hôm nay" — đúng với nhân viên vì họ chỉ xem nhật ký ca đang
+ * trực, nhưng sai hoàn toàn khi Quản lý mở nhật ký của bãi và kéo về hàng trăm
+ * dòng của nhiều ngày trước: tất cả đều hiện "Hôm nay" và bộ lọc theo ngày trở
+ * nên vô nghĩa. Cộng +7h để ra ngày theo giờ VN, khớp với cột giờ đang hiển thị.
+ */
+function realDateOf(log: AccessLog & { loggedAt?: string }): { dateISO: string; dateStr: string } {
+  if (!log.loggedAt) return { dateISO: todayISO, dateStr: 'Hôm nay' };
+  const t = new Date(log.loggedAt).getTime();
+  if (Number.isNaN(t)) return { dateISO: todayISO, dateStr: 'Hôm nay' };
+  const vn = new Date(t + 7 * 3600 * 1000);
+  const dateISO = vn.toISOString().slice(0, 10);
+  if (dateISO === todayISO) return { dateISO, dateStr: 'Hôm nay' };
+  const [y, m, d] = dateISO.split('-');
+  return { dateISO, dateStr: `${d}/${m}/${y}` };
+}
+
 /** Maps real gate-scan events into table rows — no fake/sample rows mixed in. */
-function buildRows(realLogs: AccessLog[]): ExtRow[] {
+function buildRows(realLogs: (AccessLog & { loggedAt?: string })[]): ExtRow[] {
   return realLogs.map((log) => {
     const parts = log.vehicleId.split(' ');
     const pfx = parts[0] ?? log.vehicleId;
     const num = parts.slice(1).join(' ') || '—';
     const ok = log.status === 'GRANTED' || log.status === 'OVERRIDE';
     const pending = !ok && log.status === 'PENDING';
+    const when = realDateOf(log);
     return {
       id: log.id,
       timeHMS: log.time,
-      dateStr: 'Hôm nay',
-      dateISO: todayISO,
+      dateStr: when.dateStr,
+      dateISO: when.dateISO,
       platePfx: pfx,
       plateNum: num,
       plateFull: log.vehicleId,
@@ -69,7 +97,7 @@ const PAGE_SIZE = 25;
 const VEHICLE_FILTER_OPTS = ['Tất cả', 'Ô tô 4-7 chỗ (Xăng)', 'Xe máy / Xe máy điện', 'Ô tô 4-7 chỗ (Điện / EV)'];
 const ACTION_FILTER_OPTS  = ['Tất cả', 'VÀO', 'RA', 'CHƯA VÀO'];
 
-export default function ActivityLog({ accessLogs, reservations = [], users = [] }: ActivityLogProps) {
+export default function ActivityLog({ accessLogs, reservations = [], users = [], title, subtitle, headerRight }: ActivityLogProps) {
   const allRows = buildRows(accessLogs);
 
   const [vehicleFilter, setVehicleFilter] = useState('Tất cả');
@@ -118,11 +146,12 @@ export default function ActivityLog({ accessLogs, reservations = [], users = [] 
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Nhật ký hoạt động</h1>
+          <h1 className="text-2xl font-bold text-slate-900">{title ?? 'Nhật ký hoạt động'}</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Lịch sử thời gian thực của tất cả các phương tiện di chuyển qua các cổng cơ sở.
+            {subtitle ?? 'Lịch sử thời gian thực của tất cả các phương tiện di chuyển qua các cổng cơ sở.'}
           </p>
         </div>
+        {headerRight}
       </div>
 
       {/* Filter bar */}

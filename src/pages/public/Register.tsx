@@ -4,10 +4,11 @@ import FormInput from '../../components/FormInput';
 import authService from '../../services/authService';
 import { localDateISO } from '../../utils/helpers';
 
-export default function Register({ onRegister, setView, users }: {
+// `users` không còn là prop: việc kiểm tra email trùng do backend làm (nhánh
+// tạo tài khoản cục bộ khi API lỗi đã bị gỡ — xem khối catch bên dưới).
+export default function Register({ onRegister, setView }: {
   onRegister: (newUser: User, plateNumber: string, vehicleType: string, brand: string, model: string) => void;
   setView: (view: string) => void;
-  users: User[];
 }) {
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -86,30 +87,18 @@ export default function Register({ onRegister, setView, users }: {
       onRegister(newUser, plateNumber.trim(), vehicleType, brand.trim(), model.trim());
       alert('Tạo tài khoản thành công!');
       setView('login');
-    } catch {
-      // API unavailable — create user locally in mock data
-      const emailLower = email.trim().toLowerCase();
-      if (users.some((u) => u.email.toLowerCase() === emailLower)) {
-        setErrors({ general: 'Email này đã được sử dụng. Vui lòng dùng email khác.' });
-        setIsLoading(false);
-        return;
-      }
-
-      const newUser: User = {
-        id: `USR-${Date.now()}`,
-        fullName: fullName.trim(),
-        email: emailLower,
-        phone: phone.trim(),
-        role: 'Parking User / Driver',
-        status: 'Active',
-        createdAt: localDateISO(),
-        password,
-      };
-
-      setErrors({});
-      onRegister(newUser, plateNumber.trim(), vehicleType, brand.trim(), model.trim());
-      alert('Tạo tài khoản thành công!');
-      setView('login');
+    } catch (err) {
+      // KHÔNG tạo tài khoản cục bộ khi API lỗi. Trước đây nhánh này sinh user
+      // với id `USR-<timestamp>` chỉ tồn tại trong bộ nhớ trình duyệt rồi vẫn
+      // báo "Tạo tài khoản thành công". Tài khoản đó không có trong DB, nhưng
+      // đặt chỗ nó tạo ra LẠI được ghi vào DB kèm user_id không tồn tại — sinh
+      // ra các "request ảo" không có chủ ở trang Xe thẻ tháng và Đặt chỗ.
+      setErrors({
+        general:
+          err instanceof Error && err.message
+            ? err.message
+            : 'Không kết nối được máy chủ nên chưa tạo được tài khoản. Vui lòng thử lại.',
+      });
     } finally {
       setIsLoading(false);
     }

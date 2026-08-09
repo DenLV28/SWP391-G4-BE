@@ -127,6 +127,12 @@ export type ParkingSession = {
   floor: string;
   area: string;
   slotCode: string;
+  /**
+   * Bãi mà vé này thuộc về (dbo.parking_sessions.parking_lot). Cần thiết vì
+   * không phải vé nào cũng có ô đỗ — bãi hết ô phù hợp thì xe vẫn vào nhưng
+   * chưa xếp được ô, và khi đó chỉ trường này mới cho biết vé thuộc bãi nào.
+   */
+  parkingLot?: string;
   estimatedFee: number;
   paymentStatus: 'Paid' | 'Unpaid' | 'Partially Paid' | 'Failed';
   sessionStatus: 'Active' | 'Completed' | 'Cancelled';

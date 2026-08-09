@@ -5,10 +5,19 @@ import {
   Lock,
   Pencil,
   Star,
+  Trash2,
 } from 'lucide-react';
 import { SavedVehicle, User, VehicleKey, validateEmail, validateLicensePlate, validatePhone, validateRequired } from '../../data/mockData';
 import ChangePasswordModal from '../../components/ChangePasswordModal';
+import ConfirmModal from '../../components/ConfirmModal';
 import userService from '../../services/userService';
+
+/** Nhan loai xe hien cho nguoi dung — dung chung cho cac thong bao trung xe. */
+const VEHICLE_TYPE_LABEL: Record<VehicleKey, string> = {
+  car: 'Ô tô 4-7 chỗ (Xăng)',
+  motorbike: 'Xe máy / Xe máy điện',
+  'electric vehicle': 'Ô tô 4-7 chỗ (Điện / EV)',
+};
 
 export default function Profile({
   user,
@@ -17,6 +26,7 @@ export default function Profile({
   onAddVehicle,
   onUpdateVehicle,
   onSetDefaultVehicle,
+  onDeleteVehicle,
 }: {
   user: User;
   savedVehicles: SavedVehicle[];
@@ -27,6 +37,8 @@ export default function Profile({
     updates: { licensePlate: string; vehicleType: VehicleKey; brand: string; model: string },
   ) => Promise<{ ok: boolean; error?: string }>;
   onSetDefaultVehicle?: (vehicleId: string) => void;
+  /** Xóa hẳn một xe khỏi hồ sơ (và khỏi dbo.vehicles). */
+  onDeleteVehicle?: (vehicleId: string) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [fullName, setFullName] = useState(user.fullName);
@@ -59,6 +71,9 @@ export default function Profile({
   const [editModel, setEditModel] = useState('');
   const [editErrors, setEditErrors] = useState<Record<string, string>>({});
   const [savingVehicleId, setSavingVehicleId] = useState<string | null>(null);
+  // Xóa xe cần hỏi lại: xóa nhầm là mất luôn hồ sơ xe và liên kết thẻ RFID.
+  const [deleteTarget, setDeleteTarget] = useState<SavedVehicle | null>(null);
+  const [deletingVehicleId, setDeletingVehicleId] = useState<string | null>(null);
 
   const userVehicles = useMemo(
     () => savedVehicles.filter((v) => v.userId === user.id),
@@ -108,6 +123,22 @@ export default function Profile({
     }
   };
 
+  /**
+   * Trùng khi và chỉ khi TRÙNG CẢ biển số LẪN loại xe.
+   *
+   * Cùng một biển vẫn đăng ký được nhiều lần nếu loại xe khác nhau. So biển đã
+   * chuẩn hoá (bỏ gạch/chấm/khoảng trắng) để "59A-99999" và "59A99999" không
+   * lách thành hai bản ghi. Backend áp cùng quy tắc này bằng chỉ mục duy nhất
+   * ghép (license_plate, vehicle_type) — đây chỉ là lớp báo sớm cho người dùng.
+   */
+  const isDuplicateVehicle = (p: string, type: VehicleKey, exceptId?: string) => {
+    const norm = (s: string) => s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const target = norm(p);
+    return userVehicles.some(
+      (v) => v.id !== exceptId && norm(v.licensePlate) === target && v.vehicleType === type,
+    );
+  };
+
   const handleAddVeh = (e: React.FormEvent) => {
     e.preventDefault();
     const tempErrors: Record<string, string> = {};
@@ -115,8 +146,9 @@ export default function Profile({
     const plateErr = validateLicensePlate(plate);
     if (plateErr) {
       tempErrors.licensePlate = plateErr;
-    } else if (savedVehicles.some((vehicle) => vehicle.licensePlate.trim().toLowerCase() === plate.trim().toLowerCase())) {
-      tempErrors.licensePlate = 'Biển số này đã được thêm vào danh sách xe của bạn.';
+    } else if (isDuplicateVehicle(plate, vType)) {
+      // Chỉ cấm trùng CẢ biển số LẪN loại xe — cùng biển mà khác loại vẫn được.
+      tempErrors.licensePlate = `Biển ${plate.trim().toUpperCase()} với loại xe "${VEHICLE_TYPE_LABEL[vType]}" đã có trong danh sách. Cùng biển số vẫn thêm được nếu chọn loại xe khác.`;
     }
 
     const brandErr = validateRequired(brand, 'Hãng xe');
@@ -147,6 +179,18 @@ export default function Profile({
     }
   };
 
+  const handleDeleteVehicle = async () => {
+    if (!deleteTarget || !onDeleteVehicle) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    setDeletingVehicleId(target.id);
+    const result = await onDeleteVehicle(target.id);
+    setDeletingVehicleId(null);
+    // Backend chặn xóa xe đang đỗ trong bãi (409 VEHICLE_IN_USE) — hiện đúng
+    // câu đó thay vì một thông báo chung chung.
+    if (!result.ok) alert(result.error || 'Không thể xóa phương tiện. Vui lòng thử lại.');
+  };
+
   const startEditVehicle = (vehicle: SavedVehicle) => {
     setEditingVehicleId(vehicle.id);
     setEditPlate(vehicle.licensePlate);
@@ -168,14 +212,8 @@ export default function Profile({
     const plateErr = validateLicensePlate(editPlate);
     if (plateErr) {
       tempErrors.licensePlate = plateErr;
-    } else if (
-      savedVehicles.some(
-        (vehicle) =>
-          vehicle.id !== vehicleId &&
-          vehicle.licensePlate.trim().toLowerCase() === editPlate.trim().toLowerCase(),
-      )
-    ) {
-      tempErrors.licensePlate = 'Biển số này đã được thêm vào danh sách xe của bạn.';
+    } else if (isDuplicateVehicle(editPlate, editType, vehicleId)) {
+      tempErrors.licensePlate = `Biển ${editPlate.trim().toUpperCase()} với loại xe "${VEHICLE_TYPE_LABEL[editType]}" đã có trong danh sách. Cùng biển số vẫn thêm được nếu chọn loại xe khác.`;
     }
 
     const brandErr = validateRequired(editBrand, 'Hãng xe');
@@ -427,6 +465,17 @@ export default function Profile({
                     >
                       <Pencil className="h-3 w-3" /> Sửa
                     </button>
+                    {onDeleteVehicle && (
+                      <button
+                        type="button"
+                        disabled={deletingVehicleId === vehicle.id}
+                        onClick={() => setDeleteTarget(vehicle)}
+                        className="inline-flex items-center gap-1 rounded-full border border-rose-200 px-3 py-1 text-[12px] font-medium text-rose-600 transition hover:border-rose-400 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        {deletingVehicleId === vehicle.id ? 'Đang xóa...' : 'Xóa'}
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -560,6 +609,20 @@ export default function Profile({
         isOpen={showChangePassword}
         onClose={() => setShowChangePassword(false)}
         onSubmit={handleChangePassword}
+      />
+
+      {/* Xóa xe là thao tác không lùi được — hỏi lại và nói rõ hệ quả. */}
+      <ConfirmModal
+        isOpen={deleteTarget !== null}
+        title="Xóa phương tiện khỏi hồ sơ?"
+        message={
+          deleteTarget
+            ? `Xe ${deleteTarget.licensePlate} (${VEHICLE_TYPE_LABEL[deleteTarget.vehicleType]}) sẽ bị xóa khỏi hồ sơ của bạn. ` +
+              `Thẻ RFID đang gắn với xe (nếu có) sẽ được gỡ ra. Lịch sử gửi xe và hóa đơn cũ vẫn được giữ nguyên.`
+            : ''
+        }
+        onConfirm={handleDeleteVehicle}
+        onCancel={() => setDeleteTarget(null)}
       />
     </div>
   );

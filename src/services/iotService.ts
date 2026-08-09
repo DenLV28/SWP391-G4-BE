@@ -31,7 +31,13 @@ const env: Env =
   (typeof import.meta !== 'undefined' && (import.meta as unknown as { env?: Env }).env) || {};
 
 const WS_URL = env.VITE_IOT_WS_URL?.trim() || '';
-const HTTP_URL = env.VITE_IOT_HTTP_URL?.trim() || '';
+// Mặc định trỏ vào chính backend của hệ thống bằng ĐƯỜNG DẪN TƯƠNG ĐỐI: request
+// đi qua origin đang mở app rồi được Vite proxy sang cổng 4000, nên chạy được cả
+// khi mở qua ngrok (HTTPS) lẫn từ máy khác trong LAN.
+// Trước đây bỏ trống mặc định: không cấu hình VITE_IOT_HTTP_URL thì kênh IoT
+// KHÔNG BAO GIỜ được bật — web luôn hiện "IoT: Ngoại tuyến" và nút Mở/Đóng rào
+// chỉ chạy ở "trạng thái mô phỏng", dù ESP32 đã kết nối backend bình thường.
+const HTTP_URL = env.VITE_IOT_HTTP_URL?.trim() || '/api/iot/scan-events';
 // Simulator only runs when explicitly enabled via VITE_IOT_SIMULATE=true
 const SIMULATE = env.VITE_IOT_SIMULATE?.trim() === 'true';
 

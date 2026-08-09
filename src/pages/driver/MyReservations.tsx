@@ -347,9 +347,11 @@ export default function MyReservations({
                           {reservation.slotCode && (
                             <div className="mt-0.5 text-[13px] text-slate-400">{reservation.floor}</div>
                           )}
-                          {/* Which of the 3 ParkFlow lots this booking belongs to (legacy rows predate the field) */}
+                          {/* Bãi đỗ của lượt gửi. KHÔNG mặc định về một bãi cụ thể khi thiếu dữ liệu:
+                              trước đây chỗ này ghi cứng "ParkFlow Quận 9 - Lò Lu" nên xe đỗ ở
+                              Long Phước vẫn hiện là Quận 9 — sai lệch mà khách không thể biết. */}
                           <div className="mt-0.5 text-[13px] font-medium text-[#1f67db]">
-                            {reservation.parkingLot || 'ParkFlow Quận 9 - Lò Lu'}
+                            {reservation.parkingLot || '—'}
                           </div>
                         </td>
                         <td className="border-t border-slate-100 py-5 pr-6 align-top">
@@ -732,7 +734,7 @@ function ReservationInvoiceModal({
                 {reservation.slotCode ? `${reservation.slotCode} · ` : ''}{reservation.floor}
               </p>
               <p className="mt-0.5 text-[11px] font-medium text-[#1f67db]">
-                {reservation.parkingLot || 'ParkFlow Quận 9 - Lò Lu'}
+                {reservation.parkingLot || '—'}
               </p>
             </div>
             <div className="rounded-xl bg-slate-50 px-3 py-2.5">

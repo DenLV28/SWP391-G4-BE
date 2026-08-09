@@ -10,14 +10,28 @@ export interface MapSlot {
   /** Kích thước sau khi kéo dãn. Bỏ trống → cỡ mặc định của lưới mẫu. */
   w?: number | null;
   h?: number | null;
+  /**
+   * Loại xe THẬT của ô (dbo.parking_slots.vehicle_type). Luôn truyền vào nếu có:
+   * mã ô giờ do Admin tự đặt ('V1', 'VIP3'...) nên KHÔNG thể suy loại xe từ chữ
+   * cái đầu nữa — thiếu trường này thì ô xe máy tên 'V1' sẽ bị hiểu thành ô tô.
+   */
+  vehicleType?: 'car' | 'motorbike' | 'electric vehicle' | null;
 }
 
-// Which vehicle type each slot row serves (derived from code prefix)
+/** Loại xe theo mã ô của LƯỚI MẪU — chỉ dùng khi ô không mang vehicleType thật. */
 export function slotRowType(code: string): 'car' | 'motorbike' | 'ev' {
   const row = code[0];
   if (row === 'B' || row === 'E') return 'motorbike';
   if (row === 'C') return 'ev';
   return 'car'; // A, D
+}
+
+/** VehicleKey của app ('electric vehicle') → khoá nội bộ của sơ đồ ('ev'). */
+function toRowType(v: MapSlot['vehicleType']): 'car' | 'motorbike' | 'ev' | null {
+  if (v === 'motorbike') return 'motorbike';
+  if (v === 'electric vehicle') return 'ev';
+  if (v === 'car') return 'car';
+  return null;
 }
 
 /** Cổng vào/ra do Admin đặt cho từng bãi (dbo.parking_lot_gates). */
@@ -54,8 +68,6 @@ interface Props {
   highlightEmpty?: boolean;
   /** designMode: kéo thả xong một ô — trả về toạ độ mới trong hệ toạ độ SVG. */
   onMoveSlot?: (code: string, x: number, y: number) => void;
-  /** designMode: kéo dãn ô — trả về kích thước mới trong hệ toạ độ SVG. */
-  onResizeSlot?: (code: string, w: number, h: number) => void;
 }
 
 // ── Layout constants — generously spaced so slots never crowd each other ──
@@ -72,6 +84,39 @@ const BC_Y0 = 142;
 const D_H = 50;
 const D_STEP = 68; // 18px gap between column D slots
 const D_Y0 = 150;
+
+/**
+ * KÍCH THƯỚC Ô ĐỖ THEO LOẠI XE — nguồn chân lý duy nhất cho mọi sơ đồ.
+ *
+ * Thứ tự to nhỏ phản ánh chỗ xe thật sự chiếm:
+ *   nhỏ nhất → Xe máy / Xe máy điện      54 × 40
+ *   vừa      → Ô tô 4-7 chỗ (Xăng)       62 × 46
+ *   lớn nhất → Ô tô 4-7 chỗ (Điện / EV)  68 × 52   (cần thêm chỗ cho trụ sạc)
+ *
+ * Trước đây ô tô xăng lại là ô to nhất còn ô tô điện chỉ nhỉnh hơn xe máy —
+ * ngược với thực tế.
+ *
+ * Các số này bị chặn trên bởi khoảng cách giữa các vị trí trong lưới mẫu:
+ * hàng A/E cách nhau ROW_STEP = 70 nên bề ngang tối đa là 68 (chừa 2px);
+ * cột B/C cách nhau BC_STEP = 60 nên chiều cao tối đa là 52 (chừa 8px).
+ * Tăng quá mức này thì các ô cạnh nhau sẽ đè lên nhau.
+ */
+const MOTORBIKE_W = ROW_W, MOTORBIKE_H = ROW_H;   // 54 × 40
+const CAR_W = 62, CAR_H = 46;                     // xăng
+const EV_W = 68, EV_H = 52;                       // điện — lớn nhất
+
+export const VEHICLE_SLOT_SIZE: Record<'car' | 'motorbike' | 'electric vehicle', { w: number; h: number }> = {
+  motorbike: { w: MOTORBIKE_W, h: MOTORBIKE_H },
+  car: { w: CAR_W, h: CAR_H },
+  'electric vehicle': { w: EV_W, h: EV_H },
+};
+
+/** Bản đối chiếu theo khoá nội bộ của sơ đồ ('ev' thay cho 'electric vehicle'). */
+const SIZE_BY_ROW_TYPE: Record<'car' | 'motorbike' | 'ev', { w: number; h: number }> = {
+  motorbike: VEHICLE_SLOT_SIZE.motorbike,
+  car: VEHICLE_SLOT_SIZE.car,
+  ev: VEHICLE_SLOT_SIZE['electric vehicle'],
+};
 
 const COL_B_X = 10;
 const COL_C_X = 604;
@@ -216,15 +261,12 @@ export default function ParkingFloorMap({
   onToggleSlot,
   highlightEmpty = false,
   onMoveSlot,
-  onResizeSlot,
 }: Props) {
   const spaceDefs = useMemo(() => buildSpaces(level), [level]);
   const gateList = gates && gates.length ? gates : DEFAULT_GATES;
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Ô đang kéo — giữ trong ref để không re-render mỗi lần con trỏ nhích.
   const dragRef = useRef<{ code: string; dx: number; dy: number } | null>(null);
-  // Ô đang kéo dãn: giữ góc trái-trên cố định, con trỏ điều khiển góc phải-dưới.
-  const resizeRef = useRef<{ code: string; x0: number; y0: number } | null>(null);
 
   const enriched = useMemo(() => {
     const byCode = new Map(slots?.map((s) => [s.code, s]) ?? []);
@@ -232,32 +274,57 @@ export default function ParkingFloorMap({
 
     // Ô có mã ngoài lưới mẫu (Admin tự đặt, vd. 'VIP1') không có sẵn ô trong
     // `spaceDefs` — dựng thêm def từ chính toạ độ của nó.
+    //
+    // BẮT BUỘC phải có toạ độ thật. DB còn các hàng cũ ('T1-A-01', 'B1-A-02',
+    // 'T2-B-01'...) mà caller tách mã bằng `slotCode.split('-').pop()` nên đều
+    // ra '01'/'02' — không thuộc lưới và không có toạ độ. Nếu vẫn vẽ chúng ở
+    // giữa bãi làm mặc định thì cả loạt sẽ chồng lên nhau ngay trên RAMP, tạo
+    // ra "ô đỗ ảo 01". Không có toạ độ nghĩa là không biết đặt ở đâu → không vẽ.
+    const seen = new Set<string>();
     const extraDefs: SpaceDef[] = (slots ?? [])
-      .filter((s) => !gridCodes.has(s.code))
+      .filter((s) => {
+        if (gridCodes.has(s.code)) return false;
+        if (typeof s.x !== 'number' || typeof s.y !== 'number') return false;
+        if (seen.has(s.code)) return false;
+        seen.add(s.code);
+        return true;
+      })
       .map((s) => ({
         code: s.code,
-        x: typeof s.x === 'number' ? s.x : VW / 2,
-        y: typeof s.y === 'number' ? s.y : BH / 2,
+        x: s.x as number,
+        y: s.y as number,
         w: ROW_W,
         h: ROW_H,
       }));
 
     return [...spaceDefs, ...extraDefs].map((def) => {
       const slot = byCode.get(def.code);
-      const rowType = slotRowType(def.code);
+      // Ưu tiên loại xe THẬT của ô; chỉ suy từ mã khi ô không mang thông tin đó
+      // (vị trí trống của lưới mẫu, hoặc caller cũ chưa truyền vehicleType).
+      const rowType = toRowType(slot?.vehicleType) ?? slotRowType(def.code);
       const hiddenByArea =
         areaMode === 'car' ? (rowType !== 'car' && rowType !== 'ev') :
         areaMode === 'motorbike' ? rowType !== 'motorbike' :
         false;
       const dimmedByFilter = filterVehicleType != null ? rowType !== filterVehicleType : false;
+      // KÍCH THƯỚC THEO LOẠI XE, không theo dãy của lưới mẫu.
+      //
+      // Lưới mẫu gán cỡ cứng theo cột (A/E nhỏ, B/C vừa, D cao). Nhưng Admin đổi
+      // được loại xe của từng ô, nên một ô xe máy nằm ở cột D vẫn bị vẽ to bằng
+      // ô tô — cùng một loại xe lại có cỡ khác nhau tùy chỗ nó đứng. Lấy cỡ theo
+      // loại xe thì mọi sơ đồ trong web (đặt chỗ, staff, manager, trình thiết kế)
+      // đều nhất quán.
+      const size = SIZE_BY_ROW_TYPE[rowType];
       return {
         ...def,
-        // Ô đã được kéo thả/kéo dãn thì dùng giá trị riêng, chưa thì giữ nguyên
-        // vị trí và kích thước của lưới mẫu.
+        // Ô đã được kéo thả thì dùng toạ độ riêng, chưa thì theo lưới mẫu.
         x: typeof slot?.x === 'number' ? slot.x : def.x,
         y: typeof slot?.y === 'number' ? slot.y : def.y,
-        w: typeof slot?.w === 'number' ? slot.w : def.w,
-        h: typeof slot?.h === 'number' ? slot.h : def.h,
+        // Kích thước KHÔNG nhận giá trị riêng của từng ô nữa. Tính năng kéo dãn
+        // đã bị bỏ; còn tôn trọng w/h cũ trong DB thì hai ô cùng loại xe vẫn có
+        // thể khác cỡ — đúng thứ cần loại bỏ.
+        w: size.w,
+        h: size.h,
         id: slot?.id ?? `virtual-${def.code}`,
         status: slot?.status ?? 'Available' as MapSlot['status'],
         isReal: !!slot,
@@ -289,24 +356,7 @@ export default function ParkingFloorMap({
     dragRef.current = { code: sp.code, dx: p.x - sp.x, dy: p.y - sp.y };
   };
 
-  const handleResizeStart = (e: React.PointerEvent, sp: { code: string; x: number; y: number }) => {
-    if (!designMode || !onResizeSlot) return;
-    // Chặn nổi bọt để không kích hoạt kéo-di-chuyển của chính ô này.
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    resizeRef.current = { code: sp.code, x0: sp.x, y0: sp.y };
-  };
-
   const handleDragMove = (e: React.PointerEvent) => {
-    const r = resizeRef.current;
-    if (r) {
-      const p = toSvgPoint(e.clientX, e.clientY);
-      // Kẹp trùng giới hạn với backend (24-300 × 20-240) và không tràn khỏi bãi.
-      const w = Math.max(24, Math.min(300, Math.min(VW - 8, p.x) - r.x0));
-      const h = Math.max(20, Math.min(240, Math.min(BH - 8, p.y) - r.y0));
-      onResizeSlot?.(r.code, Math.round(w), Math.round(h));
-      return;
-    }
     const d = dragRef.current;
     if (!d) return;
     const p = toSvgPoint(e.clientX, e.clientY);
@@ -316,7 +366,7 @@ export default function ParkingFloorMap({
     onMoveSlot?.(d.code, Math.round(x), Math.round(y));
   };
 
-  const handleDragEnd = () => { dragRef.current = null; resizeRef.current = null; };
+  const handleDragEnd = () => { dragRef.current = null; };
 
   return (
     <svg
@@ -445,45 +495,33 @@ export default function ParkingFloorMap({
             c = { fill: '#ffffff', stroke: '#cbd5e1', text: '#94a3b8', dashArray: '4,3' };
           }
           return (
-            <g key={sp.code}>
-              <g
-                onClick={() => { if (!dragRef.current && !resizeRef.current) onToggleSlot?.(sp.code); }}
-                // Chỉ ô ĐÃ CÓ mới kéo được; vị trí trống của lưới mẫu thì không.
-                onPointerDown={sp.isReal ? (e) => handleDragStart(e, sp) : undefined}
-                style={sp.isReal && onMoveSlot ? { cursor: 'grab' } : undefined}
-              >
-                <SlotCard sp={{ ...sp, status: 'Available' }} c={c} clickable />
-              </g>
-              {/* Tay nắm kéo dãn — chỉ hiện ở ô ĐANG CHỌN để sơ đồ khỏi rối */}
-              {sp.isReal && isSel && onResizeSlot && (
-                <g
-                  onPointerDown={(e) => handleResizeStart(e, sp)}
-                  style={{ cursor: 'nwse-resize' }}
-                >
-                  {/* Vùng bắt chuột rộng hơn phần vẽ để dễ trúng */}
-                  <rect
-                    x={sp.x + sp.w - 11} y={sp.y + sp.h - 11} width="20" height="20"
-                    fill="transparent"
-                  />
-                  <rect
-                    x={sp.x + sp.w - 7} y={sp.y + sp.h - 7} width="11" height="11"
-                    rx="2.5" fill="#ffffff" stroke="#2563eb" strokeWidth="1.6"
-                  />
-                  <line
-                    x1={sp.x + sp.w - 4.5} y1={sp.y + sp.h + 1.5}
-                    x2={sp.x + sp.w + 1.5} y2={sp.y + sp.h - 4.5}
-                    stroke="#2563eb" strokeWidth="1.3" strokeLinecap="round"
-                  />
-                </g>
-              )}
+            <g
+              key={sp.code}
+              onClick={() => { if (!dragRef.current) onToggleSlot?.(sp.code); }}
+              // Chỉ ô ĐÃ CÓ mới kéo được; vị trí trống của lưới mẫu thì không.
+              onPointerDown={sp.isReal ? (e) => handleDragStart(e, sp) : undefined}
+              style={sp.isReal && onMoveSlot ? { cursor: 'grab' } : undefined}
+            >
+              <SlotCard sp={{ ...sp, status: 'Available' }} c={c} clickable />
             </g>
           );
         }
 
-        // Có kho ô đỗ thật (mỗi bãi sức chứa khác nhau) → vị trí không tồn tại
-        // trong bãi thì không vẽ. Không truyền slots (trang demo công khai) →
-        // vẫn vẽ đủ mặt bằng như cũ.
-        if ((slots?.length ?? 0) > 0 && !sp.isReal) return null;
+        // Ô KHÔNG CÓ THẬT thì không được vẽ như ô thật.
+        //
+        // Điều kiện cũ là `slots.length > 0` nên bãi có 0 ô lại lọt qua: sơ đồ
+        // vẽ trọn lưới mẫu 36 vị trí thành các ô xanh "còn trống", trông y hệt
+        // ô thật. Staff thấy sơ đồ đầy ô nhưng bộ đếm báo 0/0 và không hiểu vì
+        // sao — chính là mâu thuẫn trong ảnh báo lỗi.
+        //
+        // Giờ chỉ cần caller có truyền mảng `slots` (tức đang hiển thị dữ liệu
+        // thật) là chỉ vẽ ô thật, kể cả mảng rỗng. Trang demo công khai không
+        // truyền `slots` nên vẫn vẽ đủ mặt bằng như cũ.
+        //
+        // `designMode` giữ NGUYÊN điều kiện cũ: trình thiết kế của Admin có
+        // quy tắc hiển thị riêng, không phải chỗ cần sửa ở đây.
+        const hideVirtual = designMode ? (slots?.length ?? 0) > 0 : slots !== undefined;
+        if (hideVirtual && !sp.isReal) return null;
         const isSelected = selectedId === sp.id;
         const isAvail = sp.status === 'Available';
         const clickable = interactive && !sp.dimmedByFilter && (issueMode || isAvail);
@@ -495,6 +533,23 @@ export default function ParkingFloorMap({
           </g>
         );
       })}
+
+      {/* Bãi thật sự chưa có ô đỗ nào — nói thẳng ra giữa mặt bằng, thay vì để
+          một khoảng trống khiến staff tưởng sơ đồ bị lỗi tải. */}
+      {slots !== undefined && slots.length === 0 && !designMode && (
+        <g>
+          <rect
+            x={VW / 2 - 190} y={BH / 2 - 34} width="380" height="68" rx="12"
+            fill="#fffbeb" stroke="#fcd34d" strokeWidth="1.5"
+          />
+          <text x={VW / 2} y={BH / 2 - 8} textAnchor="middle" fill="#b45309" fontSize="13" fontWeight="800">
+            Bãi này chưa có ô đỗ nào
+          </text>
+          <text x={VW / 2} y={BH / 2 + 14} textAnchor="middle" fill="#92400e" fontSize="10.5">
+            Quản trị cần vào "Quản lý bãi đỗ" để tạo sơ đồ ô cho bãi.
+          </text>
+        </g>
+      )}
 
       {/* ── Corner accent bolts ── */}
       {[[18, 18], [VW - 18, 18], [18, BH - 18], [VW - 18, BH - 18]].map(([bx, by], i) => (

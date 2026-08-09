@@ -1,11 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { Ticket, Receipt, Car, Clock, MapPin, CreditCard, Hash, DoorOpen, Trash2, Building2 } from 'lucide-react';
-import { User, ParkingSession, Reservation, Feedback, SavedVehicle, PricingRule, Slot } from '../../data/mockData';
+import { User, ParkingSession, Reservation, Feedback, SavedVehicle, PricingRule, Slot, Payment } from '../../data/mockData';
 import { getLotCatalog } from '../../utils/parkingLots';
 import StatCard from '../../components/StatCard';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
-import { perVisitOverstay, buildCheckedInVehicles } from '../../utils/reservationPricing';
+import { perVisitOverstay, buildCheckedInVehicles, isReservationPaid, overstayDue } from '../../utils/reservationPricing';
 
 const vehicleLabelMap: Record<string, string> = {
   car: 'Ô tô 4-7 chỗ (Xăng)', motorbike: 'Xe máy / Xe máy điện', 'electric vehicle': 'Ô tô 4-7 chỗ (Điện)',
@@ -41,7 +41,7 @@ function elapsedSince(checkInStamp: string, nowMs: number): string {
   return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
 }
 
-export default function MyParking({ user, setView, currentSession, activeSessions = [], reservations, unpaidTotal, unpaidIsEstimate, unpaidSessionAmount = 0, unpaidReservationAmount = 0, unpaidOtherAmount = 0, feedbacks, savedVehicles, pricingRules = [], slots = [], onClearCheckedIn }: {
+export default function MyParking({ user, setView, currentSession, activeSessions = [], reservations, unpaidTotal, unpaidIsEstimate, unpaidSessionAmount = 0, unpaidReservationAmount = 0, unpaidOtherAmount = 0, feedbacks, savedVehicles, pricingRules = [], slots = [], payments = [], onClearCheckedIn }: {
   user: User;
   setView: (view: string) => void;
   currentSession: ParkingSession;
@@ -58,6 +58,8 @@ export default function MyParking({ user, setView, currentSession, activeSession
   pricingRules?: PricingRule[];
   /** Kho ô đỗ — dùng để suy ra tên bãi cho xe vãng lai (không có reservation.parkingLot). */
   slots?: Slot[];
+  /** Giao dịch của tài khoản — để biết vé nào đã trả tiền, khỏi tính nợ lại. */
+  payments?: Payment[];
   onClearCheckedIn?: (ids: string[]) => void;
 }) {
   const [confirmClear, setConfirmClear] = useState(false);
@@ -209,7 +211,12 @@ export default function MyParking({ user, setView, currentSession, activeSession
                 // Phí tạm tính CHẠY REAL-TIME: tính lại theo giờ hiện tại mỗi giây
                 // qua perVisitOverstay (cộng phụ phí quá giờ nếu có) thay vì đứng
                 // yên ở con số quote lúc đặt/check-in.
-                const estimatedFee = perVisitOverstay(res, pricingRules, nowMs).total;
+                // Đã thanh toán → chỉ còn nợ phụ phí phát sinh (qua đêm), không
+                // hiện lại giá vé đã trả. Dùng đúng công thức với "Số dư chưa
+                // thanh toán" ở App.tsx nên hai con số luôn khớp nhau.
+                const feeInfo = perVisitOverstay(res, pricingRules, nowMs);
+                const alreadyPaid = isReservationPaid(res, payments);
+                const estimatedFee = overstayDue(feeInfo, alreadyPaid);
                 const entryGate = matchedSession?.entryGate ?? '—';
 
                 return (
@@ -262,8 +269,17 @@ export default function MyParking({ user, setView, currentSession, activeSession
                       <div className="flex items-center gap-1.5 text-slate-600">
                         <CreditCard className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                         <div>
-                          <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">Phí tạm tính</span>
-                          <span className="font-bold text-rose-600 tabular-nums">{estimatedFee.toLocaleString()} VND</span>
+                          <span className="text-slate-400 block font-semibold text-[9px] uppercase leading-tight">
+                            {alreadyPaid && estimatedFee === 0 ? 'Thanh toán' : 'Phí tạm tính'}
+                          </span>
+                          {alreadyPaid && estimatedFee === 0 ? (
+                            <span className="font-bold text-emerald-600">Đã thanh toán</span>
+                          ) : (
+                            <span className="font-bold text-rose-600 tabular-nums">
+                              {estimatedFee.toLocaleString()} VND
+                              {alreadyPaid && <span className="ml-1 text-[9px] font-semibold text-slate-400">(phụ phí)</span>}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5 text-slate-600">

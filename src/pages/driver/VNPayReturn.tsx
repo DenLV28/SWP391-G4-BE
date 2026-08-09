@@ -15,7 +15,9 @@ export type VNPayCheckoutContext = {
 export type PendingMonthlyBooking = {
   reservationCode: string;
   reservationType: 'Fixed-time' | 'Flexible';
-  slotAssignmentMode: 'Auto';
+  slotAssignmentMode: 'Auto' | 'Manual';
+  /** Ô khách đã bấm chọn trên sơ đồ — phải giữ qua vòng thanh toán VNPay. */
+  slotCode?: string;
   vehicleType: string;
   licensePlate: string;
   date: string;

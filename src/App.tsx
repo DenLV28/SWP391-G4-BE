@@ -68,6 +68,7 @@ import {
   createVehicle,
   updateVehicle as apiUpdateVehicle,
   setDefaultVehicle as apiSetDefaultVehicle,
+  deleteVehicle as apiDeleteVehicle,
 } from "./services/vehicleService";
 import {
   fetchReservationsByUser,
@@ -116,7 +117,7 @@ import {
 } from "./services/sessionStore";
 import userService, { UserRecord } from "./services/userService";
 import { fixMojibake, nowLocalStr, localDateISO } from "./utils/helpers";
-import { minutesSinceCreated, SELF_CANCEL_WINDOW_MINUTES, perVisitOverstay, buildCheckedInVehicles, isPaymentVoided, addOneMonth, findActiveMonthlyReservation } from "./utils/reservationPricing";
+import { minutesSinceCreated, SELF_CANCEL_WINDOW_MINUTES, perVisitOverstay, buildCheckedInVehicles, isPaymentVoided, isReservationPaid, overstayDue, addOneMonth, findActiveMonthlyReservation } from "./utils/reservationPricing";
 import { fetchSlotStatuses, updateSlotStatus, subscribeToSlotEvents, forceClearSlot } from "./services/slotService";
 import { fetchPricingRules } from "./services/pricingService";
 import { fetchParkingLotStatuses, updateParkingLotStatus, type ParkingLotStatus } from "./services/parkingLotService";
@@ -770,9 +771,12 @@ export default function App() {
     if (isDriver) {
       const uid = currentUser.id;
 
+      // Fetch xong là DB nói gì nghe nấy — danh sách RỖNG cũng là câu trả lời
+      // hợp lệ. Chốt `if (length === 0) return` cũ lẫn lộn "request hỏng" với
+      // "tài khoản này không còn đặt chỗ nào", nên đơn/xe đã bị xóa khỏi DB vẫn
+      // hiện mãi ở trang khách. Mất mạng đã có .catch() giữ cache.
       fetchReservationsByUser(uid)
         .then((apiRes) => {
-          if (apiRes.length === 0) return;
           const visible = apiRes.filter((r) => !hiddenResIds.current.has(r.id));
           setReservations((prev) => {
             const others = prev.filter((r) => r.userId !== uid);
@@ -783,7 +787,6 @@ export default function App() {
 
       fetchPaymentsByUser(uid)
         .then((apiPay) => {
-          if (apiPay.length === 0) return;
           setPayments((prev) => {
             const others = prev.filter((p) => p.userId !== uid);
             return [...apiPay, ...others];
@@ -844,18 +847,19 @@ export default function App() {
     }
 
     if (isStaffOrManager) {
+      // Gọi API THÀNH CÔNG thì DB là chân lý — kể cả khi trả về danh sách rỗng.
+      //
+      // Trước đây có chốt `if (length === 0) return;` nhằm "giữ cache khi mất
+      // mạng", nhưng nó lẫn lộn hai việc khác hẳn nhau: *request hỏng* và
+      // *DB thật sự không còn bản ghi nào*. Hậu quả là xe/đặt chỗ đã bị xóa
+      // khỏi DB vẫn hiện mãi trên màn hình staff, không cách nào biến mất.
+      // Mất mạng đã có nhánh .catch() lo — ở đó cache mới được giữ.
       fetchAllReservations()
-        .then((apiRes) => {
-          if (apiRes.length === 0) return;
-          setReservations(apiRes);
-        })
+        .then((apiRes) => setReservations(apiRes))
         .catch(() => {});
 
       fetchAllFeedbacks()
-        .then((apiFb) => {
-          if (apiFb.length === 0) return;
-          setFeedbacks(apiFb);
-        })
+        .then((apiFb) => setFeedbacks(apiFb))
         .catch(() => {});
 
       fetchAllPayments()
@@ -886,19 +890,16 @@ export default function App() {
             fetchReservationsByUser(uid),
             fetchFeedbacksByUser(uid),
           ]);
-          if (apiRes.length > 0) {
-            const visible = apiRes.filter((r) => !hiddenResIds.current.has(r.id));
-            setReservations((prev) => {
-              const others = prev.filter((r) => r.userId !== uid);
-              return [...visible, ...others];
-            });
-          }
-          if (apiFb.length > 0) {
-            setFeedbacks((prev) => {
-              const others = prev.filter((f) => f.userId !== uid);
-              return [...apiFb, ...others];
-            });
-          }
+          // Như trên: rỗng cũng là câu trả lời hợp lệ, không phải dấu hiệu lỗi.
+          const visible = apiRes.filter((r) => !hiddenResIds.current.has(r.id));
+          setReservations((prev) => {
+            const others = prev.filter((r) => r.userId !== uid);
+            return [...visible, ...others];
+          });
+          setFeedbacks((prev) => {
+            const others = prev.filter((f) => f.userId !== uid);
+            return [...apiFb, ...others];
+          });
           // Heal a stale local session: the DB may hold an Active session this
           // tab isn't tracking (e.g. it was restored/created elsewhere after this
           // page load nulled currentSession). Only adopt when we're not already
@@ -922,9 +923,11 @@ export default function App() {
             fetchAllFeedbacks(),
             fetchAllPayments(),
           ]);
-          if (apiRes.length > 0) setReservations(apiRes);
-          if (apiFb.length > 0) setFeedbacks(apiFb);
-          if (apiPay.length > 0) setPayments(apiPay);
+          // Như trên: fetch xong là DB nói gì nghe nấy, rỗng cũng là một câu
+          // trả lời hợp lệ. Lỗi mạng rơi vào catch bên dưới, cache giữ nguyên.
+          setReservations(apiRes);
+          setFeedbacks(apiFb);
+          setPayments(apiPay);
         }
       } catch {
         // API không khả dụng — tiếp tục chạy với dữ liệu đã cache
@@ -1001,29 +1004,33 @@ export default function App() {
         const remoteUsers = await userService.fetchUsers();
         const mappedUsers = remoteUsers.map(toAppUser);
 
-        // Merge API users into local users — preserve local IDs so every
-        // userId-based filter (vehicles, reservations, payments) keeps working.
+        // DB là nguồn chân lý cho danh sách người dùng: lấy đúng những hàng API
+        // trả về. Trước đây hàm này chỉ THÊM/CẬP NHẬT chứ không bao giờ LOẠI, nên
+        // các tài khoản mock trong initialUsers (driver@example.com,
+        // locked@example.com, admin@example.com...) tồn tại vĩnh viễn trong
+        // "Quản lý người dùng" dù không có trong DB — sửa/xóa chúng không lưu
+        // được vì backend không có hàng tương ứng.
+        //
+        // Vẫn giữ ID cục bộ khi email trùng, vì mọi bộ lọc theo userId (xe, đặt
+        // chỗ, thanh toán) đang bám vào ID đó.
         setUsers((prev) => {
-          const merged = [...prev];
-          mappedUsers.forEach((apiUser) => {
-            const idx = merged.findIndex(
+          // API trả rỗng (DB trống hoặc lỗi bất thường) → giữ nguyên, không xoá
+          // sạch danh sách đang hiển thị. Lỗi mạng đã throw ở trên nên không tới đây.
+          if (!mappedUsers.length) return prev;
+          return mappedUsers.map((apiUser) => {
+            const local = prev.find(
               (u) => u.email.toLowerCase() === apiUser.email.toLowerCase(),
             );
-            if (idx >= 0) {
-              // Refresh live fields but keep the local ID.
-              merged[idx] = {
-                ...merged[idx],
-                fullName: apiUser.fullName,
-                phone: apiUser.phone,
-                role: apiUser.role,
-                status: apiUser.status,
-                assignedParkingLot: apiUser.assignedParkingLot,
-              };
-            } else {
-              merged.push(apiUser);
-            }
+            if (!local) return apiUser;
+            return {
+              ...local,
+              fullName: apiUser.fullName,
+              phone: apiUser.phone,
+              role: apiUser.role,
+              status: apiUser.status,
+              assignedParkingLot: apiUser.assignedParkingLot,
+            };
           });
-          return merged;
         });
 
         if (currentUser) {
@@ -1125,6 +1132,37 @@ export default function App() {
   // tại thời điểm đó `slots` trong closure có thể vẫn là bản cache cũ từ
   // localStorage vì App vừa mount lại, effect fetch tươi chưa kịp chạy xong).
   // Không có override thì dùng state hiện tại như trước giờ.
+  /**
+   * Quản lý chấm dứt một thẻ tháng.
+   *
+   * Chỉ vai trò Quản lý (và Quản trị) mới gọi được — backend chặn nhân viên
+   * bằng 403 MONTHLY_CANCEL_REQUIRES_MANAGER, vì thẻ tháng là hợp đồng đã thu
+   * tiền trọn tháng chứ không phải đơn gửi lượt thường ngày.
+   *
+   * Ô đỗ của thẻ đang ở 'Locked' (giữ riêng cho khách) → trả về 'Available'
+   * cho bãi dùng lại; các đường hủy khác cũng làm đúng như vậy.
+   */
+  const handleCancelMonthlyCard = (id: string) => {
+    const res = reservations.find((r) => r.id === id);
+    if (!res) return;
+    setReservations((prev) => prev.map((r) => (r.id === id ? { ...r, status: 'Cancelled' } : r)));
+    apiUpdateReservation(id, { status: 'Cancelled', cancelledBy: 'staff', staffId: currentUser?.id })
+      .then(() => {
+        addToast(`Đã hủy thẻ tháng ${res.reservationCode} — ô ${res.slotCode || '—'} được trả lại cho bãi.`, 'success');
+        if (res.slotCode) {
+          setSlots((prev) => prev.map((s) => (s.slotCode === res.slotCode ? { ...s, status: 'Available' } : s)));
+          updateSlotStatus(res.slotCode, 'Available').catch(() => {});
+        }
+      })
+      .catch((e: Error & { status?: number }) => {
+        setReservations((prev) => prev.map((r) => (r.id === id ? { ...r, status: res.status } : r)));
+        addToast(
+          e?.status === 403 && e.message ? e.message : 'Không thể hủy thẻ tháng — vui lòng thử lại.',
+          'error',
+        );
+      });
+  };
+
   const handleAddReservation = (newRes: any, slotsOverride?: Slot[]): Reservation | null => {
     const slotPool = slotsOverride ?? slots;
     // A physical vehicle can't be booked/parked in two places at once — block a
@@ -1178,6 +1216,24 @@ export default function App() {
 
     const code = `RSV-${Math.floor(1000 + Math.random() * 9000)}`;
     let assignedSlotCode = newRes.slotCode;
+
+    // Ô khách tự chọn trên sơ đồ được TÔN TRỌNG, chỉ xếp lại khi nó vừa bị
+    // người khác chiếm mất (gói tháng: khách rời đi thanh toán VNPay rồi mới
+    // quay lại, ô có thể đã đổi chủ trong lúc đó).
+    if (assignedSlotCode) {
+      const chosen = slotPool.find((s) => s.slotCode === assignedSlotCode);
+      if (chosen && chosen.status !== "Available") {
+        const replacement = slotPool.find(
+          (s) => s.vehicleType === newRes.vehicleType && s.status === "Available",
+        );
+        assignedSlotCode = replacement ? replacement.slotCode : assignedSlotCode;
+        if (replacement) {
+          alert(
+            `Ô ${chosen.slotCode} vừa có người khác đặt mất trong lúc bạn thanh toán. Bạn được xếp sang ô trống ${replacement.slotCode}.`,
+          );
+        }
+      }
+    }
 
     if (!assignedSlotCode && newRes.slotAssignmentMode === "Auto") {
       const availableSlot = slotPool.find(
@@ -1839,8 +1895,21 @@ export default function App() {
             prev.map((v) => (v.id === localVehicle.id ? saved : v)),
           );
         })
-        .catch(() => {
-          // API unavailable — localStorage copy remains.
+        .catch((e: Error & { status?: number; code?: string }) => {
+          // Backend TỪ CHỐI (409 trùng biển+loại / đã có chính chủ) hoặc HOÃN
+          // (202 xe đang đỗ, sẽ chuyển chủ khi ra bãi) → gỡ bản ghi lạc quan.
+          // Giữ lại thì hồ sơ hiện một chiếc xe chưa thuộc về mình: đặt chỗ hay
+          // tra cứu về sau đều không khớp.
+          //
+          // Lỗi mạng (không có status) thì vẫn giữ bản cục bộ như trước, để
+          // mất kết nối tạm thời không làm khách mất công nhập lại.
+          if (e?.status) {
+            setSavedVehicles((prev) => prev.filter((v) => v.id !== localVehicle.id));
+            addToast(
+              e.message || 'Không thể thêm phương tiện.',
+              e.code === 'OWNERSHIP_PENDING' ? 'info' : 'error',
+            );
+          }
         });
     }
     return true;
@@ -1862,6 +1931,24 @@ export default function App() {
       // API unavailable — keep the optimistic local update instead of reverting,
       // matching handleAddVehicle's offline-friendly behavior.
       return { ok: true };
+    }
+  };
+
+  /**
+   * Xóa hẳn một xe khỏi hồ sơ VÀ khỏi dbo.vehicles.
+   *
+   * KHÔNG xóa lạc quan như sửa/thêm: xóa là thao tác không lùi được, và backend
+   * có thể từ chối (409 xe đang đỗ trong bãi). Chờ server xác nhận rồi mới bỏ
+   * khỏi danh sách; hỏng thì giữ nguyên và trả lý do cho trang Hồ sơ hiển thị.
+   */
+  const handleDeleteVehicle = async (vehicleId: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      await apiDeleteVehicle(vehicleId);
+      setSavedVehicles((prev) => prev.filter((v) => v.id !== vehicleId));
+      return { ok: true };
+    } catch (e) {
+      const err = e as Error;
+      return { ok: false, error: err?.message || 'Không thể xóa phương tiện.' };
     }
   };
 
@@ -2213,7 +2300,11 @@ export default function App() {
       const myReservations = reservations.filter((r) => r.userId === currentUser.id);
       const checkedIn = buildCheckedInVehicles(myReservations, driverActiveSessions);
       for (const res of checkedIn) {
-        sessionAmount += perVisitOverstay(res, pricingRules, Date.now()).total;
+        const fee = perVisitOverstay(res, pricingRules, Date.now());
+        // Vé ĐÃ thanh toán chỉ còn nợ phần phụ phí phát sinh thêm (qua đêm),
+        // KHÔNG nợ lại giá vé gốc. Trước đây luôn cộng `fee.total` nên khách đã
+        // trả tiền vẫn thấy nguyên số đó ở "Số dư chưa thanh toán".
+        sessionAmount += overstayDue(fee, isReservationPaid(res, payments));
         hasEstimate = true;
       }
     }
@@ -2461,7 +2552,6 @@ export default function App() {
                 <RegisterPage
                   onRegister={handleRegister}
                   setView={setView}
-                  users={users}
                 />
               )}
             </main>
@@ -2584,6 +2674,7 @@ export default function App() {
             onAssignStaff={handleAssignStaffToLot}
             lotStatuses={lotStatuses}
             onUpdateLotStatus={handleUpdateLotStatus}
+            onCancelMonthlyCard={handleCancelMonthlyCard}
           />
         </div>
       );
@@ -2624,14 +2715,23 @@ export default function App() {
                   );
                   addToast('Không thể xác nhận đặt chỗ — bãi đỗ không thuộc phân công của bạn.', 'error');
                 });
-              // Slot becomes Reserved (yellow) once staff confirms the booking
+              // Staff xác nhận xong thì ô đổi trạng thái ngay.
+              //
+              // THẺ THÁNG → 'Locked' ("Xe tháng"), KHÔNG phải 'Reserved'
+              // ("Đã đặt"). "Đã đặt" mang nghĩa giữ chỗ cho một lượt gửi sắp
+              // tới rồi trả lại; còn ô của thẻ tháng thuộc về khách suốt cả
+              // tháng, xe ra vào bao nhiêu lần cũng không ai được đặt vào đó.
+              // Đường xe tháng RA bãi (GateControl) đã trả ô về 'Locked' từ
+              // trước — chỉ riêng lúc xác nhận là còn đặt nhầm 'Reserved',
+              // khiến ô nhấp nháy qua lại giữa hai ý nghĩa khác hẳn nhau.
               if (res?.slotCode) {
+                const nextStatus = res.note === 'Theo tháng' ? 'Locked' : 'Reserved';
                 setSlots((prev) =>
                   prev.map((s) =>
-                    s.slotCode === res.slotCode ? { ...s, status: "Reserved" } : s,
+                    s.slotCode === res.slotCode ? { ...s, status: nextStatus } : s,
                   ),
                 );
-                updateSlotStatus(res.slotCode, 'Reserved').catch(() => {});
+                updateSlotStatus(res.slotCode, nextStatus).catch(() => {});
               }
             }}
             onCancelReservation={(id) => {
@@ -2643,40 +2743,55 @@ export default function App() {
               // staffId để backend TỰ kiểm tra staff có đúng bãi của đặt chỗ
               // không (không chỉ tin bộ lọc UI) — server chặn (403) nếu lệch bãi.
               apiUpdateReservation(id, { status: 'Cancelled', cancelledBy: 'staff', staffId: currentUser?.id })
-                .catch(() => {
+                .then(() => {
+                  // CHỈ trả ô khi server ĐÃ THẬT SỰ hủy đặt chỗ.
+                  //
+                  // Trước đây khối này nằm ngoài promise nên chạy ngay lập tức,
+                  // bất kể server trả về gì. Nhân viên bấm hủy một thẻ tháng →
+                  // server từ chối (403) → đặt chỗ được hoàn tác nhưng ô đỗ thì
+                  // đã bị giải phóng cả ở giao diện lẫn trong DB. Kết quả đúng
+                  // như báo lỗi: "hủy ô đỗ đó nhưng xe tháng vẫn còn hiển thị"
+                  // — thẻ vẫn sống mà chỗ của nó thì đã bị cho người khác đặt.
+                  if (res.slotCode) {
+                    setSlots((prev) =>
+                      prev.map((s) =>
+                        s.slotCode === res.slotCode ? { ...s, status: "Available" } : s,
+                      ),
+                    );
+                    updateSlotStatus(res.slotCode, 'Available').catch(() => {});
+                  }
+                  setAreas((prev) =>
+                    prev.map((a) =>
+                      a.areaName === res.area
+                        ? { ...a, availableSlots: a.availableSlots + 1, reservedSlots: Math.max(0, a.reservedSlots - 1) }
+                        : a,
+                    ),
+                  );
+                  setFloors((prev) =>
+                    prev.map((f) =>
+                      f.floorName === res.floor
+                        ? { ...f, availableSlots: f.availableSlots + 1, reservedSlots: Math.max(0, f.reservedSlots - 1) }
+                        : f,
+                    ),
+                  );
+                })
+                .catch((e: Error & { status?: number }) => {
                   // Bị chặn hoặc lỗi mạng → hoàn tác trạng thái lạc quan đã set ở trên.
                   setReservations((prev) =>
                     prev.map((r) => (r.id === id ? { ...r, status: res.status } : r)),
                   );
-                  addToast('Không thể hủy đặt chỗ — bãi đỗ không thuộc phân công của bạn.', 'error');
+                  // Backend nói rõ lý do (thẻ tháng cần Quản lý / sai bãi phụ
+                  // trách) — hiện đúng câu đó thay vì luôn đổ cho "sai bãi".
+                  addToast(
+                    e?.status === 403 && e.message
+                      ? e.message
+                      : 'Không thể hủy đặt chỗ — vui lòng thử lại.',
+                    'error',
+                  );
                 });
-              // Slot + area/floor stats freed back up once staff cancels the booking
-              if (res.slotCode) {
-                setSlots((prev) =>
-                  prev.map((s) =>
-                    s.slotCode === res.slotCode ? { ...s, status: "Available" } : s,
-                  ),
-                );
-                updateSlotStatus(res.slotCode, 'Available').catch(() => {});
-              }
-              setAreas((prev) =>
-                prev.map((a) =>
-                  a.areaName === res.area
-                    ? { ...a, availableSlots: a.availableSlots + 1, reservedSlots: Math.max(0, a.reservedSlots - 1) }
-                    : a,
-                ),
-              );
-              setFloors((prev) =>
-                prev.map((f) =>
-                  f.floorName === res.floor
-                    ? { ...f, availableSlots: f.availableSlots + 1, reservedSlots: Math.max(0, f.reservedSlots - 1) }
-                    : f,
-                ),
-              );
             }}
             onLogout={handleLogout}
             addToast={addToast}
-            onAddEmergency={(log) => setEmergencyLogs((prev) => [log, ...prev])}
             onCreateIssue={handleCreateIssue}
           />
         </div>
@@ -2891,6 +3006,7 @@ export default function App() {
                         savedVehicles={savedVehicles}
                         pricingRules={pricingRules}
                         slots={slots}
+                        payments={payments.filter((p) => p.userId === currentUser.id)}
                         onClearCheckedIn={(ids) => {
                           addHiddenResIds(ids);
                           setReservations((prev) => prev.filter((r) => !ids.includes(r.id)));
@@ -2961,6 +3077,7 @@ export default function App() {
                         onAddVehicle={handleAddVehicle}
                         onUpdateVehicle={handleUpdateVehicle}
                         onSetDefaultVehicle={handleSetDefaultVehicle}
+                        onDeleteVehicle={handleDeleteVehicle}
                       />
                     )}
                   </div>

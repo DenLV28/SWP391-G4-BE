@@ -4,7 +4,13 @@ import { GoogleGenAI } from '@google/genai';
 // See ocr-service/README.md — wraps the PaddleOCR repo at
 // d:\FPT_ThNgwx\PaddleOCR-main behind POST /ocr/plate and returns the plate
 // already normalized to the app's canonical format (e.g. "29C1-38383").
-const PADDLE_URL: string = (import.meta.env.VITE_OCR_API_URL as string) || 'http://localhost:8868';
+// Mặc định để RỖNG = gọi đường dẫn tương đối ('/ocr/plate') nên request đi qua
+// chính origin đang mở app rồi được Vite proxy sang cổng 8868. Trước đây mặc
+// định là 'http://localhost:8868': mở app qua ngrok (HTTPS) thì trình duyệt chặn
+// vì mixed content, và mở từ máy khác trong LAN thì 'localhost' trỏ về chính máy
+// đó chứ không phải máy chạy OCR — cả hai trường hợp đều báo "OCR chưa chạy".
+// Đặt VITE_OCR_API_URL nếu cần trỏ tới một host OCR riêng.
+const PADDLE_URL: string = (import.meta.env.VITE_OCR_API_URL as string) || '';
 // First request right after service start can still be warming up the model.
 const PADDLE_TIMEOUT_MS = 45_000;
 
@@ -136,7 +142,7 @@ export async function readLicensePlateEx(
 
   const detail = paddleError instanceof Error ? paddleError.message : String(paddleError);
   throw new Error(
-    `Không kết nối được dịch vụ PaddleOCR tại ${PADDLE_URL} (${detail}). ` +
+    `Không kết nối được dịch vụ PaddleOCR tại ${getOcrServiceUrl()} (${detail}). ` +
       'Khởi động service: chạy start.ps1 trong thư mục ocr-service, hoặc cấu hình VITE_OCR_API_URL trong .env.',
   );
 }
@@ -147,7 +153,8 @@ export async function readLicensePlate(imageBase64: string, mimeType = 'image/jp
 }
 
 export function getOcrServiceUrl(): string {
-  return PADDLE_URL;
+  // Rỗng = đi qua proxy của origin hiện tại; hiển thị cho người dùng dễ hiểu.
+  return PADDLE_URL || `${typeof window !== 'undefined' ? window.location.origin : ''}/ocr`;
 }
 
 /** Quick ping so the Gate Control screen can show whether PaddleOCR is up. */
@@ -155,7 +162,8 @@ export async function checkOcrHealth(): Promise<boolean> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3_000);
-    const res = await fetch(`${PADDLE_URL}/health`, { signal: controller.signal });
+    // '/ocr/health' (không phải '/health') để nằm dưới đúng tiền tố Vite proxy.
+    const res = await fetch(`${PADDLE_URL}/ocr/health`, { signal: controller.signal });
     clearTimeout(timer);
     return res.ok;
   } catch {

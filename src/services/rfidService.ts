@@ -57,17 +57,23 @@ export async function linkRfidCard(
   uid: string,
   licensePlate: string,
   vehicleType?: string,
-): Promise<{ ok: boolean; error?: string; created?: boolean }> {
+  /** Bãi của cổng đang thao tác — backend chỉ chặn xe thẻ tháng CỦA CHÍNH bãi
+   *  này; thẻ tháng mua ở bãi khác thì ở đây khách là khách vãng lai bình thường. */
+  parkingLot?: string,
+): Promise<{ ok: boolean; error?: string; created?: boolean; code?: string }> {
   try {
     const res = await fetch(buildApiUrl('/api/rfid/link'), {
       method: 'POST',
       headers: defaultHeaders(),
-      body: JSON.stringify({ uid, licensePlate, vehicleType }),
+      body: JSON.stringify({ uid, licensePlate, vehicleType, parkingLot }),
     });
-    const body: { error?: string; created?: boolean } = await res.json().catch(() => ({}));
+    const body: { error?: string; created?: boolean; code?: string } = await res.json().catch(() => ({}));
     if (!res.ok) {
       const message: string = body.error || 'Không thể liên kết thẻ.';
-      return { ok: false, error: message };
+      // Trả kèm `code` để nơi gọi phân biệt được lý do từ chối — nhất là
+      // MONTHLY_CANNOT_LINK_RFID: xe tháng thì phải DỪNG HẲN luồng vãng lai,
+      // không chỉ báo lỗi rồi vẫn cho vào bãi.
+      return { ok: false, error: message, code: body.code };
     }
     return { ok: true, created: body.created };
   } catch {

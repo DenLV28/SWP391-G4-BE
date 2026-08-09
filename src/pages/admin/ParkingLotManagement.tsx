@@ -61,9 +61,9 @@ export default function ParkingLotManagement({
   const [selectedLot, setSelectedLot] = useState<ParkingLotInfo | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ParkingLotInfo | null>(null);
   const [deleteError, setDeleteError] = useState('');
+  const [deleteInfo, setDeleteInfo] = useState('');
 
   const [name, setName] = useState('');
-  const [bookingLabel, setBookingLabel] = useState('');
   const [address, setAddress] = useState('');
   const [mapsUrl, setMapsUrl] = useState('');
   const [description, setDescription] = useState('');
@@ -76,7 +76,6 @@ export default function ParkingLotManagement({
     setFormMode('Create');
     setSelectedLot(null);
     setName('');
-    setBookingLabel('');
     setAddress('');
     setMapsUrl('');
     setDescription('');
@@ -89,7 +88,6 @@ export default function ParkingLotManagement({
     setSelectedLot(lot);
     setFormMode('Edit');
     setName(lot.name);
-    setBookingLabel(lot.bookingLabel);
     setAddress(lot.address);
     setMapsUrl(lot.mapsUrl);
     setDescription(lot.description);
@@ -120,7 +118,7 @@ export default function ParkingLotManagement({
     setErrors({});
     setSubmitting(true);
 
-    const payload: ParkingLotInput = { name, bookingLabel, address, mapsUrl, description, imageData, status };
+    const payload: ParkingLotInput = { name, address, mapsUrl, description, imageData, status };
     // Sửa bãi: KHÔNG gửi slots/gates ở form này — chúng thuộc trình thiết kế sơ
     // đồ. Backend bỏ qua khi trường vắng mặt nên sơ đồ giữ nguyên.
     const result =
@@ -142,14 +140,24 @@ export default function ParkingLotManagement({
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
+    const name = deleteTarget.name;
     const result = await deleteParkingLot(deleteTarget.id);
+    setDeleteTarget(null);
     if (!result.ok) {
       setDeleteError(result.error || 'Không thể xóa bãi đỗ.');
-      setDeleteTarget(null);
+      setDeleteInfo('');
       return;
     }
-    setDeleteTarget(null);
     setDeleteError('');
+    // Báo rõ phần dữ liệu xe được giữ lại — Admin cần biết những phiên gửi xe
+    // đang mở vẫn còn trong hệ thống dù bãi đã biến mất khỏi mọi màn hình.
+    const kept: string[] = [];
+    if (result.keptActiveSessions) kept.push(`${result.keptActiveSessions} xe đang gửi`);
+    if (result.keptOpenReservations) kept.push(`${result.keptOpenReservations} đặt chỗ chưa kết thúc`);
+    setDeleteInfo(
+      `Đã xóa bãi "${name}" khỏi hệ thống (${result.removedSlots ?? 0} ô đỗ).` +
+        (kept.length ? ` Dữ liệu xe được giữ nguyên: ${kept.join(', ')}.` : ''),
+    );
     await onReload();
   };
 
@@ -172,6 +180,14 @@ export default function ParkingLotManagement({
       {deleteError && (
         <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700">
           {deleteError}
+        </div>
+      )}
+      {deleteInfo && (
+        <div className="flex items-start justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-semibold text-emerald-700">
+          <span>{deleteInfo}</span>
+          <button onClick={() => setDeleteInfo('')} className="shrink-0 text-emerald-600 hover:text-emerald-800">
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
 
@@ -258,12 +274,6 @@ export default function ParkingLotManagement({
               placeholder="ParkFlow Quận 1"
             />
             <FormInput
-              label="Nhãn trên form đặt chỗ (tùy chọn)"
-              value={bookingLabel}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setBookingLabel(e.target.value)}
-              placeholder="ParkFlow Quận 1 - Bến Thành"
-            />
-            <FormInput
               label="Địa chỉ (tùy chọn)"
               value={address}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) => setAddress(e.target.value)}
@@ -348,7 +358,12 @@ export default function ParkingLotManagement({
       <ConfirmModal
         isOpen={!!deleteTarget}
         title="Xóa bãi đỗ"
-        message={`Bạn có chắc muốn xóa bãi đỗ "${deleteTarget?.name}"? Toàn bộ ô đỗ và sơ đồ của bãi này sẽ bị xóa vĩnh viễn.`}
+        message={
+          `Bạn có chắc muốn xóa bãi đỗ "${deleteTarget?.name}"? ` +
+          `Bãi cùng toàn bộ ${deleteTarget?.slotCount ?? 0} ô đỗ, sơ đồ và cổng vào/ra sẽ bị xóa vĩnh viễn khỏi hệ thống ` +
+          `và biến mất khỏi màn hình của nhân viên, quản lý và người dùng. ` +
+          `Dữ liệu xe (phiên gửi xe, đặt chỗ, thanh toán) được giữ nguyên, không bị xóa.`
+        }
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
       />

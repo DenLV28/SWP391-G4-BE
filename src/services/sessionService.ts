@@ -56,6 +56,37 @@ export async function fetchActiveSessions(): Promise<ParkingSession[]> {
   return (Array.isArray(data) ? data : []).map(toSession);
 }
 
+/**
+ * Dựng Error mang theo thông báo & mã lỗi của backend.
+ *
+ * Backend từ chối có lý do đọc được cho staff (409 ALREADY_INSIDE "xe đang ở
+ * trong bãi, ô B01, từ 20:04"); nuốt thành "Sessions API 409" là mất sạch phần
+ * hữu ích nhất.
+ */
+type ApiError = Error & {
+  code?: string;
+  status?: number;
+  /** Vé đang chặn thao tác — cổng dùng để hiện rõ xe đang ở ô nào, từ lúc nào. */
+  session?: { ticketCode?: string; slotCode?: string; checkInTime?: string; parkingLot?: string };
+};
+
+async function apiError(res: Response): Promise<ApiError> {
+  let message = `Sessions API ${res.status}`;
+  let code = '';
+  let session: ApiError['session'];
+  try {
+    const body = await res.json();
+    if (body?.error) message = body.error;
+    if (body?.code) code = body.code;
+    if (body?.session) session = body.session;
+  } catch { /* body không phải JSON — dùng thông báo mặc định */ }
+  const err = new Error(message) as ApiError;
+  err.code = code;
+  err.status = res.status;
+  err.session = session;
+  return err;
+}
+
 export async function createSession(
   session: ParkingSession,
   /** Chỉ dùng để backend tự chọn ô trống trong ĐÚNG bãi khi xe vào không có đặt chỗ (slotCode rỗng) — không phải cột lưu trên phiên gửi xe. */
@@ -66,7 +97,7 @@ export async function createSession(
     headers: headers(),
     body: JSON.stringify(parkingLot ? { ...session, parkingLot } : session),
   });
-  if (!res.ok) throw new Error(`Sessions API ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   const data = await res.json();
   return { session: toSession(data.session ?? data), autoAssignedSlot: !!data.autoAssignedSlot };
 }
@@ -80,6 +111,9 @@ export async function updateSession(
     checkOutTime?: string;
     estimatedFee?: number;
     barrierStatus?: string;
+    /** Nhân viên đang thao tác — backend dùng để chặn cho xe ra ở bãi khác
+     *  với bãi xe đã vào (403 WRONG_LOT_EXIT). */
+    staffId?: string;
   },
 ): Promise<ParkingSession> {
   const res = await fetch(buildUrl(`/api/sessions/${encodeURIComponent(id)}`), {
@@ -87,7 +121,7 @@ export async function updateSession(
     headers: headers(),
     body: JSON.stringify(patch),
   });
-  if (!res.ok) throw new Error(`Sessions API ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   const data = await res.json();
   return toSession(data.session ?? data);
 }

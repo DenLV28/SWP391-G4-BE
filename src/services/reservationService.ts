@@ -71,7 +71,22 @@ export async function updateReservation(
     headers: headers(),
     body: JSON.stringify(patch),
   });
-  if (!res.ok) throw new Error(`Reservations API ${res.status}`);
+  if (!res.ok) {
+    // Backend từ chối có lý do đọc được (403 "chỉ Quản lý mới được hủy thẻ
+    // tháng", "không phụ trách bãi này") — giữ nguyên câu đó cho UI hiển thị,
+    // thay vì nuốt thành "Reservations API 403" rồi báo một câu chung chung sai.
+    let message = `Reservations API ${res.status}`;
+    let code = '';
+    try {
+      const body = await res.json();
+      if (body?.error) message = body.error;
+      if (body?.code) code = body.code;
+    } catch { /* body không phải JSON — dùng thông báo mặc định */ }
+    const err = new Error(message) as Error & { code?: string; status?: number };
+    err.code = code;
+    err.status = res.status;
+    throw err;
+  }
   const data = await res.json();
   return toReservation(data.reservation ?? data);
 }

@@ -1,11 +1,13 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import {
   MapPin, Car, Bookmark, Wrench,
-  LayoutGrid, ArrowLeft,
+  LayoutGrid, ArrowLeft, RefreshCw,
 } from 'lucide-react';
-import type { Slot } from '../../data/mockData';
+import type { Reservation, Slot, User } from '../../data/mockData';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
 import { findLot, sameLot } from '../../utils/parkingLots';
+import ActivityLog from '../staff/ActivityLog';
+import { fetchAccessLogs, type SharedAccessLog } from '../../services/accessLogService';
 
 /** Bãi đang xem chi tiết — do ManagerParkingLots truyền qua khi bấm "Xem chi tiết". */
 export interface LotDetailInfo {
@@ -20,22 +22,40 @@ interface ManagerParkingLotDetailProps {
   lot?: LotDetailInfo | null;
   /** Toàn bộ ô đỗ hệ thống — trang tự lọc theo bãi đang xem. */
   slots?: Slot[];
+  /** Cho bảng nhật ký tra ra người đặt chỗ khi bấm xem chi tiết một lượt. */
+  reservations?: Reservation[];
+  users?: User[];
 }
 
-const ACTIVITY_LOG = [
-  { time: '14:32:01', plate: '51G-888.99', action: 'Vào (Tháng)',  type: 'Ô tô 4-7 chỗ', status: 'Thành công' },
-  { time: '14:30:15', plate: '29A-123.45', action: 'Ra (Lượt)',    type: 'Ô tô 4-7 chỗ', status: 'Thành công' },
-  { time: '14:28:44', plate: '60B-456.78', action: 'Vào (Lượt)',   type: 'Xe máy',        status: 'Cảnh báo'  },
-  { time: '14:25:30', plate: '59H-999.00', action: 'Ra (Tháng)',   type: 'Ô tô 4-7 chỗ', status: 'Thành công' },
-];
+export default function ManagerParkingLotDetail({
+  setView,
+  lot,
+  slots = [],
+  reservations = [],
+  users = [],
+}: ManagerParkingLotDetailProps) {
+  // ── Nhật ký qua cổng CỦA ĐÚNG BÃI NÀY ──────────────────────────────────────
+  //
+  // Trước đây khối này là 4 dòng viết cứng (51G-888.99, 29A-123.45...) hiện
+  // giống hệt nhau ở mọi bãi. Nay đọc dbo.access_logs — chính dữ liệu nhân
+  // viên ghi ở trang "Nhật ký hoạt động" — và lọc theo tên bãi đang xem.
+  const lotName = lot?.name ?? '';
+  const [logs, setLogs] = useState<SharedAccessLog[]>([]);
+  const [loadingLogs, setLoadingLogs] = useState(true);
+  const [reloadTick, setReloadTick] = useState(0);
 
-const statusBadge = (s: string) => {
-  if (s === 'Thành công') return 'bg-green-100 text-green-700';
-  if (s === 'Cảnh báo')   return 'bg-yellow-100 text-yellow-700';
-  return 'bg-red-100 text-red-700';
-};
+  useEffect(() => {
+    if (!lotName) return;
+    let cancelled = false;
+    setLoadingLogs(true);
+    fetchAccessLogs(lotName, 500).then((rows) => {
+      if (cancelled) return;
+      setLogs(rows);
+      setLoadingLogs(false);
+    });
+    return () => { cancelled = true; };
+  }, [lotName, reloadTick]);
 
-export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: ManagerParkingLotDetailProps) {
   // Không biết đang xem bãi nào (vd. refresh trang) → về danh sách bãi
   useEffect(() => {
     if (!lot) setView('parkinglots');
@@ -54,6 +74,8 @@ export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: Ma
     y: s.posY ?? null,
     w: s.posW ?? null,
     h: s.posH ?? null,
+    // Loai xe THAT cua o — khong suy tu chu cai dau ma o
+    vehicleType: s.vehicleType,
   }));
   // Cổng vào/ra do Admin đặt riêng cho bãi này.
   const lotGates = findLot(lot.name)?.gates;
@@ -132,41 +154,30 @@ export default function ManagerParkingLotDetail({ setView, lot, slots = [] }: Ma
         )}
       </div>
 
-      {/* Activity log */}
-      <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-base font-bold text-slate-800">Nhật ký hoạt động gần đây</h2>
-          <button className="text-xs font-semibold text-blue-600 hover:underline">Xem tất cả</button>
+      {/* Nhật ký hoạt động — dùng LẠI đúng bảng của nhân viên (đủ bộ lọc theo
+          ngày / loại xe / hành động, tìm biển số, phân trang và nút xem chi
+          tiết từng lượt), chỉ đổi tiêu đề và giới hạn dữ liệu về bãi này. */}
+      {loadingLogs ? (
+        <div className="rounded-2xl border border-slate-100 bg-white p-10 text-center text-sm text-slate-400 shadow-sm">
+          Đang tải nhật ký của bãi…
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-left text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                <th className="py-2.5 pr-3">Thời gian</th>
-                <th className="py-2.5 pr-3">Biển số</th>
-                <th className="py-2.5 pr-3">Hành động</th>
-                <th className="py-2.5 pr-3">Loại xe</th>
-                <th className="py-2.5 text-right">Trạng thái</th>
-              </tr>
-            </thead>
-            <tbody>
-              {ACTIVITY_LOG.map((row) => (
-                <tr key={`${row.time}-${row.plate}`} className="border-b border-slate-50 last:border-0">
-                  <td className="py-2.5 pr-3 font-mono text-xs text-slate-500">{row.time}</td>
-                  <td className="py-2.5 pr-3 font-mono font-bold text-slate-800">{row.plate}</td>
-                  <td className="py-2.5 pr-3 text-slate-600">{row.action}</td>
-                  <td className="py-2.5 pr-3 text-slate-500">{row.type}</td>
-                  <td className="py-2.5 text-right">
-                    <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${statusBadge(row.status)}`}>
-                      {row.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      ) : (
+        <ActivityLog
+          accessLogs={logs}
+          reservations={reservations}
+          users={users}
+          title="Nhật ký hoạt động"
+          subtitle={`Toàn bộ lượt xe qua cổng do nhân viên ${lot.name} ghi nhận — ${logs.length} lượt.`}
+          headerRight={
+            <button
+              onClick={() => setReloadTick((n) => n + 1)}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50"
+            >
+              <RefreshCw className="h-3.5 w-3.5" /> Làm mới
+            </button>
+          }
+        />
+      )}
     </div>
   );
 }

@@ -9,19 +9,20 @@ import {
   LogOut,
   ParkingCircle,
   UserCircle2,
+  CalendarCheck,
 } from 'lucide-react';
 import type { User, Slot, Reservation, Payment, PricingRule, VehicleKey, SlotIssue, ParkingSession } from '../../data/mockData';
-import type { Gate, ScanEvent, AccessLog, EmergencyLog, IncidentType } from '../../types/staff';
+import { validateLicensePlate } from '../../data/mockData';
+import type { Gate, ScanEvent, AccessLog } from '../../types/staff';
 import {
   initialGates,
-  initialAccessLogs,
-  initialEmergencyLogs,
   manualVehicleOptions,
 } from '../../types/staff';
 import { connectIot, iotTransport, type GateCommand } from '../../services/iotService';
 import { rejectRfidScan, fetchRejectedScanCount } from '../../services/rfidScanService';
 import { fetchActiveSessions } from '../../services/sessionService';
 import { loadAccessLogs, saveAccessLogs } from '../../services/accessLogStore';
+import { pushAccessLogs, fetchAccessLogs } from '../../services/accessLogService';
 import StaffOverview from './StaffOverview';
 import GateControl from './GateControl';
 import ActivityLog from './ActivityLog';
@@ -29,9 +30,9 @@ import EmergencyReport from './EmergencyReport';
 import StaffManagerChat from '../../components/StaffManagerChat';
 import RoleProfilePage from '../../components/RoleProfilePage';
 import CurrentSessionPage from '../driver/CurrentSession';
-import { perVisitOverstay, overstayDue, isReservationPaid } from '../../utils/reservationPricing';
+import { perVisitOverstay, overstayDue, isReservationPaid, findActiveMonthlyReservation } from '../../utils/reservationPricing';
 import { formatCurrency, localDateISO } from '../../utils/helpers';
-import { lotKeyOf, lotKeyOrDefault, isLotUnavailable } from '../../utils/parkingLots';
+import { lotKeyOf, lotKeyOrDefault, isLotUnavailable, sameLot } from '../../utils/parkingLots';
 import type { ParkingLotInfo } from '../../utils/parkingLots';
 
 interface StaffDashboardProps {
@@ -47,7 +48,6 @@ interface StaffDashboardProps {
   onCancelReservation?: (id: string) => void;
   onLogout: () => void;
   addToast: (message: string, type?: 'success' | 'info' | 'error') => void;
-  onAddEmergency?: (log: EmergencyLog) => void;
   onCreateIssue?: (issue: Omit<SlotIssue, 'id' | 'reportedAt' | 'status'>) => Promise<void>;
   onForceClearSlot?: (slotCode: string, reason: string) => Promise<boolean>;
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
@@ -113,7 +113,6 @@ export default function StaffDashboard({
   onCancelReservation,
   onLogout,
   addToast,
-  onAddEmergency,
   onCreateIssue,
   onForceClearSlot,
   onSetSlotStatus,
@@ -152,10 +151,54 @@ export default function StaffDashboard({
   // Khôi phục nhật ký từ localStorage khi mở lại trang — trước đây accessLogs
   // chỉ tồn tại trong bộ nhớ React nên F5 là mất sạch, chỉ còn lại 1-2 dòng
   // do effect diff reservations dựng tạm lại bên dưới.
-  const [accessLogs, setAccessLogs] = useState<AccessLog[]>(() => loadAccessLogs() ?? initialAccessLogs);
-  useEffect(() => { saveAccessLogs(accessLogs); }, [accessLogs]);
+  // NHẬT KÝ TÁCH RIÊNG THEO BÃI. Đệm localStorage có khoá riêng cho từng bãi,
+  // nên đổi bãi phụ trách (hoặc hai nhân viên khác bãi dùng chung một máy) là
+  // đổi hẳn sổ nhật ký, không còn thấy hoạt động của bãi kia.
+  const assignedLot = currentUser.assignedParkingLot;
+  // Không lùi về `initialAccessLogs` (dữ liệu mẫu) nữa: bãi chưa có hoạt động
+  // nào mà hiện mấy dòng mẫu thì lại đúng kiểu lỗi đang sửa — nhật ký không
+  // thuộc về bãi này.
+  const [accessLogs, setAccessLogs] = useState<AccessLog[]>(
+    () => loadAccessLogs(assignedLot) ?? [],
+  );
+  useEffect(() => { saveAccessLogs(accessLogs, assignedLot); }, [accessLogs, assignedLot]);
+
+  // Đổi bãi → nạp lại nhật ký ĐÚNG BÃI ĐÓ.
+  //
+  // Server là nguồn chân lý (dbo.access_logs có cột parking_lot); đệm cục bộ chỉ
+  // để nhân viên mất mạng vẫn xem được ca của mình. Không lấy được thì lùi về
+  // đệm của chính bãi đó, tuyệt đối không giữ lại state của bãi trước.
+  const pushedLogIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    pushedLogIdsRef.current = new Set();
+    if (!assignedLot) { setAccessLogs([]); return; }
+    fetchAccessLogs(assignedLot, 300)
+      .then((rows) => {
+        if (cancelled) return;
+        // Đã có trên server rồi thì không cần đẩy lên lại.
+        rows.forEach((l) => pushedLogIdsRef.current.add(l.id));
+        setAccessLogs(rows.length ? rows : (loadAccessLogs(assignedLot) ?? []));
+      })
+      .catch(() => {
+        if (!cancelled) setAccessLogs(loadAccessLogs(assignedLot) ?? []);
+      });
+    return () => { cancelled = true; };
+  }, [assignedLot]);
+
+  // Đẩy nhật ký lên backend kèm tên bãi để Manager xem được hoạt động của bãi
+  // này. Bám vào chính state `accessLogs` thay vì sửa từng chỗ gọi setAccessLogs
+  // (có 8 chỗ rải khắp file) — mọi dòng mới đều đi qua đây, khỏi sót.
+  useEffect(() => {
+    if (!assignedLot) return;
+    const fresh = accessLogs.filter((l) => !pushedLogIdsRef.current.has(l.id));
+    if (!fresh.length) return;
+    fresh.forEach((l) => pushedLogIdsRef.current.add(l.id));
+    // Backend ghi theo client_id nên gửi lại dòng cũ cũng không nhân bản; thất
+    // bại mạng thì bỏ qua, dòng đó vẫn còn trong localStorage của staff.
+    pushAccessLogs(fresh, assignedLot);
+  }, [accessLogs, assignedLot]);
   const [liveScans, setLiveScans] = useState<ScanEvent[]>([]);
-  const [emergencyLogs, setEmergencyLogs] = useState<EmergencyLog[]>(initialEmergencyLogs);
   const [confirmedReservations, setConfirmedReservations] = useState<Set<string>>(new Set());
   const [iotStatus, setIotStatus] = useState<'connecting' | 'online' | 'offline' | 'simulated'>('connecting');
   const [bellOpen, setBellOpen] = useState(false);
@@ -189,9 +232,45 @@ export default function StaffDashboard({
   // just reservation-based check-ins.
   const lotSlotCodes = React.useMemo(() => new Set(slots.map((s) => s.slotCode)), [slots]);
   const sessions = React.useMemo(
-    () => liveSessions.filter((s) => s.sessionStatus === 'Active' && s.slotCode && lotSlotCodes.has(s.slotCode)),
-    [liveSessions, lotSlotCodes],
+    () =>
+      liveSessions.filter((s) => {
+        if (s.sessionStatus !== 'Active') return false;
+        // Ưu tiên bãi ghi thẳng trên vé: vé chưa được xếp ô (bãi hết ô phù hợp)
+        // vẫn phải hiện ở đúng bãi, trước đây bị loại khỏi mọi màn hình.
+        if (s.parkingLot) return sameLot(s.parkingLot, currentUser.assignedParkingLot);
+        // Vé cũ chưa có cột parking_lot → suy theo ô đỗ như trước.
+        return !!s.slotCode && lotSlotCodes.has(s.slotCode);
+      }),
+    [liveSessions, lotSlotCodes, currentUser.assignedParkingLot],
   );
+
+  // ── Hàng đợi "Lượt quét đang chờ xử lý" ────────────────────────────────────
+  // Quy tắc: hàng đợi CHỈ chứa lượt quét mà hệ thống KHÔNG tự xử lý được —
+  // camera không đọc nổi biển số. Lượt quét đọc được biển và xe đã qua cổng
+  // (đã có vé đang hoạt động) thì việc đã xong, không còn gì để staff bấm nữa.
+  // Trước đây mọi lượt quét đều nằm lại vĩnh viễn tới khi staff bấm tay, nên
+  // quét lại cùng một xe đã ở trong bãi cứ chồng thêm thẻ chờ trùng lặp.
+  const normPlateKey = (p?: string) => String(p || '').toUpperCase().replace(/[\s.-]/g, '');
+  /** Lượt quét không đọc được biển → việc của staff; đọc được → hệ thống lo. */
+  const isUnreadableScan = (s: { licensePlate?: string; recognition?: string }) =>
+    !s.licensePlate || s.recognition === 'unknown' || !!validateLicensePlate(s.licensePlate);
+
+  // Ảnh chụp biển số đang đỗ trong bãi, để callback IoT (đăng ký một lần, deps
+  // rỗng) đọc được trạng thái mới nhất mà không phải đăng ký lại kết nối.
+  const admittedPlatesRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const admitted = new Set(sessions.map((s) => normPlateKey(s.licensePlate)).filter(Boolean));
+    admittedPlatesRef.current = admitted;
+    setLiveScans((prev) => {
+      const next = prev.filter((s) => {
+        if (isUnreadableScan(s)) return true;            // lỗi quét → luôn giữ
+        const plate = normPlateKey(s.licensePlate);
+        // Vào: xe đã trong bãi → xong. Ra: xe không còn trong bãi → xong.
+        return s.direction === 'entry' ? !admitted.has(plate) : admitted.has(plate);
+      });
+      return next.length === prev.length ? prev : next;
+    });
+  }, [sessions]);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -281,14 +360,55 @@ export default function StaffDashboard({
     prevReservationsRef.current = reservations;
   }, [reservations]);
 
+  /**
+   * Biển số này có thẻ tháng còn hiệu lực không.
+   *
+   * CÓ THẺ RFID KHÔNG ĐỒNG NGHĨA LÀ KHÁCH THÁNG. Thẻ RFID chỉ là phương tiện mở
+   * rào — khách vãng lai cũng được phát thẻ mượn ngay tại cổng (xem luồng tự
+   * liên kết trong GateControl). Trước đây mọi lượt quẹt thẻ thành công đều bị
+   * gán cứng 'subscriber', nên một chiếc xe thường quẹt thẻ lần thứ hai là bị
+   * ghi nhận thành "Khách tháng".
+   *
+   * Giữ trong ref vì callback IoT chỉ đăng ký MỘT LẦN (deps rỗng) nên không đọc
+   * được state `reservations` mới nhất qua closure.
+   */
+  const monthlyPlatesRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    monthlyPlatesRef.current = new Set(
+      reservations
+        .filter((r) => findActiveMonthlyReservation(r.licensePlate, reservations))
+        .map((r) => normPlateKey(r.licensePlate)),
+    );
+  }, [reservations]);
+  const isMonthlyPlate = (plate?: string) => {
+    const k = normPlateKey(plate);
+    return !!k && monthlyPlatesRef.current.has(k);
+  };
+
   // Connect to the IoT layer once
   useEffect(() => {
     const conn = connectIot({
       onStatus: setIotStatus,
       onScan: (scan) => {
-        setLiveScans((prev) => [scan, ...prev].slice(0, 8));
+        const plate = normPlateKey(scan.licensePlate);
+        const unreadable = isUnreadableScan(scan);
+        // Xe đọc được biển và ĐÃ ở trong bãi thì lượt quét vào không phải việc
+        // chờ xử lý — bỏ qua, khỏi đẩy thẻ trùng vào hàng đợi.
+        const alreadyInside = !unreadable && scan.direction === 'entry' && admittedPlatesRef.current.has(plate);
+        // Thẻ tháng được ghi nhận tự động, không cần staff duyệt. Xét theo DỮ
+        // LIỆU (xe có thẻ tháng còn hạn không), không theo nhãn đầu đọc gắn.
+        const autoHandled = isMonthlyPlate(scan.licensePlate);
+        if (!alreadyInside && !autoHandled) {
+          setLiveScans((prev) => {
+            // Quét lại cùng một xe cùng chiều thì THAY thẻ cũ, không chồng thêm.
+            const dedup = unreadable
+              ? prev
+              : prev.filter((s) => !(s.direction === scan.direction && normPlateKey(s.licensePlate) === plate));
+            return [scan, ...dedup].slice(0, 8);
+          });
+        }
         // Known subscribers are auto-recorded; everything else waits for staff.
-        if (scan.recognition === 'subscriber') {
+        if (autoHandled) {
           setAccessLogs((prev) => [
             {
               id: newLogId(),
@@ -304,10 +424,7 @@ export default function StaffDashboard({
             },
             ...prev,
           ]);
-          // Auto-handled scans drop off the pending queue shortly after.
-          setTimeout(() => {
-            setLiveScans((prev) => prev.filter((s) => s.id !== scan.id));
-          }, 4000);
+          // Thẻ tháng không còn được đẩy vào hàng đợi nên không cần hẹn giờ gỡ.
         }
         // Lượt quét không đọc được biển số CHỈ nằm ở hàng đợi chờ xử lý —
         // không tự đổ dòng "KHÔNG XÁC ĐỊNH" vào nhật ký. Nhật ký chỉ ghi khi
@@ -428,7 +545,10 @@ export default function StaffDashboard({
         direction,
         status: 'GRANTED',
         time: nowLabel(),
-        recognition: 'subscriber',
+        // Gán theo DỮ LIỆU chứ không mặc định 'subscriber'. Trước đây mọi lượt
+        // quẹt thẻ thành công đều bị ghi là "Khách tháng" — thẻ RFID chỉ là
+        // phương tiện mở rào, khách vãng lai cũng được phát thẻ mượn ở cổng.
+        recognition: isMonthlyPlate(plate) ? 'subscriber' : 'casual',
         vehicleType: vehicleLabelOf(vehicleType),
         // Xe ra: ghi đúng số tiền thực thu từ vé (trạm OCR truyền sang)
         fee: direction === 'exit' ? (collectedFee ?? pricing?.firstHourPrice ?? 0) : 0,
@@ -489,22 +609,9 @@ export default function StaffDashboard({
     addToast('Đã hủy đặt chỗ theo yêu cầu.', 'success');
   };
 
-  const handleSubmitEmergency =(type: IncidentType, description: string, slotCode?: string, floor?: string) => {
-    const newLog: EmergencyLog = {
-      id: `EM-${Date.now()}`,
-      type,
-      title: `${type}: Báo cáo mới`,
-      description,
-      status: 'NEW',
-      createdAt: `Hôm nay lúc ${nowLabel()}`,
-      reportedBy: currentUser.fullName,
-      slotCode,
-      floor,
-    };
-    setEmergencyLogs((prev) => [newLog, ...prev]);
-    onAddEmergency?.(newLog);
-    addToast('Đã gửi cảnh báo khẩn cấp tới quản lý & an ninh.', 'success');
-  };
+  // Đã gỡ handleSubmitEmergency cùng biểu mẫu "Gửi cảnh báo" và nút "Báo động".
+  // Không còn nơi nào tạo EmergencyLog từ phía nhân viên nữa; sự cố ô đỗ đi
+  // theo luồng riêng ở trang "Sự cố Ô đỗ" (onCreateIssue → dbo.slot_issues).
 
   // "Cảnh báo" phải ra CÙNG một số trên mọi máy đang xem bãi này — trước đây
   // đếm accessLogs (localStorage riêng từng trình duyệt) nên mỗi máy một số.
@@ -594,7 +701,6 @@ export default function StaffDashboard({
             onManualEntry={handleManualEntry}
             onRfidVerified={handleRfidVerified}
             onGateCommand={(gateId, command) => (guardMaintenance() ? false : Boolean(sendCommand(gateId, command)))}
-            onAlarm={(description) => handleSubmitEmergency('Other', description)}
             addToast={addToast}
             isUnderMaintenance={lotUnderMaintenance}
           />
@@ -602,6 +708,9 @@ export default function StaffDashboard({
       case 'parkingmonitor':
         // Toàn bộ chức năng "Lượt gửi hiện tại" của user, chạy trong cổng staff:
         // reservations là của MỌI khách trong bãi phụ trách (đã lọc theo bãi).
+        // activeSessions phải là `sessions` (ĐÃ lọc theo bãi), KHÔNG phải
+        // `liveSessions` — liveSessions là vé đang hoạt động của TOÀN HỆ THỐNG
+        // nên truyền thẳng vào đây sẽ cho staff thấy cả xe đang đỗ ở bãi khác.
         return (
           <CurrentSessionPage
             title="Theo dõi bãi xe"
@@ -616,7 +725,7 @@ export default function StaffDashboard({
             slots={slots}
             payments={payments}
             reservations={reservations}
-            activeSessions={liveSessions}
+            activeSessions={sessions}
             onCancelReservation={handleCancelReservation}
           />
         );
@@ -650,13 +759,11 @@ export default function StaffDashboard({
             sessions={sessions}
             slots={slots}
             payments={payments}
-            alertsCount={alertsCount}
             confirmedReservations={confirmedReservations}
             onConfirmReservation={handleConfirmReservation}
             onCancelReservation={handleCancelReservation}
             onNavigate={setView}
-            emergencyLogs={emergencyLogs}
-            onSubmitEmergency={handleSubmitEmergency}
+            users={users}
             addToast={addToast}
             onSetSlotStatus={async (slotCode, status) => (guardMaintenance() ? false : (await onSetSlotStatus?.(slotCode, status)) ?? false)}
             isUnderMaintenance={lotUnderMaintenance}
@@ -887,12 +994,25 @@ export default function StaffDashboard({
             </div>
             {/* Body */}
             <div className="p-5 space-y-3">
+              {/* Thẻ tháng phải nổi bật ngay ở đầu: xác nhận nó là giữ nguyên
+                  một ô đỗ suốt cả tháng, không giống duyệt một lượt gửi thường. */}
+              {bookingAlert.note === 'Theo tháng' && (
+                <div className="flex items-start gap-2 rounded-xl border border-pink-200 bg-pink-50 px-4 py-3">
+                  <CalendarCheck className="mt-0.5 h-4 w-4 shrink-0 text-pink-600" />
+                  <p className="text-xs leading-relaxed text-pink-800">
+                    <strong>Đặt chỗ THEO THÁNG.</strong> Xác nhận sẽ giữ riêng ô đỗ này cho khách suốt cả
+                    tháng. Sau khi xác nhận, chỉ Quản lý mới hủy được.
+                  </p>
+                </div>
+              )}
               <div className="rounded-xl bg-slate-50 border border-slate-100 p-4 space-y-2 text-sm">
                 {[
                   { label: 'Mã đặt chỗ',  value: bookingAlert.reservationCode },
+                  { label: 'Loại gói',     value: bookingAlert.note || 'Gửi theo lượt' },
                   { label: 'Ô đỗ',         value: bookingAlert.slotCode ?? '—' },
                   { label: 'Biển số xe',   value: bookingAlert.licensePlate },
-                  { label: 'Loại xe',      value: bookingAlert.vehicleType },
+                  // Trước đây in thẳng khóa nội bộ ('car') — hiện nhãn tiếng Việt.
+                  { label: 'Loại xe',      value: vehicleLabelOf(bookingAlert.vehicleType) },
                   { label: 'Ngày / Giờ',   value: `${bookingAlert.date} ${bookingAlert.startTime}` },
                 ].map((row) => (
                   <div key={row.label} className="flex justify-between">

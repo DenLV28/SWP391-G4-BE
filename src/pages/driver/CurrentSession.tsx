@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { BadgeInfo, Car, CheckCircle, Clock, Lock, MapPin, Search, Ticket, Unlock, X } from 'lucide-react';
+import { BadgeInfo, CalendarCheck, Car, CheckCircle, Clock, Lock, MapPin, Search, Ticket, Unlock, X } from 'lucide-react';
 import { ParkingSession, PricingRule, Reservation, SavedVehicle, User, Slot, Payment } from '../../data/mockData';
 import StatusBadge from '../../components/StatusBadge';
 import EmptyState from '../../components/EmptyState';
@@ -108,6 +108,11 @@ export default function CurrentSession({
   onCancelReservation,
 }: CurrentSessionProps) {
   const [cancelTarget, setCancelTarget] = useState<Reservation | null>(null);
+
+  // Trang này dùng chung cho hai vai: khách xem lượt gửi của mình, và nhân viên
+  // xem "Theo dõi bãi xe" của cả bãi. Một số thao tác chỉ cấm với nhân viên
+  // (hủy thẻ tháng) chứ không cấm khách hủy thẻ của chính họ.
+  const isStaffViewer = currentUser?.role === 'Parking Staff';
   // All currently parked vehicles for this user — includes walk-ins (no prior
   // reservation) synthesized from activeSessions, not just checked-in
   // reservations, so a car that just drove up without booking still shows here.
@@ -201,19 +206,25 @@ export default function CurrentSession({
   // The session object to drive the detail panel
   const activeSession = isPrimarySelected ? currentSession : virtualSession;
 
-  // Which ParkFlow lot this session belongs to — saved on the reservation when
-  // the driver booked (Chọn bãi đỗ). Sessions don't carry it, so resolve via
-  // the reservation for the same plate; older bookings predate the field and
-  // fall back to the default lot the form always offered.
+  // Bãi đỗ của lượt gửi này.
+  //
+  // Phiên gửi xe NAY đã tự mang `parkingLot` (cột parking_sessions.parking_lot),
+  // nên ưu tiên đọc thẳng từ vé — chính xác nhất. Chỉ khi vé không có mới suy
+  // qua đặt chỗ cùng biển số.
+  //
+  // KHÔNG mặc định về một bãi cụ thể nữa: trước đây thiếu dữ liệu là ghi cứng
+  // "ParkFlow Quận 9 - Lò Lu", nên xe đỗ ở Long Phước vẫn hiện thành Quận 9 —
+  // sai lệch mà khách không có cách nào biết. Không rõ thì hiện "—".
   const activeLot = useMemo(() => {
-    if (!isPrimarySelected) return selectedRes?.parkingLot || 'ParkFlow Quận 9 - Lò Lu';
+    if (!isPrimarySelected) return selectedRes?.parkingLot || '—';
+    if (currentSession.parkingLot) return currentSession.parkingLot;
     const match = reservations.find(
       (r) =>
         r.licensePlate === currentSession.licensePlate &&
         (r.status === 'Checked-in' || r.status === 'Confirmed' || r.status === 'Completed'),
     );
-    return match?.parkingLot || 'ParkFlow Quận 9 - Lò Lu';
-  }, [isPrimarySelected, selectedRes, reservations, currentSession.licensePlate]);
+    return match?.parkingLot || '—';
+  }, [isPrimarySelected, selectedRes, reservations, currentSession.licensePlate, currentSession.parkingLot]);
 
   // Pricing rule for selected vehicle
   const pricingRule = useMemo(
@@ -584,8 +595,18 @@ export default function CurrentSession({
                       </p>
                       <p className="text-base font-bold text-slate-800">{res.reservationCode}</p>
                     </div>
-                    <span className="ml-auto inline-flex rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                      ĐÃ XÁC NHẬN
+                    {/* Loại gói phải nhìn ra ngay: thẻ tháng có luật riêng
+                        (giữ ô cả tháng, chỉ Quản lý được hủy) nên không thể để
+                        nó trông y hệt một đơn gửi lượt thường. */}
+                    <span className="ml-auto flex items-center gap-2">
+                      {res.note === 'Theo tháng' && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-pink-50 px-3 py-1 text-xs font-bold text-pink-700">
+                          <CalendarCheck className="h-3.5 w-3.5" /> THEO THÁNG
+                        </span>
+                      )}
+                      <span className="inline-flex rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+                        ĐÃ XÁC NHẬN
+                      </span>
                     </span>
                   </div>
 
@@ -612,13 +633,27 @@ export default function CurrentSession({
 
                   {onCancelReservation && (
                     <div className="flex justify-end">
-                      <button
-                        type="button"
-                        onClick={() => setCancelTarget(res)}
-                        className="cursor-pointer rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 transition hover:bg-rose-50"
-                      >
-                        Hủy đặt chỗ
-                      </button>
+                      {/* Nhân viên KHÔNG được hủy thẻ tháng — đó là hợp đồng
+                          trọn tháng, chỉ Quản lý mới chấm dứt được (backend
+                          chặn bằng 403 MONTHLY_CANCEL_REQUIRES_MANAGER). Khách
+                          tự hủy thẻ của chính mình thì vẫn bình thường, nên chỉ
+                          khóa khi người đang dùng trang là nhân viên. */}
+                      {res.note === 'Theo tháng' && isStaffViewer ? (
+                        <span
+                          title="Thẻ tháng chỉ Quản lý mới được hủy"
+                          className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-bold text-slate-400"
+                        >
+                          Thẻ tháng — liên hệ Quản lý để hủy
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setCancelTarget(res)}
+                          className="cursor-pointer rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 transition hover:bg-rose-50"
+                        >
+                          Hủy đặt chỗ
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -720,44 +755,28 @@ export default function CurrentSession({
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-2 pt-2">
-            {activeSession.sessionStatus === 'Active' && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => setShowQRModal(true)}
-                  className="cursor-pointer rounded-xl border border-slate-200 px-4 py-2 text-xs font-bold text-slate-700 transition hover:bg-slate-50"
-                >
-                  Xem mã QR vé xe
-                </button>
-                <button
-                  type="button"
-                  onClick={openCheckout}
-                  className="cursor-pointer rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-indigo-500"
-                >
-                  Cho xe ra
-                </button>
-              </>
-            )}
-            {activeSession.sessionStatus === 'Completed' && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => setShowBarrierOpenedModal(true)}
-                  className="cursor-pointer rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-emerald-500"
-                >
-                  Mở barie
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setView('myparking')}
-                  className="cursor-pointer rounded-xl border border-slate-200 px-4 py-2 text-xs font-bold text-slate-700 transition hover:bg-slate-50"
-                >
-                  Quay lại trang của tôi
-                </button>
-              </>
-            )}
-          </div>
+          {/* Đã gỡ 2 nút "Xem mã QR vé xe" và "Cho xe ra" của lượt đang đỗ.
+              Bọc cả khối trong điều kiện 'Completed' thay vì để lại một <div>
+              rỗng — div đó vẫn có pt-2 nên xe đang đỗ sẽ thừa một khoảng trắng
+              không rõ vì sao ở cuối thẻ. */}
+          {activeSession.sessionStatus === 'Completed' && (
+            <div className="flex flex-wrap gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowBarrierOpenedModal(true)}
+                className="cursor-pointer rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-emerald-500"
+              >
+                Mở barie
+              </button>
+              <button
+                type="button"
+                onClick={() => setView('myparking')}
+                className="cursor-pointer rounded-xl border border-slate-200 px-4 py-2 text-xs font-bold text-slate-700 transition hover:bg-slate-50"
+              >
+                Quay lại trang của tôi
+              </button>
+            </div>
+          )}
         </div>
       ) : checkedInVehicles.length === 0 && pendingReservations.length === 0 ? (
         <EmptyState

@@ -1,12 +1,12 @@
 import React, { useMemo, useState } from 'react';
 import {
-  Send, Flame, Car, Server, ShieldAlert, HeartPulse, AlertTriangle, Bike, Monitor, Search, MapPin, ArrowLeftRight, X,
+  Car, AlertTriangle, Bike, Monitor, Search, MapPin, ArrowLeftRight, X, CalendarClock,
 } from 'lucide-react';
-import type { EmergencyLog, IncidentType, EmergencyStatus } from '../../types/staff';
-import type { Slot, Reservation, ParkingSession, VehicleKey } from '../../data/mockData';
+import type { Slot, Reservation, ParkingSession, VehicleKey, User } from '../../data/mockData';
 import ParkingFloorMap, { type MapSlot } from '../../components/ParkingFloorMap';
 import { findLot } from '../../utils/parkingLots';
 import { relocateSlot } from '../../services/slotService';
+import { addOneMonth } from '../../utils/reservationPricing';
 
 const VEHICLE_TYPE_LABEL: Record<string, string> = {
   car: 'Ô tô 4-7 chỗ (Xăng)',
@@ -19,22 +19,6 @@ const VEHICLE_TYPE_LABEL: Record<string, string> = {
  * Lives on the staff Bảng điều khiển (StaffOverview).
  */
 
-const statusPill: Record<EmergencyStatus, { label: string; cls: string }> = {
-  NEW:      { label: 'MỚI',     cls: 'bg-amber-500   text-white'     },
-  LOGGED:   { label: 'ĐÃ GHI',  cls: 'bg-slate-200   text-slate-700' },
-  RESOLVED: { label: 'ĐÃ XỬ',   cls: 'bg-rose-600    text-white'     },
-  FIXED:    { label: 'ĐÃ SỬA',  cls: 'bg-emerald-600 text-white'     },
-};
-
-const typeIcon: Record<string, { icon: React.ElementType; wrap: string }> = {
-  'Fire / Smoke':      { icon: Flame,         wrap: 'bg-rose-50    text-rose-600'    },
-  'Vehicle Collision': { icon: Car,           wrap: 'bg-blue-50    text-blue-600'    },
-  'Equipment Failure': { icon: Server,        wrap: 'bg-violet-50  text-violet-600'  },
-  'Security Breach':   { icon: ShieldAlert,   wrap: 'bg-slate-100  text-slate-600'   },
-  'Medical Emergency': { icon: HeartPulse,    wrap: 'bg-emerald-50 text-emerald-600' },
-  'Other':             { icon: AlertTriangle, wrap: 'bg-amber-50  text-amber-600'    },
-};
-
 const STATUS_VI: Record<string, string> = {
   Available:   'Trống',
   Occupied:    'Đang đỗ',
@@ -43,14 +27,6 @@ const STATUS_VI: Record<string, string> = {
   Maintenance: 'Bảo trì',
   Locked:      'Đã khóa',
 };
-
-// Staff can only flip a slot between the day-to-day states; Bảo trì/Đã khóa
-// are reserved for Manager tooling.
-const SLOT_STATUS_OPTIONS: { value: Slot['status']; label: string; cls: string }[] = [
-  { value: 'Available', label: 'Trống',   cls: 'bg-white border border-blue-400 text-blue-700' },
-  { value: 'Occupied',  label: 'Đang đỗ', cls: 'bg-emerald-600 text-white' },
-  { value: 'Reserved',  label: 'Đã đặt',  cls: 'bg-amber-400 text-white' },
-];
 
 /** So khớp biển số bất chấp dấu gạch/chấm: "29C138383" tìm ra "29C1-383.83". */
 const normalizePlate = (p: string) => p.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -67,8 +43,6 @@ type ParkedVehicleRow = {
 };
 
 interface EmergencyPanelProps {
-  emergencyLogs: EmergencyLog[];
-  onSubmit: (type: IncidentType, description: string, slotCode?: string, floor?: string) => void;
   /** Ô đỗ CỦA BÃI STAFF PHỤ TRÁCH (StaffDashboard đã lọc sẵn theo bãi). */
   slots?: Slot[];
   /** Đặt chỗ của bãi phụ trách — nguồn cho bảng "xe đang đỗ ở đâu". */
@@ -81,11 +55,30 @@ interface EmergencyPanelProps {
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
   /** id của nhân viên đang đăng nhập — backend dùng để xác thực thao tác chuyển ô đỗ. */
   actorId?: string;
+  /** Danh bạ người dùng — chỉ để hiện TÊN CHỦ XE trong bảng xe tháng. */
+  users?: User[];
 }
 
+/** Một ô tháng + chi tiết chiếc xe đang được giữ chỗ ở đó. */
+type MonthlySlotRow = {
+  reservationId: string;
+  slotCode: string;
+  licensePlate: string;
+  vehicleType: VehicleKey;
+  ownerName: string;
+  reservationCode: string;
+  startDate: string;
+  expiryDate: string;
+  daysLeft: number;
+  /** Xe có đang thật sự nằm trong bãi lúc này không (khách tháng ra/vào tự do). */
+  inLot: boolean;
+  /** Trạng thái ô trên sơ đồ — 'Locked' là đang giữ chỗ, 'Occupied' là có xe. */
+  slotStatus?: Slot['status'];
+};
+
+const normalizePlateKey = (p: string) => String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
 export default function EmergencyPanel({
-  emergencyLogs,
-  onSubmit,
   slots = [],
   reservations = [],
   sessions = [],
@@ -93,9 +86,8 @@ export default function EmergencyPanel({
   addToast,
   onSetSlotStatus,
   actorId,
+  users = [],
 }: EmergencyPanelProps) {
-  const [eDesc, setEDesc] = useState('');
-  const [slotStatusSaving, setSlotStatusSaving] = useState(false);
   const [eAreaMode, setEAreaMode] = useState<'all' | 'car' | 'motorbike'>('all');
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
 
@@ -103,7 +95,7 @@ export default function EmergencyPanel({
   // Staff chỉ làm việc trên đúng bãi được Quản lý phân công — không còn dropdown
   // chọn bãi. Nhãn đầy đủ lấy từ danh mục bãi (vd. "ParkFlow Quận 9 - Lò Lu").
   const assignedLotLabel = useMemo(
-    () => findLot(assignedLot)?.bookingLabel ?? assignedLot ?? '',
+    () => findLot(assignedLot)?.name ?? assignedLot ?? '',
     [assignedLot],
   );
   const lotSlots = slots;
@@ -131,8 +123,14 @@ export default function EmergencyPanel({
         timeLabel: r.startTime?.slice(0, 5) ?? '',
       }));
     const coveredSlotCodes = new Set(fromReservations.map((r) => r.slotCode));
+    // XE CHƯA XẾP Ô VẪN LÀ XE ĐANG ĐỖ.
+    //
+    // Bãi chưa có ô cho loại xe đó thì vé được mở với slot_code rỗng. Bộ lọc cũ
+    // đòi `s.slotCode` nên những xe này biến mất khỏi bảng — nhân viên thấy xe
+    // đứng trong bãi mà hệ thống thì không, đúng như báo lỗi "cho xe máy vào rồi
+    // không thấy xe máy đâu". Vẫn loại trùng theo ô, nhưng chỉ với vé CÓ ô.
     const fromWalkInSessions: ParkedVehicleRow[] = sessions
-      .filter((s) => s.slotCode && !coveredSlotCodes.has(s.slotCode))
+      .filter((s) => !s.slotCode || !coveredSlotCodes.has(s.slotCode))
       .map((s) => {
         const [dateLabel = '', timeLabel = ''] = (s.checkInTime || '').split(' ');
         return {
@@ -153,6 +151,65 @@ export default function EmergencyPanel({
     return parkedVehicles.filter((r) => normalizePlate(r.licensePlate).includes(q));
   }, [parkedVehicles, searchPlate]);
 
+  // ── Xe tháng đang giữ ô trong bãi ──────────────────────────────────────────
+  //
+  // CHỈ lấy đăng ký tháng ĐÃ CÓ Ô. Khách tháng chưa được xếp ô thì chưa có "ô
+  // tháng" nào để nói tới — đưa vào danh sách sẽ thành một dòng trỏ vào hư
+  // không. Số này được đếm riêng và ghi chú bên dưới bảng để không giấu mất.
+  //
+  // Khác hẳn bảng "Xe đang đỗ trong bãi" ở cột bên: ô tháng vẫn thuộc về khách
+  // kể cả lúc xe đi vắng, nên bảng này liệt kê theo Ô chứ không theo lượt gửi.
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const activeMonthly = useMemo(
+    () =>
+      reservations.filter(
+        (r) =>
+          r.note === 'Theo tháng' &&
+          r.status !== 'Cancelled' &&
+          r.status !== 'Expired' &&
+          todayIso <= addOneMonth(r.date.split('T')[0]),
+      ),
+    [reservations, todayIso],
+  );
+  const monthlyWithoutSlot = activeMonthly.filter((r) => !r.slotCode).length;
+
+  const monthlySlotRows: MonthlySlotRow[] = useMemo(() => {
+    const parkedPlates = new Set(
+      [
+        ...sessions.map((s) => s.licensePlate),
+        ...reservations.filter((r) => r.status === 'Checked-in').map((r) => r.licensePlate),
+      ].map(normalizePlateKey),
+    );
+    // Một ô chỉ thuộc về MỘT khách tháng. Gia hạn tạo đăng ký mới trên cùng ô,
+    // nên giữ bản có ngày bắt đầu muộn nhất — đó mới là hợp đồng đang hiệu lực.
+    const bySlot = new Map<string, Reservation>();
+    for (const r of activeMonthly) {
+      if (!r.slotCode) continue;
+      const cur = bySlot.get(r.slotCode);
+      if (!cur || r.date > cur.date) bySlot.set(r.slotCode, r);
+    }
+    return [...bySlot.values()]
+      .map((r) => {
+        const startDate = r.date.split('T')[0];
+        const expiryDate = addOneMonth(startDate);
+        const msLeft = new Date(`${expiryDate}T23:59:59`).getTime() - Date.now();
+        return {
+          reservationId: r.id,
+          slotCode: r.slotCode as string,
+          licensePlate: r.licensePlate,
+          vehicleType: r.vehicleType,
+          ownerName: users.find((u) => String(u.id) === String(r.userId))?.fullName ?? '',
+          reservationCode: r.reservationCode,
+          startDate,
+          expiryDate,
+          daysLeft: Math.ceil(msLeft / 86400000),
+          inLot: parkedPlates.has(normalizePlateKey(r.licensePlate)),
+          slotStatus: lotSlots.find((s) => s.slotCode === r.slotCode)?.status,
+        };
+      })
+      .sort((a, b) => a.slotCode.localeCompare(b.slotCode));
+  }, [activeMonthly, sessions, reservations, users, lotSlots]);
+
   const mapSlotData: MapSlot[] = lotSlots.map((s) => ({
     id: s.slotCode,
     code: s.slotCode.split('-').pop() ?? s.slotCode,
@@ -162,6 +219,8 @@ export default function EmergencyPanel({
     y: s.posY ?? null,
     w: s.posW ?? null,
     h: s.posH ?? null,
+    // Loai xe THAT cua o — khong suy tu chu cai dau ma o
+    vehicleType: s.vehicleType,
   }));
 
   const cleanSelectedSlot = selectedSlot?.startsWith('virtual-')
@@ -171,19 +230,6 @@ export default function EmergencyPanel({
   const selectedSlotData = cleanSelectedSlot
     ? lotSlots.find((s) => s.slotCode === cleanSelectedSlot)
     : undefined;
-
-  const handleSendEmergency = () => {
-    if (!eDesc.trim()) { addToast?.('Vui lòng mô tả chi tiết sự cố.', 'error'); return; }
-    onSubmit('Other', eDesc.trim(), cleanSelectedSlot ?? undefined, selectedSlotData?.floorName);
-    setEDesc(''); setSelectedSlot(null);
-  };
-
-  const handleChangeSlotStatus = async (status: Slot['status']) => {
-    if (!cleanSelectedSlot || !onSetSlotStatus) return;
-    setSlotStatusSaving(true);
-    await onSetSlotStatus(cleanSelectedSlot, status);
-    setSlotStatusSaving(false);
-  };
 
   // ── Chuyển ô đỗ cho xe đang đỗ ───────────────────────────────────────────
   const [moveTarget, setMoveTarget] = useState<ParkedVehicleRow | null>(null);
@@ -287,91 +333,117 @@ export default function EmergencyPanel({
                   </span>
                 )}
               </p>
-              {onSetSlotStatus && selectedSlotData && (
-                <div className="mt-2.5 border-t border-slate-100 pt-2.5">
-                  <p className="mb-1.5 text-[11px] font-bold text-slate-500">Đổi trạng thái ô đỗ</p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {SLOT_STATUS_OPTIONS.map((opt) => (
-                      <button
-                        key={opt.value}
-                        type="button"
-                        disabled={slotStatusSaving || selectedSlotData.status === opt.value}
-                        onClick={() => handleChangeSlotStatus(opt.value)}
-                        className={`rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition disabled:cursor-not-allowed disabled:opacity-40 ${opt.cls}`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {/* Bỏ khối "Đổi trạng thái ô đỗ".
+                  Trạng thái ô phải phản ánh thực tế do luồng vào/ra/đặt chỗ
+                  sinh ra; cho phép đặt tay ở đây tạo ra ô "Đang đỗ" mà không có
+                  vé nào, hoặc "Đã đặt" mà không có đặt chỗ nào — sai lệch mà
+                  không lần ra được nguồn gốc. Trang này chỉ để BÁO SỰ CỐ. */}
             </div>
           )}
         </div>
 
-        {/* Description */}
-        <div>
-          <label className="mb-1.5 block text-xs font-bold text-slate-600">Mô tả chi tiết</label>
-          <textarea
-            value={eDesc}
-            onChange={(e) => setEDesc(e.target.value)}
-            placeholder="Cung cấp mô tả chi tiết về sự cố xảy ra..."
-            rows={4}
-            className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm focus:border-blue-400 focus:outline-none resize-none"
-          />
-        </div>
-
-        <div className="flex items-center gap-4">
-          <button
-            onClick={handleSendEmergency}
-            className="inline-flex items-center gap-2 rounded-xl bg-rose-600 px-6 py-3 text-sm font-bold text-white hover:bg-rose-700 transition"
-          >
-            <Send className="h-4 w-4" /> Gửi cảnh báo
-          </button>
-          <button
-            onClick={() => { setEDesc(''); setSelectedSlot(null); }}
-            className="text-sm font-semibold text-slate-500 hover:text-slate-700 transition"
-          >
-            Hủy bỏ
-          </button>
-        </div>
       </div>
 
-      {/* Right column: recent emergency logs */}
+      {/* Cột phải: xe tháng đang giữ ô trong bãi (thay cho nhật ký khẩn cấp) */}
       <div className="space-y-6">
         <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-base font-bold text-slate-800">Nhật ký khẩn cấp gần đây</h3>
+            <h3 className="text-base font-bold text-slate-800">Thông tin xe tháng trong bãi</h3>
+            <span className="rounded-full bg-violet-50 px-2.5 py-0.5 text-[11px] font-bold text-violet-600">
+              {monthlySlotRows.length} ô tháng
+            </span>
           </div>
-          <div className="space-y-4">
-            {emergencyLogs.slice(0, 5).map((log) => {
-              const meta  = typeIcon[log.type] ?? typeIcon.Other;
-              const Icon  = meta.icon;
-              const badge = statusPill[log.status];
+
+          <div className="space-y-3">
+            {monthlySlotRows.map((row) => {
+              // Sắp hết hạn thì phải đập vào mắt — nhân viên là người nhắc khách
+              // gia hạn trước khi ô bị trả về cho bãi.
+              const expiring = row.daysLeft <= 7;
               return (
-                <div key={log.id} className="border-b border-slate-100 pb-4 last:border-0 last:pb-0">
-                  <div className="flex items-start gap-3">
-                    <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${meta.wrap}`}>
-                      <Icon className="h-5 w-5" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <p className="font-bold text-slate-800 text-sm leading-snug">{log.title}</p>
-                          <p className="text-[10px] text-slate-400 mt-0.5">{log.createdAt}</p>
-                        </div>
-                        <span className={`shrink-0 rounded px-2 py-0.5 text-[10px] font-bold ${badge.cls}`}>
-                          {badge.label}
-                        </span>
+                <div
+                  key={row.reservationId}
+                  className="rounded-xl border border-slate-100 bg-slate-50/60 p-3.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-100 text-violet-600">
+                        {row.vehicleType === 'motorbike' ? <Bike className="h-5 w-5" /> : <Car className="h-5 w-5" />}
                       </div>
-                      <p className="mt-1.5 text-xs text-slate-500 line-clamp-2">{log.description}</p>
+                      <div className="min-w-0">
+                        <p className="truncate font-mono text-sm font-bold text-slate-800">
+                          {row.licensePlate}
+                        </p>
+                        <p className="truncate text-[11px] text-slate-500">
+                          {VEHICLE_TYPE_LABEL[row.vehicleType] ?? row.vehicleType}
+                        </p>
+                      </div>
                     </div>
+                    <span className="shrink-0 rounded-lg bg-violet-600 px-2 py-1 text-[11px] font-bold text-white">
+                      {row.slotCode.split('-').pop()}
+                    </span>
+                  </div>
+
+                  <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-[11px]">
+                    <div>
+                      <dt className="text-slate-400">Chủ xe</dt>
+                      <dd className="truncate font-semibold text-slate-700">{row.ownerName || '—'}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-400">Mã đăng ký</dt>
+                      <dd className="truncate font-semibold text-slate-700">{row.reservationCode}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-400">Bắt đầu</dt>
+                      <dd className="font-semibold text-slate-700">{row.startDate}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-slate-400">Hết hạn</dt>
+                      <dd className={`font-semibold ${expiring ? 'text-rose-600' : 'text-slate-700'}`}>
+                        {row.expiryDate}
+                      </dd>
+                    </div>
+                  </dl>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={`rounded px-2 py-0.5 text-[10px] font-bold ${
+                        row.inLot ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600'
+                      }`}
+                    >
+                      {row.inLot ? 'Xe đang trong bãi' : 'Xe không có trong bãi'}
+                    </span>
+                    <span
+                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-bold ${
+                        expiring ? 'bg-rose-100 text-rose-700' : 'bg-blue-50 text-blue-600'
+                      }`}
+                    >
+                      <CalendarClock className="h-3 w-3" />
+                      {row.daysLeft > 0 ? `Còn ${row.daysLeft} ngày` : 'Hết hạn hôm nay'}
+                    </span>
+                    {/* Ô tháng đúng ra phải là Locked (đang giữ) hoặc Occupied (xe
+                        đang đỗ). Rơi vào trạng thái khác nghĩa là ô đã bị trả về
+                        cho bãi trong khi thẻ tháng còn hạn — sai, cần báo lên. */}
+                    {row.slotStatus && row.slotStatus !== 'Locked' && row.slotStatus !== 'Occupied' && (
+                      <span className="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                        Ô đang ở trạng thái {STATUS_VI[row.slotStatus] ?? row.slotStatus}
+                      </span>
+                    )}
                   </div>
                 </div>
               );
             })}
-            {emergencyLogs.length === 0 && (
-              <p className="text-center text-sm text-slate-400 py-8">Chưa có sự cố khẩn cấp</p>
+
+            {monthlySlotRows.length === 0 && (
+              <p className="py-8 text-center text-sm text-slate-400">
+                Bãi chưa có ô nào đăng ký theo tháng
+              </p>
+            )}
+
+            {monthlyWithoutSlot > 0 && (
+              <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] font-medium text-amber-700">
+                {monthlyWithoutSlot} thẻ tháng còn hạn nhưng CHƯA được xếp ô — không hiện ở
+                trên vì chưa có ô tháng nào để hiển thị.
+              </p>
             )}
           </div>
         </div>
@@ -421,11 +493,26 @@ export default function EmergencyPanel({
                       >
                         <td className="py-2.5 pr-2 font-mono font-bold text-slate-800">{v.licensePlate}</td>
                         <td className="py-2.5 pr-2">
-                          <span className="inline-flex items-center gap-1 font-semibold text-blue-700">
-                            <MapPin className="h-3.5 w-3.5" />
-                            {v.slotCode?.split('-').pop() ?? v.slotCode}
-                          </span>
-                          <span className="block text-[10px] text-slate-400">{v.floor}</span>
+                          {/* Xe vào lúc bãi chưa có ô cho loại của nó → chưa có
+                              ô nào để chỉ. Nói thẳng thay vì để trống. */}
+                          {v.slotCode ? (
+                            <>
+                              <span className="inline-flex items-center gap-1 font-semibold text-blue-700">
+                                <MapPin className="h-3.5 w-3.5" />
+                                {v.slotCode.split('-').pop() ?? v.slotCode}
+                              </span>
+                              <span className="block text-[10px] text-slate-400">{v.floor}</span>
+                            </>
+                          ) : (
+                            <>
+                              <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                                <AlertTriangle className="h-3 w-3" /> CHƯA XẾP Ô
+                              </span>
+                              <span className="block text-[10px] text-slate-400">
+                                Bãi chưa có ô {VEHICLE_TYPE_LABEL[v.vehicleType] ?? v.vehicleType}
+                              </span>
+                            </>
+                          )}
                         </td>
                         <td className="py-2.5 pr-2 text-right text-xs text-slate-500">
                           {v.dateLabel}

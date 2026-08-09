@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, LogIn, LogOut, Move, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
-import ParkingFloorMap, { type MapGate, type MapSlot } from '../../components/ParkingFloorMap';
+import ParkingFloorMap, { VEHICLE_SLOT_SIZE, type MapGate, type MapSlot } from '../../components/ParkingFloorMap';
 import type { LotGate, LotGridSlot, ParkingLotInfo } from '../../utils/parkingLots';
 import { updateParkingLot } from '../../services/parkingLotService';
 
@@ -23,9 +23,30 @@ const ROW_VEHICLE: Record<string, VehicleKey> = {
   A: 'car', B: 'motorbike', C: 'electric vehicle', D: 'car', E: 'motorbike',
 };
 
-// Cỡ ô mặc định của lưới mẫu (khớp ROW_W/ROW_H trong ParkingFloorMap) — dùng
-// làm giá trị hiển thị cho ô chưa từng được kéo dãn.
-const DEFAULT_SLOT_SIZE = { w: 54, h: 40 };
+// Số ô mỗi dãy của mặt bằng mẫu (khớp buildSpaces() trong ParkingFloorMap).
+const GRID_ROWS: Record<string, number> = { A: 11, B: 5, C: 5, D: 4, E: 11 };
+
+/** Mã có sẵn vị trí trong lưới mẫu (A01-A11, B01-B05, C01-C05, D01-D04, E01-E11). */
+function isGridCode(code: string): boolean {
+  const m = /^([A-E])(\d{2})$/.exec(code);
+  if (!m) return false;
+  const n = Number(m[2]);
+  return n >= 1 && n <= (GRID_ROWS[m[1]] ?? 0);
+}
+
+// Cỡ ô sẵn có của từng dãy trong lưới mẫu (khớp buildSpaces() bên
+// ParkingFloorMap) — chỉ để hiển thị cho ô chưa có cỡ riêng.
+const GRID_SIZE: Record<string, { w: number; h: number }> = {
+  A: { w: 54, h: 40 },
+  B: { w: 64, h: 42 },
+  C: { w: 64, h: 42 },
+  D: { w: 64, h: 50 },
+  E: { w: 54, h: 40 },
+};
+
+function gridSizeOf(code: string): { w: number; h: number } {
+  return GRID_SIZE[code[0]] ?? GRID_SIZE.A;
+}
 
 const GATE_POSITIONS: { value: LotGate['position']; label: string }[] = [
   { value: 'left', label: 'Trái' },
@@ -86,6 +107,8 @@ export default function ParkingLayoutEditor({
       y: s.y ?? null,
       w: s.w ?? null,
       h: s.h ?? null,
+      // Loại xe thật của ô — sơ đồ không suy từ chữ cái đầu của mã nữa.
+      vehicleType: s.vehicleType,
     })),
     [slots],
   );
@@ -146,15 +169,18 @@ export default function ParkingLayoutEditor({
     setSlots((prev) => prev.map((s) => (s.code === code ? { ...s, x, y } : s)));
   };
 
-  /** Kéo dãn: ghi kích thước mới cho ô. */
-  const handleResizeSlot = (code: string, w: number, h: number) => {
-    setSlots((prev) => prev.map((s) => (s.code === code ? { ...s, w, h } : s)));
-  };
-
-  /** Đưa ô về đúng vị trí VÀ kích thước mặc định của lưới mẫu. */
+  /**
+   * Đưa ô về đúng vị trí mặc định của lưới mẫu.
+   * Mã ngoài lưới (Admin tự đặt, vd. 'VIP1') KHÔNG có vị trí mặc định để quay
+   * về — xoá toạ độ của nó thì sơ đồ không biết vẽ ở đâu và ô sẽ biến mất, nên
+   * chỉ áp dụng cho mã thuộc lưới.
+   */
   const handleResetPosition = (code: string) => {
-    setSlots((prev) => prev.map((s) => (s.code === code ? { ...s, x: null, y: null, w: null, h: null } : s)));
-    setMessage(`Đã đưa ô ${code} về vị trí và kích thước mặc định.`);
+    if (!isGridCode(code)) return;
+    setSlots((prev) => prev.map((s) => (
+      s.code === code ? { ...s, x: null, y: null, w: null, h: null } : s
+    )));
+    setMessage(`Đã đưa ô ${code} về vị trí mặc định.`);
   };
 
   /** Thêm ô mã tùy ý; đặt giữa bãi để Admin kéo tới chỗ mong muốn. */
@@ -172,15 +198,19 @@ export default function ParkingLayoutEditor({
     setError('');
     // Rải so le quanh giữa bãi để nhiều ô mới không chồng khít lên nhau.
     const n = slots.filter((s) => typeof s.x === 'number').length;
+    // Kích thước lấy theo loại xe (cỡ chuẩn của A01/C01/D01) — không chỉnh tay.
+    const size = VEHICLE_SLOT_SIZE[newVehicleType];
     setSlots((prev) => [...prev, {
       code,
       vehicleType: newVehicleType,
       x: 360 + (n % 5) * 62,
       y: 250 + Math.floor(n / 5) * 50,
+      w: size.w,
+      h: size.h,
     }]);
     setSelectedCode(code);
     setNewCode('');
-    setMessage(`Đã thêm ô ${code}. Kéo ô trên sơ đồ để đặt vào vị trí mong muốn.`);
+    setMessage(`Đã thêm ô ${code} (${VEHICLE_LABEL[newVehicleType]}, ${size.w}×${size.h}). Kéo ô trên sơ đồ để đặt vào vị trí mong muốn.`);
   };
 
   /** Đổi mã của ô đang chọn (giữ nguyên loại xe và vị trí). */
@@ -208,9 +238,19 @@ export default function ParkingLayoutEditor({
     setError('');
   };
 
+  /**
+   * Đổi loại xe. Kích thước ô bám theo loại xe, nên ô nào đang có cỡ riêng (ô
+   * Admin tự tạo) sẽ đổi cỡ theo luôn. Ô thuộc lưới mẫu giữ nguyên cỡ ô lưới để
+   * không xô lệch mặt bằng sẵn có.
+   */
   const handleChangeVehicleType = (vehicleType: VehicleKey) => {
     if (!selectedCode) return;
-    setSlots((prev) => prev.map((s) => (s.code === selectedCode ? { ...s, vehicleType } : s)));
+    const size = VEHICLE_SLOT_SIZE[vehicleType];
+    setSlots((prev) => prev.map((s) => {
+      if (s.code !== selectedCode) return s;
+      const hasOwnSize = typeof s.w === 'number';
+      return hasOwnSize ? { ...s, vehicleType, w: size.w, h: size.h } : { ...s, vehicleType };
+    }));
   };
 
   const handleAddGate = (kind: LotGate['kind']) => {
@@ -230,7 +270,6 @@ export default function ParkingLayoutEditor({
     setError('');
     const result = await updateParkingLot(lot.id, {
       name: lot.name,
-      bookingLabel: lot.bookingLabel,
       address: lot.address,
       description: lot.description,
       imageData: lot.imageData,
@@ -312,13 +351,16 @@ export default function ParkingLayoutEditor({
             designMode
             onToggleSlot={handleCellClick}
             onMoveSlot={handleMoveSlot}
-            onResizeSlot={handleResizeSlot}
             selectedId={movingCode ?? selectedCode}
             highlightEmpty={!!movingCode}
             level={1}
           />
           <p className="mt-2 text-[11px] text-slate-400">
-            Mẹo: kéo thân ô để di chuyển. Chọn một ô rồi kéo <span className="font-bold text-blue-600">nút vuông ở góc dưới-phải</span> để phóng to / thu nhỏ ô đó.
+            Mẹo: kéo thân ô để di chuyển. Kích thước ô tự đặt theo loại xe, nhỏ đến lớn —
+            xe máy {VEHICLE_SLOT_SIZE.motorbike.w}×{VEHICLE_SLOT_SIZE.motorbike.h},
+            ô tô xăng {VEHICLE_SLOT_SIZE.car.w}×{VEHICLE_SLOT_SIZE.car.h},
+            ô tô điện {VEHICLE_SLOT_SIZE['electric vehicle'].w}×{VEHICLE_SLOT_SIZE['electric vehicle'].h} (lớn nhất).
+            Đổi loại xe của ô là kích thước tự đổi theo, ở mọi sơ đồ.
           </p>
         </div>
 
@@ -340,6 +382,10 @@ export default function ParkingLayoutEditor({
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thêm ô đỗ mới</h3>
             <p className="mt-1 text-[11px] text-slate-400">
               Đặt mã bất kỳ (chữ + số), chọn loại xe, rồi kéo ô tới vị trí mong muốn.
+              Kích thước ô lấy theo loại xe:{' '}
+              <span className="font-semibold text-slate-500">
+                {VEHICLE_SLOT_SIZE[newVehicleType].w}×{VEHICLE_SLOT_SIZE[newVehicleType].h}
+              </span>
             </p>
             <div className="mt-2 space-y-2">
               <input
@@ -410,35 +456,20 @@ export default function ParkingLayoutEditor({
                   <Move className="h-3.5 w-3.5" />
                   {movingCode === selected.code ? 'Đang chọn vị trí mới...' : 'Đổi vị trí ô này'}
                 </button>
-                <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  Kích thước ô (rộng × cao)
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min={24}
-                    max={300}
-                    value={Math.round(selected.w ?? DEFAULT_SLOT_SIZE.w)}
-                    onChange={(e) => handleResizeSlot(selected.code, Number(e.target.value), selected.h ?? DEFAULT_SLOT_SIZE.h)}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
-                  />
-                  <span className="text-xs font-bold text-slate-400">×</span>
-                  <input
-                    type="number"
-                    min={20}
-                    max={240}
-                    value={Math.round(selected.h ?? DEFAULT_SLOT_SIZE.h)}
-                    onChange={(e) => handleResizeSlot(selected.code, selected.w ?? DEFAULT_SLOT_SIZE.w, Number(e.target.value))}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
-                  />
-                </div>
-                {(typeof selected.x === 'number' || typeof selected.w === 'number') && (
+                <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-500">
+                  Kích thước:{' '}
+                  <span className="font-bold text-slate-700">
+                    {Math.round(selected.w ?? gridSizeOf(selected.code).w)} × {Math.round(selected.h ?? gridSizeOf(selected.code).h)}
+                  </span>{' '}
+                  — tự đặt theo loại xe, không chỉnh tay.
+                </p>
+                {isGridCode(selected.code) && typeof selected.x === 'number' && (
                   <button
                     onClick={() => handleResetPosition(selected.code)}
                     className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-slate-50 px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
-                    Về vị trí & cỡ mặc định
+                    Về vị trí mặc định
                   </button>
                 )}
                 <button

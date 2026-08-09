@@ -1,7 +1,7 @@
-import { useState, useMemo, type ReactNode } from 'react';
+import { useState, useMemo, useEffect, type ReactNode } from 'react';
 import { Calendar, Download, FileText, ChevronLeft, ChevronRight, TrendingUp, TrendingDown, Minus, ChevronDown, Building2, PieChart } from 'lucide-react';
-import type { Payment, Reservation } from '../../data/mockData';
-import { lotKeyOrDefault, type LotKey, type ParkingLotInfo } from '../../utils/parkingLots';
+import { sameLot, type ParkingLotInfo } from '../../utils/parkingLots';
+import { fetchRevenueReport, type RevenueReport } from '../../services/reportService';
 
 type TimeTab = '7days' | 'month' | 'custom';
 
@@ -80,12 +80,8 @@ const SOURCE_META: Record<string, { label: string; cls: string }> = {
 };
 
 export default function ManagerReports({
-  payments = [],
-  reservations = [],
   parkingLots = [],
 }: {
-  payments?: Payment[];
-  reservations?: Reservation[];
   /** Danh mục bãi từ backend — nguồn cho cột "doanh thu theo bãi" và bộ lọc bãi. */
   parkingLots?: ParkingLotInfo[];
 }) {
@@ -98,130 +94,106 @@ export default function ManagerReports({
   const [customFrom, setCustomFrom] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 6); return isoDay(d); });
   const [customTo, setCustomTo]     = useState(() => isoDay(new Date()));
 
-  // ── Khoảng thời gian đang thống kê (chính xác theo ngày) ────────────────────
+  // ── Khoảng thời gian đang thống kê (theo NGÀY, gửi thẳng cho server) ────────
   const range = useMemo(() => {
     const now = new Date();
     if (activeTab === '7days') {
-      const s = new Date(now); s.setDate(s.getDate() - 6); s.setHours(0, 0, 0, 0);
-      return { start: s.getTime(), end: now.getTime() };
+      const s = new Date(now); s.setDate(s.getDate() - 6);
+      return { from: isoDay(s), to: isoDay(now) };
     }
     if (activeTab === 'month') {
-      return { start: new Date(now.getFullYear(), now.getMonth(), 1).getTime(), end: now.getTime() };
+      return { from: isoDay(new Date(now.getFullYear(), now.getMonth(), 1)), to: isoDay(now) };
     }
-    const s = new Date(`${customFrom}T00:00:00`);
-    const e = new Date(`${customTo}T23:59:59`);
-    return {
-      start: Number.isNaN(s.getTime()) ? 0 : s.getTime(),
-      end: Number.isNaN(e.getTime()) ? now.getTime() : e.getTime(),
-    };
+    return { from: customFrom || isoDay(now), to: customTo || isoDay(now) };
   }, [activeTab, customFrom, customTo]);
 
-  // ── Gắn mỗi giao dịch Paid với bãi đỗ + nguồn thu ───────────────────────────
-  // payments không mang cột bãi — tra ngược qua reservation (reservationCode
-  // giữ nguyên qua check-in; ticketCode phủ các bản ghi cũ).
-  const resByCode = useMemo(() => {
-    const m = new Map<string, Reservation>();
-    for (const r of reservations) if (r.reservationCode) m.set(r.reservationCode, r);
-    return m;
-  }, [reservations]);
+  // ── Số liệu lấy thẳng từ backend ────────────────────────────────────────────
+  //
+  // Toàn bộ phép cộng nằm ở /api/reports/revenue. Trình duyệt không còn tự
+  // gộp dbo.payments nữa vì hai lý do đã gây sai số thật:
+  //  • payments không có cột bãi; tra ngược qua reservationCode hụt thì bản cũ
+  //    gán bừa vào bãi mặc định, làm tiền của bãi này hiện sang bãi khác;
+  //  • cộng ở client chỉ đúng khi đã tải về đủ mọi hoá đơn.
+  const [report, setReport] = useState<RevenueReport | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  const enriched = useMemo(() => {
-    return payments
-      .filter((p) => p.status === 'Paid')
-      .map((p) => {
-        const res = resByCode.get(p.reservationCode || '') ?? resByCode.get(p.ticketCode || '');
-        const raw = (p.paidAt || p.createdAt || '').replace(' ', 'T');
-        const ts = new Date(raw).getTime();
-        return {
-          amount: p.totalAmount || 0,
-          ts: Number.isNaN(ts) ? null : ts,
-          // Không tra được đặt chỗ gốc → quy về bãi mặc định (Quận 9), cùng
-          // quy ước fallback với phần còn lại của hệ thống.
-          lotKey: lotKeyOrDefault(res?.parkingLot),
-          source: res ? 'booking' : (p.ticketCode || '').startsWith('TCK') ? 'session' : 'other',
-          vehicle: res?.vehicleType ?? '',
-          method: p.method || 'Khác',
-        };
-      })
-      .filter((e) => e.ts != null);
-  }, [payments, resByCode]);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchRevenueReport({
+      from: range.from,
+      to: range.to,
+      lot: filterLot,
+      vehicleType: filterVehicle,
+      method: filterPayment,
+    }).then((data) => {
+      if (cancelled) return;
+      setReport(data);
+      setLoading(false);
+      setPage(1);
+    });
+    return () => { cancelled = true; };
+  }, [range.from, range.to, filterLot, filterVehicle, filterPayment]);
 
-  // Áp khoảng thời gian + 3 bộ lọc
-  const inRange = useMemo(
-    () =>
-      enriched.filter(
-        (e) =>
-          (e.ts as number) >= range.start &&
-          (e.ts as number) <= range.end &&
-          (!filterLot || e.lotKey === filterLot) &&
-          (!filterVehicle || e.vehicle === filterVehicle) &&
-          (!filterPayment || e.method === filterPayment),
-      ),
-    [enriched, range, filterLot, filterVehicle, filterPayment],
-  );
-
-  // ── Doanh thu theo bãi (trong khoảng thời gian, trước bộ lọc bãi) ───────────
+  // Ghép doanh thu server trả về vào danh mục bãi để giữ đúng thứ tự & tên hiển
+  // thị. Bãi nào server có mà danh mục không có (kể cả nhóm rỗng = chưa quy được
+  // về bãi nào) vẫn phải hiện — giấu đi là tổng không khớp với các dòng ở trên.
   const byLot = useMemo(() => {
-    const scoped = enriched.filter(
-      (e) =>
-        (e.ts as number) >= range.start &&
-        (e.ts as number) <= range.end &&
-        (!filterVehicle || e.vehicle === filterVehicle) &&
-        (!filterPayment || e.method === filterPayment),
-    );
-    const rows = parkingLots.map((lot) => {
-      const items = scoped.filter((e) => e.lotKey === lot.key);
-      return { key: lot.key as LotKey, name: lot.name, revenue: items.reduce((s, e) => s + e.amount, 0), count: items.length };
+    const src = report?.byLot ?? [];
+    const known = parkingLots.map((lot) => {
+      const hit = src.find((x) => sameLot(x.lot, lot.name));
+      return { key: lot.key, name: lot.name, revenue: hit?.revenue ?? 0, count: hit?.count ?? 0 };
     });
-    return { rows, total: scoped.reduce((s, e) => s + e.amount, 0), count: scoped.length };
-  }, [enriched, range, filterVehicle, filterPayment, parkingLots]);
+    const extra = src
+      .filter((x) => !parkingLots.some((lot) => sameLot(x.lot, lot.name)))
+      .map((x) => ({ key: x.lot, name: x.lot || 'Chưa xác định bãi', revenue: x.revenue, count: x.count }));
+    const rows = [...known, ...extra];
+    return { rows, total: rows.reduce((s, r) => s + r.revenue, 0), count: rows.reduce((s, r) => s + r.count, 0) };
+  }, [report, parkingLots]);
 
-  // ── Nguồn doanh thu (theo loại giao dịch & phương thức thanh toán) ──────────
-  const bySource = useMemo(() => {
-    const g = new Map<string, number>();
-    for (const e of inRange) g.set(e.source, (g.get(e.source) ?? 0) + e.amount);
-    return Array.from(g.entries()).sort((a, b) => b[1] - a[1]);
-  }, [inRange]);
-  const byMethod = useMemo(() => {
-    const g = new Map<string, number>();
-    for (const e of inRange) g.set(e.method, (g.get(e.method) ?? 0) + e.amount);
-    return Array.from(g.entries()).sort((a, b) => b[1] - a[1]);
-  }, [inRange]);
+  // Giữ nguyên dạng [key, số tiền][] mà phần hiển thị bên dưới đang dùng.
+  const bySource: [string, number][] = (report?.bySource ?? [])
+    .map((x) => [x.source, x.revenue] as [string, number])
+    .sort((a, b) => b[1] - a[1]);
+  const byMethod: [string, number][] = (report?.byMethod ?? [])
+    .map((x) => [x.method, x.revenue] as [string, number])
+    .sort((a, b) => b[1] - a[1]);
 
-  // Bảng vận hành hàng ngày — gộp inRange theo ngày
   const realRows = useMemo((): DailyRow[] => {
-    if (enriched.length === 0) return [];
-    const byDate = new Map<string, { revenue: number; count: number }>();
-    for (const e of inRange) {
-      const d = new Date(e.ts as number);
-      const key = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
-      const cur = byDate.get(key) ?? { revenue: 0, count: 0 };
-      byDate.set(key, { revenue: cur.revenue + e.amount, count: cur.count + 1 });
-    }
-    const entries = Array.from(byDate.entries()).sort((a, b) => {
-      const parse = (s: string) => { const [dd, mm, yyyy] = s.split('/').map(Number); return new Date(yyyy, mm - 1, dd).getTime(); };
-      return parse(b[0]) - parse(a[0]);
+    const days = report?.byDate ?? [];
+    return days.map((d, i) => {
+      const prevRevenue = days[i + 1]?.revenue ?? d.revenue;
+      const trend: DailyRow['trend'] =
+        d.revenue > prevRevenue * 1.05 ? 'up' : d.revenue < prevRevenue * 0.95 ? 'down' : 'stable';
+      const [yyyy, mm, dd] = d.date.split('-');
+      return {
+        date: `${dd}/${mm}/${yyyy}`,
+        vehicleType: 'Tất cả',
+        // enters/exits đếm trên vé gửi xe, không phải số hoá đơn: xe tháng ra
+        // vào không sinh hoá đơn nào, còn một lượt gửi có thể sinh nhiều hoá đơn.
+        enter: d.enters,
+        exit: d.exits,
+        revenue: d.revenue,
+        trend,
+      };
     });
-    return entries.map(([date, { revenue, count }], i) => {
-      const prevRevenue = entries[i + 1]?.[1].revenue ?? revenue;
-      const trend: DailyRow['trend'] = revenue > prevRevenue * 1.05 ? 'up' : revenue < prevRevenue * 0.95 ? 'down' : 'stable';
-      return { date, vehicleType: 'Tất cả', enter: count, exit: count, revenue, trend };
-    });
-  }, [enriched.length, inRange]);
+  }, [report]);
 
-  const useRealData = enriched.length > 0;
+  const useRealData = (report?.count ?? 0) > 0 || realRows.length > 0;
+  // Trong lúc chờ server trả số, KHÔNG được rơi về bộ số minh hoạ
+  // (150.000.000 / 5.432) — nhìn thoáng qua sẽ tưởng là doanh thu thật.
+  const showDemo = !loading && !useRealData;
 
-  const filtered = (useRealData ? realRows : ALL_ROWS).filter((r) => {
-    if (!useRealData && filterVehicle && r.vehicleType !== filterVehicle) return false;
-    return true;
-  });
+  const filtered = useRealData ? realRows : ALL_ROWS;
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
   const pageRows   = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
-  const totalEnter   = filtered.reduce((s, r) => s + r.enter,   0);
-  const totalExit    = filtered.reduce((s, r) => s + r.exit,    0);
-  const totalRevenue = filtered.reduce((s, r) => s + r.revenue, 0);
+  const totalEnter   = filtered.reduce((s, r) => s + r.enter, 0);
+  const totalExit    = filtered.reduce((s, r) => s + r.exit,  0);
+  // Tổng doanh thu lấy thẳng con số server đã cộng, KHÔNG cộng lại từ các dòng
+  // đang hiển thị — bảng có phân trang nên cộng theo trang sẽ ra thiếu.
+  const totalRevenue = useRealData ? (report?.total ?? 0) : filtered.reduce((s, r) => s + r.revenue, 0);
 
   const visiblePages = Array.from({ length: Math.min(totalPages, 3) }, (_, i) => i + 1);
 
@@ -284,7 +256,7 @@ export default function ManagerReports({
             }
           </div>
           <p className="mt-3 text-2xl font-bold text-slate-900">
-            {useRealData ? totalRevenue.toLocaleString('vi-VN') : '150.000.000'}
+            {showDemo ? '150.000.000' : loading ? '…' : totalRevenue.toLocaleString('vi-VN')}
           </p>
           <p className="text-xs text-slate-500">VND</p>
         </div>
@@ -298,7 +270,7 @@ export default function ManagerReports({
             }
           </div>
           <p className="mt-3 text-2xl font-bold text-slate-900">
-            {useRealData ? totalEnter.toLocaleString('vi-VN') : '5.432'}
+            {showDemo ? '5.432' : loading ? '…' : totalEnter.toLocaleString('vi-VN')}
           </p>
           <p className="text-xs text-slate-500">lượt</p>
         </div>
@@ -346,7 +318,9 @@ export default function ManagerReports({
                 );
               })}
               <div className="flex items-center justify-between border-t border-slate-100 pt-3 text-sm">
-                <span className="font-bold text-slate-900">TỔNG CỘNG (cả 3 bãi)</span>
+                {/* Số bãi đếm từ chính các dòng ở trên, không viết cứng "3" —
+                    hệ thống đang có 4 bãi nên dòng cũ đọc là sai. */}
+                <span className="font-bold text-slate-900">TỔNG CỘNG (cả {byLot.rows.length} bãi)</span>
                 <span className="text-lg font-black text-blue-700">{fmtVND(byLot.total)}</span>
               </div>
             </div>
@@ -395,8 +369,11 @@ export default function ManagerReports({
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
         {[
+          // Giá trị lọc là TÊN bãi, không phải key nội bộ: server so trực tiếp
+          // với cột parking_lot (lưu tên đầy đủ). Gửi key thì SQL không khớp
+          // dòng nào và mọi số về 0.
           { value: filterLot,     setter: setFilterLot,     label: 'Tất cả bãi đỗ',
-            opts: parkingLots.map((l) => [l.key, l.name] as [string, string]) },
+            opts: parkingLots.map((l) => [l.name, l.name] as [string, string]) },
           { value: filterVehicle, setter: setFilterVehicle, label: 'Tất cả loại xe',
             opts: [['motorbike', 'Xe máy / Xe máy điện'], ['car', 'Ô tô 4-7 chỗ (Xăng)'], ['electric vehicle', 'Ô tô Điện / EV']] as [string, string][] },
           { value: filterPayment, setter: setFilterPayment, label: 'Tất cả thanh toán',

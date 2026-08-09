@@ -21,6 +21,14 @@ export default defineConfig(() => {
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
       proxy: {
+        // Dịch vụ PaddleOCR chạy riêng ở cổng 8868. Phải đi qua proxy giống /api
+        // thì khi mở app qua ngrok (HTTPS) trình duyệt mới gọi được — gọi thẳng
+        // http://localhost:8868 từ trang HTTPS bị chặn vì mixed content.
+        '/ocr': {
+          target: process.env.VITE_OCR_PROXY_TARGET || 'http://127.0.0.1:8868',
+          changeOrigin: true,
+          secure: false,
+        },
         '/api': {
           target: process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:4000',
           changeOrigin: true,

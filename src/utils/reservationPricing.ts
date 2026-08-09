@@ -27,6 +27,10 @@ export function synthesizeWalkInReservations(
       floor: s.floor,
       area: s.area,
       slotCode: s.slotCode,
+      // BÃI ĐỖ phải đi theo vé. Thiếu trường này thì mọi nơi hiển thị lượt gửi
+      // suy ra từ phiên gửi xe đều không biết xe đang ở bãi nào, và rơi vào
+      // giá trị mặc định — khách đỗ ở Long Phước lại thấy ghi Quận 9.
+      parkingLot: s.parkingLot,
       status: 'Checked-in',
       note: '',
       estimatedCost: s.estimatedFee,

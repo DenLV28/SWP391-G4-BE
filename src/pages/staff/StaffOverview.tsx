@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Car, CheckCircle2, AlertTriangle, MoreVertical, Monitor, X } from 'lucide-react';
-import type { AccessLog, EmergencyLog, IncidentType } from '../../types/staff';
-import type { Reservation, Slot, Payment, ParkingSession } from '../../data/mockData';
+import type { AccessLog } from '../../types/staff';
+import type { Reservation, Slot, Payment, ParkingSession, User } from '../../data/mockData';
 import PaymentWalletCard from '../../components/PaymentWalletCard';
 import ConfirmModal from '../../components/ConfirmModal';
 import EmergencyPanel from './EmergencyPanel';
@@ -14,14 +14,12 @@ interface StaffOverviewProps {
   sessions?: ParkingSession[];
   slots: Slot[];
   payments: Payment[];
-  alertsCount: number;
   confirmedReservations: Set<string>;
   onConfirmReservation: (id: string) => void;
   onCancelReservation: (id: string) => void;
   onNavigate: (view: string) => void;
-  // "Sự cố Khẩn cấp" panel (moved here from Quản lý Sự cố)
-  emergencyLogs?: EmergencyLog[];
-  onSubmitEmergency?: (type: IncidentType, description: string, slotCode?: string, floor?: string) => void;
+  /** Danh bạ người dùng — panel xe tháng dùng để hiện tên chủ xe. */
+  users?: User[];
   addToast?: (message: string, type?: 'success' | 'info' | 'error') => void;
   onSetSlotStatus?: (slotCode: string, status: Slot['status']) => Promise<boolean>;
   /** Bãi staff phụ trách — panel sơ đồ chỉ hiển thị đúng bãi này. */
@@ -53,13 +51,11 @@ export default function StaffOverview({
   sessions = [],
   slots,
   payments,
-  alertsCount,
   confirmedReservations,
   onConfirmReservation,
   onCancelReservation,
   onNavigate,
-  emergencyLogs = [],
-  onSubmitEmergency,
+  users = [],
   addToast,
   onSetSlotStatus,
   assignedLot,
@@ -73,13 +69,30 @@ export default function StaffOverview({
   // lấy trực tiếp từ dữ liệu server, không dùng accessLogs (chỉ tồn tại tạm
   // trong bộ nhớ trình duyệt, mất khi tải lại trang nên dễ đếm thiếu).
   const parkedNow = buildCheckedInVehicles(reservations, sessions).length;
-  const zoneAFree  = slots.filter((s) => s.areaName?.includes('A') && s.status === 'Available').length;
-  const zoneATotal = slots.filter((s) => s.areaName?.includes('A')).length || 150;
-  // Cảnh báo = lượt quét bị từ chối + số ô đang gặp sự cố/bảo trì thực tế
-  // trong bãi phụ trách (trước đây chỉ đếm accessLogs nên luôn hiện 0 dù
-  // sơ đồ có ô đang lỗi).
-  const maintenanceCount = slots.filter((s) => s.status === 'Maintenance').length;
-  const totalAlerts = alertsCount + maintenanceCount;
+  // Chỗ trống của CẢ BÃI đang phụ trách.
+  //
+  // Công thức cũ lọc `areaName.includes('A')` với ý định "Khu A", nhưng chữ 'A'
+  // khớp cả "Floor 1 - Car Area", "Motorbike Area"... nên thực chất đếm một tập
+  // ô ngẫu nhiên: con số đó không bao giờ khớp với sơ đồ hay với "Xe đang đỗ"
+  // (báo lỗi: 3 xe đang đỗ nhưng vẫn hiện 16/18).
+  //
+  // Chỉ 'Available' mới là trống thật: 'Locked' là ô đang giữ cho thẻ tháng,
+  // 'Maintenance' là ô đang hỏng — không ô nào trong hai loại đó nhận xe được.
+  const lotFree  = slots.filter((s) => s.status === 'Available').length;
+  const lotTotal = slots.length;
+  // Phần còn lại của tổng, tách ra để chú thích bên dưới con số cho staff biết
+  // vì sao "trống" nhỏ hơn "tổng trừ số xe": ô giữ cho thẻ tháng và ô đang hỏng
+  // cũng nằm trong tổng nhưng không nhận xe được.
+  const lotOccupied = slots.filter((s) => s.status === 'Occupied' || s.status === 'Reserved').length;
+  const lotUnusable = lotTotal - lotFree - lotOccupied;
+  // Cảnh báo = CHỈ số ô đang bảo trì / hỏng trong bãi phụ trách.
+  //
+  // Trước đây còn cộng thêm số lượt quét thẻ bị từ chối. Hai thứ
+  // đó khác hẳn nhau: ô hỏng là hạ tầng cần đi sửa, còn quét thẻ trượt là việc
+  // thường ngày ở cổng và đã có hàng đợi riêng lo. Gộp lại làm con số phồng lên
+  // (ảnh báo lỗi: "4 lỗi" trong khi không ô nào đang bảo trì) và staff không
+  // biết phải đi xử lý cái gì.
+  const totalAlerts = slots.filter((s) => s.status === 'Maintenance').length;
 
   const statusOrder: Record<string, number> = { Pending: 0, Confirmed: 1, Cancelled: 2 };
   const upcoming = reservations
@@ -110,10 +123,24 @@ export default function StaffOverview({
             <CheckCircle2 className="h-6 w-6" />
           </div>
           <div>
-            <p className="text-xs font-medium text-slate-400">Chỗ trống Khu A</p>
+            <p className="text-xs font-medium text-slate-400">Chỗ trống trong bãi</p>
+            {/* LUÔN hiện dạng "trống / tổng". Trước đây bãi chưa có ô nào thì
+                rơi về hiện mỗi số 0 trơ trọi, không rõ là 0 chỗ trống hay bãi
+                chưa được cấu hình. */}
             <p className="text-2xl font-bold text-slate-800">
-              {zoneATotal > 0 ? `${zoneAFree} / ${zoneATotal}` : zoneAFree}
+              {lotFree} <span className="text-slate-400">/ {lotTotal}</span>
             </p>
+            {lotTotal === 0 ? (
+              <p className="mt-0.5 text-[11px] font-medium text-amber-600">
+                Bãi chưa có ô đỗ nào — cần Quản trị tạo sơ đồ ô.
+              </p>
+            ) : lotUnusable > 0 ? (
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                {lotOccupied} ô có xe · {lotUnusable} ô giữ chỗ tháng / bảo trì
+              </p>
+            ) : (
+              <p className="mt-0.5 text-[11px] text-slate-400">{lotOccupied} ô đang có xe</p>
+            )}
           </div>
         </div>
 
@@ -123,8 +150,11 @@ export default function StaffOverview({
             <AlertTriangle className="h-6 w-6" />
           </div>
           <div>
-            <p className="text-xs font-medium text-slate-400">Cảnh báo</p>
-            <p className="text-2xl font-bold text-slate-800">{totalAlerts} lỗi</p>
+            <p className="text-xs font-medium text-slate-400">Ô đỗ đang bảo trì</p>
+            <p className="text-2xl font-bold text-slate-800">{totalAlerts} ô</p>
+            <p className="mt-0.5 text-[11px] text-slate-400">
+              {totalAlerts === 0 ? 'Không có ô nào đang hỏng' : 'Cần sửa chữa trước khi nhận xe'}
+            </p>
           </div>
         </div>
 
@@ -152,22 +182,19 @@ export default function StaffOverview({
         </div>
       )}
 
-      {/* Sự cố Khẩn cấp — replaces the old read-only "Sơ đồ bãi đỗ — Trực tiếp"
-          panel (the live map now lives inside this panel, clickable to pick the
-          incident location). */}
-      {onSubmitEmergency && (
-        <EmergencyPanel
-          emergencyLogs={emergencyLogs}
-          onSubmit={onSubmitEmergency}
-          slots={slots}
-          reservations={reservations}
-          sessions={sessions}
-          assignedLot={assignedLot}
-          addToast={addToast}
-          onSetSlotStatus={onSetSlotStatus}
-          actorId={actorId}
-        />
-      )}
+      {/* Sơ đồ bãi trực tiếp + xe tháng + xe đang đỗ.
+          Biểu mẫu "Gửi cảnh báo" đã gỡ, nên panel không còn phụ thuộc
+          onSubmitEmergency và luôn hiển thị. */}
+      <EmergencyPanel
+        slots={slots}
+        reservations={reservations}
+        sessions={sessions}
+        assignedLot={assignedLot}
+        addToast={addToast}
+        onSetSlotStatus={onSetSlotStatus}
+        actorId={actorId}
+        users={users}
+      />
 
       <PaymentWalletCard payments={payments} />
 
@@ -233,13 +260,26 @@ export default function StaffOverview({
                               XÁC NHẬN
                             </button>
                           )}
-                          <button
-                            onClick={() => setCancelTarget(r)}
-                            disabled={isUnderMaintenance}
-                            className="rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            HỦY
-                          </button>
+                          {/* Thẻ tháng là hợp đồng trọn tháng đã thu tiền —
+                              chỉ Quản lý mới được chấm dứt. Backend cũng chặn
+                              (403 MONTHLY_CANCEL_REQUIRES_MANAGER), đây chỉ là
+                              phần cho nhân viên thấy lý do ngay tại chỗ. */}
+                          {r.note === 'Theo tháng' ? (
+                            <span
+                              title="Thẻ tháng chỉ Quản lý mới được hủy"
+                              className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-bold text-slate-400"
+                            >
+                              THẺ THÁNG — LIÊN HỆ QUẢN LÝ
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => setCancelTarget(r)}
+                              disabled={isUnderMaintenance}
+                              className="rounded-lg border border-rose-200 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              HỦY
+                            </button>
+                          )}
                         </div>
                       )}
                     </td>
